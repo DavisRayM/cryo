@@ -10,3 +10,4 @@ name = "cli"
 test = true
 
 [dependencies]
+thiserror = "2.0.12"
