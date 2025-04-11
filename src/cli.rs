@@ -1,3 +1,6 @@
+//! CLI utilities for Cryo.
+//!
+//! The utilities present in this module can be used to create a CLI tool for the Database.
 use std::io::{BufRead, Write};
 
 /// Possible commands from a user.
@@ -5,9 +8,14 @@ use std::io::{BufRead, Write};
 pub enum Command {
     /// Exit command `.exit`
     Exit,
+    /// DSL Statements
     Statement(String),
 }
 
+/// Prompt user for a valid Cryo command.
+///
+/// # Panics
+/// If user inputted string is not a valid statement/command.
 pub fn prompt<R, W>(mut reader: R, mut writer: W) -> Command
 where
     R: BufRead,
