@@ -1,0 +1,8 @@
+[package]
+name = "cryo"
+version = "0.1.0"
+edition = "2024"
+authors = ["Davis Raymond Muro <git@davisraym.com>"]
+license = "MIT"
+
+[dependencies]
