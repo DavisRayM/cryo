@@ -50,4 +50,13 @@ mod tests {
         let res = prompt(&input[..], &mut output);
         assert_eq!(Command::Statement(String::default()), res);
     }
+
+    #[test]
+    #[should_panic(expected = "unrecognized command")]
+    fn prompt_unrecognized_command() {
+        let input = b".something_wrong\n";
+        let mut output = Vec::new();
+
+        prompt(&input[..], &mut output);
+    }
 }
