@@ -1,8 +1,11 @@
 use crate::{EMAIL_MAX_LENGTH, Statement, USERNAME_MAX_LENGTH};
 
+pub(crate) const ROW_ID_SIZE: usize = size_of::<usize>();
 // NOTE: Characters in rust are Unicode scalar values which are maximum 4 bytes; Hence the *4
-pub(crate) const ROW_SIZE: usize =
-    size_of::<usize>() + (USERNAME_MAX_LENGTH * 4) + (EMAIL_MAX_LENGTH * 4);
+pub(crate) const ROW_USERNAME_SIZE: usize = USERNAME_MAX_LENGTH * 4;
+pub(crate) const ROW_EMAIL_SIZE: usize = EMAIL_MAX_LENGTH * 4;
+
+pub(crate) const ROW_SIZE: usize = ROW_ID_SIZE + ROW_USERNAME_SIZE + ROW_EMAIL_SIZE;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Row([u8; ROW_SIZE]);
