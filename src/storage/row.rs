@@ -1,6 +1,6 @@
 use crate::{EMAIL_MAX_LENGTH, Statement, USERNAME_MAX_LENGTH};
 
-// NOTE: Characters in rust are Unicode scalar values which are 4 bytes; Hence the *4
+// NOTE: Characters in rust are Unicode scalar values which are maximum 4 bytes; Hence the *4
 pub(crate) const ROW_SIZE: usize =
     size_of::<usize>() + (USERNAME_MAX_LENGTH * 4) + (EMAIL_MAX_LENGTH * 4);
 
@@ -16,11 +16,26 @@ impl TryFrom<Statement> for Row {
 }
 
 pub(crate) fn char_array_to_byte_array(val: &[char]) -> Vec<u8> {
-    todo!()
+    let mut res = Vec::new();
+
+    for c in val {
+        let mut buf = [0; 4];
+        c.encode_utf8(&mut buf);
+        res.extend_from_slice(&buf);
+    }
+
+    res
 }
 
 pub(crate) fn byte_array_to_char_array(val: &[u8]) -> Vec<char> {
-    todo!()
+    let mut res = Vec::new();
+
+    for chunk in val.chunks(4) {
+        let str = std::str::from_utf8(chunk).expect("should be valid UTF-8 character");
+        res.push(str.chars().next().expect("should be atleast one char"));
+    }
+
+    res
 }
 
 #[cfg(test)]
