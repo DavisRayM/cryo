@@ -1,2 +1,5 @@
 pub mod cli;
-pub mod statement;
+pub(crate) mod statement;
+pub mod storage;
+
+pub(crate) use statement::*;
