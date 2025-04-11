@@ -176,8 +176,8 @@ mod tests {
     #[test]
     fn command_to_insert_statement() {
         let id = 1;
-        let username: String = "davis".into();
-        let email: String = "git@davisraym.com".into();
+        let username = "davis";
+        let email = "git@davisraym.com";
         let command = Command::Statement(format!("insert {id} {username} {email}"));
 
         assert_eq!(
