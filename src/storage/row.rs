@@ -11,7 +11,22 @@ impl TryFrom<Statement> for Row {
     type Error = String;
 
     fn try_from(value: Statement) -> Result<Self, Self::Error> {
-        unimplemented!()
+        match value {
+            Statement::Insert {
+                id,
+                username,
+                email,
+            } => {
+                let mut bytes = Vec::new();
+
+                bytes.extend_from_slice(id.to_ne_bytes().as_ref());
+                bytes.extend_from_slice(&char_array_to_byte_array(&username));
+                bytes.extend_from_slice(&char_array_to_byte_array(email.as_ref()));
+
+                Ok(Self(bytes.try_into().expect("should be expected length")))
+            }
+            _ => Err("can not convert statement to row".to_string()),
+        }
     }
 }
 
@@ -31,6 +46,7 @@ pub(crate) fn byte_array_to_char_array(val: &[u8]) -> Vec<char> {
     let mut res = Vec::new();
 
     for chunk in val.chunks(4) {
+        // TODO: At some point I may want to handle these errors...
         let str = std::str::from_utf8(chunk).expect("should be valid UTF-8 character");
         res.push(str.chars().next().expect("should be atleast one char"));
     }
