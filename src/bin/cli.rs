@@ -15,10 +15,11 @@ fn main() {
         };
 
         match prompt(reader, writer) {
-            Command::Exit => break,
-            Command::Statement(s) => {
+            Ok(Command::Exit) => break,
+            Ok(Command::Statement(s)) => {
                 println!("Statement: {}", s);
             }
+            Err(e) => eprintln!("{}", e),
         }
     }
 }
