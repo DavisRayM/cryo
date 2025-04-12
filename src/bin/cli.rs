@@ -20,11 +20,11 @@ fn main() {
 
         match prompt(reader, writer) {
             Ok(Command::Exit) => break,
-            Ok(c) => {
-                if let Err(e) = backend.query(c) {
-                    eprintln!("statement error: {}", e);
-                }
-            }
+            Ok(c) => match backend.query(c) {
+                Ok(Some(s)) => println!("{}", s),
+                Ok(None) => (),
+                Err(e) => eprintln!("{}", e),
+            },
             Err(e) => eprintln!("{}", e),
         }
     }

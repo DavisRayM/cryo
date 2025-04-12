@@ -67,8 +67,6 @@ impl StorageBackend for BTreeStorage {
     fn query(&mut self, cmd: Command) -> Result<Option<Self::Output>, Self::Error> {
         let stmt: Statement = cmd.try_into().unwrap();
 
-        println!("query received: {:?}", stmt);
-
         match stmt {
             Statement::Select => Ok(Some(self.select(stmt)?)),
             Statement::Insert { .. } => {
