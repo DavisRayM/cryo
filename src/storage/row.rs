@@ -1,3 +1,5 @@
+use std::fmt;
+
 use crate::{EMAIL_MAX_LENGTH, Statement, USERNAME_MAX_LENGTH};
 
 pub(crate) const ROW_ID_SIZE: usize = size_of::<usize>();
@@ -6,9 +8,53 @@ pub(crate) const ROW_USERNAME_SIZE: usize = USERNAME_MAX_LENGTH * 4;
 pub(crate) const ROW_EMAIL_SIZE: usize = EMAIL_MAX_LENGTH * 4;
 
 pub(crate) const ROW_SIZE: usize = ROW_ID_SIZE + ROW_USERNAME_SIZE + ROW_EMAIL_SIZE;
+pub(crate) const ID_OFFSET: usize = 0;
+pub(crate) const USERNAME_OFFSET: usize = ID_OFFSET + ROW_ID_SIZE;
+pub(crate) const EMAIL_OFFSET: usize = USERNAME_OFFSET + ROW_USERNAME_SIZE;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Row([u8; ROW_SIZE]);
+
+impl Row {
+    pub fn key(&self) -> usize {
+        let bytes = &self.0[ID_OFFSET..USERNAME_OFFSET];
+        usize::from_ne_bytes(bytes.try_into().expect("should be expected size"))
+    }
+
+    pub fn username(&self) -> String {
+        let bytes = &self.0[USERNAME_OFFSET..EMAIL_OFFSET];
+        byte_array_to_char_array(bytes)
+            .iter()
+            .filter(|c| **c != '\0')
+            .collect()
+    }
+
+    pub fn email(&self) -> String {
+        let bytes = &self.0[EMAIL_OFFSET..ROW_SIZE];
+        byte_array_to_char_array(bytes)
+            .iter()
+            .filter(|c| **c != '\0')
+            .collect()
+    }
+}
+
+impl fmt::Display for Row {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{} {} {}", self.key(), self.username(), self.email())
+    }
+}
+
+impl PartialOrd for Row {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for Row {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.key().cmp(&other.key())
+    }
+}
 
 impl TryFrom<Statement> for Row {
     type Error = String;

@@ -1,12 +1,16 @@
 use std::io;
 
-use cryo::cli::{Command, prompt};
+use cryo::{
+    BTreeStorage, StorageBackend,
+    cli::{Command, prompt},
+};
 
 fn main() {
     let mut reader;
     let mut writer;
     let stdio = io::stdin();
     let stdout = io::stdout();
+    let mut backend = BTreeStorage::new();
 
     loop {
         reader = stdio.lock();
@@ -16,8 +20,10 @@ fn main() {
 
         match prompt(reader, writer) {
             Ok(Command::Exit) => break,
-            Ok(Command::Statement(s)) => {
-                println!("Statement: {}", s);
+            Ok(c) => {
+                if let Err(e) = backend.query(c) {
+                    eprintln!("statement error: {}", e);
+                }
             }
             Err(e) => eprintln!("{}", e),
         }

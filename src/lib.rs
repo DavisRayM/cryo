@@ -3,3 +3,4 @@ pub(crate) mod statement;
 pub mod storage;
 
 pub(crate) use statement::*;
+pub use storage::*;
