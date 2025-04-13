@@ -101,8 +101,45 @@ impl BTreeStorage {
         Ok(out)
     }
 
+    /// Flushes pager cache to disk
+    pub fn close(mut self) -> Result<(), StorageError> {
+        while !self.cached.is_empty() {
+            self.free()?;
+        }
+        Ok(())
+    }
+
+    /// Creates a new page and returns the offset to the page
+    fn create(
+        &mut self,
+        kind: PageKind,
+        cells: usize,
+        parent: usize,
+    ) -> Result<usize, StorageError> {
+        let offset = self.pages * PAGE_SIZE;
+        let page = Page::new(offset, self.pages, kind, cells, parent);
+
+        if let Some(path) = self.path.take() {
+            let f = OpenOptions::new().write(true).open(&path)?;
+            let mut writer = BufWriter::new(f);
+
+            writer.seek(SeekFrom::Start(offset as u64))?;
+            let buf: [u8; PAGE_SIZE] = page.into();
+            writer.write_all(&buf)?;
+            writer.flush()?;
+            self.path = Some(path);
+            self.pages += 1;
+            self.page(self.pages - 1)?;
+        } else {
+            self.cached.push_back(Arc::new(RefCell::new(page)));
+            self.pages += 1;
+        };
+
+        Ok(offset)
+    }
+
     /// Inserts a new Row into the BTree storage
-    pub(crate) fn insert(&mut self, row: Row) -> Result<(), StorageError> {
+    fn insert(&mut self, row: Row) -> Result<(), StorageError> {
         let page_offset = self.current;
         let page = self.page(page_offset)?;
 
@@ -143,45 +180,8 @@ impl BTreeStorage {
         }
     }
 
-    /// Flushes pager cache to disk
-    pub fn close(mut self) -> Result<(), StorageError> {
-        while !self.cached.is_empty() {
-            self.free()?;
-        }
-        Ok(())
-    }
-
-    /// Creates a new page and returns the offset to the page
-    pub(crate) fn create(
-        &mut self,
-        kind: PageKind,
-        cells: usize,
-        parent: usize,
-    ) -> Result<usize, StorageError> {
-        let offset = self.pages * PAGE_SIZE;
-        let page = Page::new(offset, self.pages, kind, cells, parent);
-
-        if let Some(path) = self.path.take() {
-            let f = OpenOptions::new().write(true).open(&path)?;
-            let mut writer = BufWriter::new(f);
-
-            writer.seek(SeekFrom::Start(offset as u64))?;
-            let buf: [u8; PAGE_SIZE] = page.into();
-            writer.write_all(&buf)?;
-            writer.flush()?;
-            self.path = Some(path);
-            self.pages += 1;
-            self.page(self.pages - 1)?;
-        } else {
-            self.cached.push_back(Arc::new(RefCell::new(page)));
-            self.pages += 1;
-        };
-
-        Ok(offset)
-    }
-
     /// Splits an Internal node at the current position
-    pub(crate) fn split_internal(&mut self, root: bool) -> Result<(), StorageError> {
+    fn split_internal(&mut self, root: bool) -> Result<(), StorageError> {
         if root {
             let parent_offset =
                 self.create(PageKind::Internal { offsets: vec![] }, 0, self.root)?;
@@ -216,7 +216,7 @@ impl BTreeStorage {
     /// Splits a Leaf node at the current position
     ///
     /// TODO: Handle median/max keys
-    pub(crate) fn split_leaf(&mut self, root: bool) -> Result<(), StorageError> {
+    fn split_leaf(&mut self, root: bool) -> Result<(), StorageError> {
         if root {
             let parent_offset =
                 self.create(PageKind::Internal { offsets: vec![] }, 0, self.root)?;
