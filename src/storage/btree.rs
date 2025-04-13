@@ -30,6 +30,7 @@ pub struct BTreeStorage {
 }
 
 impl BTreeStorage {
+    /// Create a new BTreeStorage backend and configures persistence to the directory
     pub fn new(dir: PathBuf) -> Result<Self, StorageError> {
         let path = dir.join("btree.db");
         let f = OpenOptions::new()
@@ -64,6 +65,7 @@ impl BTreeStorage {
         Ok(storage)
     }
 
+    /// Walks the BTree and prints all the nodes
     pub(crate) fn walk(&mut self, width: Option<usize>) -> Result<String, StorageError> {
         let page_offset = self.current;
         let page = self.page(page_offset)?;
@@ -99,6 +101,7 @@ impl BTreeStorage {
         Ok(out)
     }
 
+    /// Inserts a new Row into the BTree storage
     pub(crate) fn insert(&mut self, row: Row) -> Result<(), StorageError> {
         let page_offset = self.current;
         let page = self.page(page_offset)?;
@@ -177,6 +180,74 @@ impl BTreeStorage {
         Ok(offset)
     }
 
+    /// Splits an Internal node at the current position
+    pub(crate) fn split_internal(&mut self, root: bool) -> Result<(), StorageError> {
+        if root {
+            let parent_offset =
+                self.create(PageKind::Internal { offsets: vec![] }, 0, self.root)?;
+            let child_offset = self.current;
+            let right_offset =
+                self.create(PageKind::Internal { offsets: vec![] }, 0, parent_offset)?;
+
+            // Link child to parent
+            self.page(child_offset)?.borrow_mut().parent = parent_offset;
+            self.page(parent_offset)?.borrow_mut().parent = parent_offset;
+
+            // Add children
+            for child in vec![child_offset, right_offset] {
+                let mut row = Row::new();
+                row.set_offset(self.page(child)?.borrow().offset);
+                row.set_id(self.page(child)?.borrow().id);
+                self.page(parent_offset)?.borrow_mut().insert(row)?;
+            }
+
+            // Ensure root parent ID is itself.
+            self.root = parent_offset;
+            self.current = right_offset;
+            Ok(())
+        } else {
+            let parent = self.page(self.current)?.borrow().parent;
+            let offset = self.create(PageKind::Internal { offsets: vec![] }, 0, parent)?;
+            self.current = parent;
+            self.split_insert(offset)
+        }
+    }
+
+    /// Splits a Leaf node at the current position
+    ///
+    /// TODO: Handle median/max keys
+    pub(crate) fn split_leaf(&mut self, root: bool) -> Result<(), StorageError> {
+        if root {
+            let parent_offset =
+                self.create(PageKind::Internal { offsets: vec![] }, 0, self.root)?;
+            let child_offset = self.current;
+            let right_offset = self.create(PageKind::Leaf { rows: vec![] }, 0, parent_offset)?;
+
+            // Link child to parent
+            self.page(child_offset)?.borrow_mut().parent = parent_offset;
+            self.page(parent_offset)?.borrow_mut().parent = parent_offset;
+
+            // Add children
+            for child in vec![child_offset, right_offset] {
+                let mut row = Row::new();
+                row.set_offset(self.page(child)?.borrow().offset);
+                row.set_id(self.page(child)?.borrow().id);
+                self.page(parent_offset)?.borrow_mut().insert(row)?;
+            }
+
+            // Ensure root parent ID is itself.
+            self.root = parent_offset;
+            self.current = self.root;
+            Ok(())
+        } else {
+            let parent = self.page(self.current)?.borrow().parent;
+            let offset = self.create(PageKind::Leaf { rows: vec![] }, 0, parent)?;
+            self.current = parent;
+            self.split_insert(offset)
+        }
+    }
+
+    /// Splits the current node and inserts a new child to it
     fn split_insert(&mut self, child: usize) -> Result<(), StorageError> {
         let mut row = Row::new();
         let offset = self.page(child)?.borrow().offset;
@@ -210,69 +281,10 @@ impl BTreeStorage {
         res
     }
 
-    pub(crate) fn split_internal(&mut self, root: bool) -> Result<(), StorageError> {
-        if root {
-            let parent_offset =
-                self.create(PageKind::Internal { offsets: vec![] }, 0, self.root)?;
-            let child_offset = self.current;
-            let right_offset =
-                self.create(PageKind::Internal { offsets: vec![] }, 0, parent_offset)?;
-
-            // Link child to parent
-            self.page(child_offset)?.borrow_mut().parent = parent_offset;
-            self.page(parent_offset)?.borrow_mut().parent = parent_offset;
-
-            // Add children
-            for child in vec![child_offset, right_offset] {
-                let mut row = Row::new();
-                row.set_offset(self.page(child)?.borrow().offset);
-                row.set_id(self.page(child)?.borrow().id);
-                self.page(parent_offset)?.borrow_mut().insert(row)?;
-            }
-
-            // Ensure root parent ID is itself.
-            self.root = parent_offset;
-            self.current = right_offset;
-            Ok(())
-        } else {
-            let parent = self.page(self.current)?.borrow().parent;
-            let offset = self.create(PageKind::Internal { offsets: vec![] }, 0, parent)?;
-            self.current = parent;
-            self.split_insert(offset)
-        }
-    }
-
-    pub(crate) fn split_leaf(&mut self, root: bool) -> Result<(), StorageError> {
-        if root {
-            let parent_offset =
-                self.create(PageKind::Internal { offsets: vec![] }, 0, self.root)?;
-            let child_offset = self.current;
-            let right_offset = self.create(PageKind::Leaf { rows: vec![] }, 0, parent_offset)?;
-
-            // Link child to parent
-            self.page(child_offset)?.borrow_mut().parent = parent_offset;
-            self.page(parent_offset)?.borrow_mut().parent = parent_offset;
-
-            // Add children
-            for child in vec![child_offset, right_offset] {
-                let mut row = Row::new();
-                row.set_offset(self.page(child)?.borrow().offset);
-                row.set_id(self.page(child)?.borrow().id);
-                self.page(parent_offset)?.borrow_mut().insert(row)?;
-            }
-
-            // Ensure root parent ID is itself.
-            self.root = parent_offset;
-            self.current = self.root;
-            Ok(())
-        } else {
-            let parent = self.page(self.current)?.borrow().parent;
-            let offset = self.create(PageKind::Leaf { rows: vec![] }, 0, parent)?;
-            self.current = parent;
-            self.split_insert(offset)
-        }
-    }
-
+    // Clear a page from cache and write it to disk
+    //
+    // # Panics
+    // If no path has been configured for the storage
     fn free(&mut self) -> Result<(), StorageError> {
         if let Some(path) = self.path.take() {
             let page = self.cached.pop_front().ok_or(StorageError::Storage {
