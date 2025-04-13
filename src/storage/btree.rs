@@ -436,6 +436,7 @@ mod tests {
         for i in 0..CELLS_PER_LEAF * leafs {
             let mut row = Row::new();
             row.set_id(i);
+            storage.current = storage.root;
             storage.insert(row).unwrap();
         }
 
@@ -465,6 +466,7 @@ mod tests {
         for i in 0..CELLS_PER_LEAF * (CELLS_PER_INTERNAL + 1) {
             let mut row = Row::new();
             row.set_id(i);
+            storage.current = storage.root;
             storage.insert(row).unwrap();
         }
 
@@ -482,6 +484,7 @@ mod tests {
         for i in 0..CELLS_PER_LEAF * (CELLS_PER_INTERNAL * 2) + 1 {
             let mut row = Row::new();
             row.set_id(i);
+            storage.current = storage.root;
             storage.insert(row).unwrap();
         }
 
