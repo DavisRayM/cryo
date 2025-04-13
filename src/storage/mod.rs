@@ -1,3 +1,4 @@
+pub mod btree;
 pub mod page;
 pub mod row;
 
@@ -25,12 +26,15 @@ pub mod header {
         pub(crate) const PAGE_SIZE: usize = 4096;
         pub(crate) const PAGE_ID_SIZE: usize = size_of::<usize>();
         pub(crate) const PAGE_CELLS_SIZE: usize = size_of::<usize>();
+        pub(crate) const PAGE_PARENT_SIZE: usize = size_of::<usize>();
         pub(crate) const PAGE_KIND_SIZE: usize = size_of::<u8>();
-        pub(crate) const PAGE_HEADER_SIZE: usize = PAGE_ID_SIZE + PAGE_CELLS_SIZE + PAGE_KIND_SIZE;
+        pub(crate) const PAGE_HEADER_SIZE: usize =
+            PAGE_ID_SIZE + PAGE_CELLS_SIZE + PAGE_PARENT_SIZE + PAGE_KIND_SIZE;
 
         pub(crate) const PAGE_ID: usize = 0;
         pub(crate) const PAGE_CELLS: usize = PAGE_ID + PAGE_ID_SIZE;
-        pub(crate) const PAGE_KIND: usize = PAGE_CELLS + PAGE_CELLS_SIZE;
+        pub(crate) const PAGE_PARENT: usize = PAGE_CELLS + PAGE_CELLS_SIZE;
+        pub(crate) const PAGE_KIND: usize = PAGE_PARENT + PAGE_PARENT_SIZE;
         pub(crate) const HEADER_END: usize = PAGE_HEADER_SIZE;
 
         pub(crate) const CELLS_PER_LEAF: usize = (PAGE_SIZE - PAGE_HEADER_SIZE) / LEAF_ROW_SIZE;
@@ -43,6 +47,8 @@ pub mod header {
 }
 
 pub mod error {
+    use std::{error::Error, io};
+
     use thiserror::Error;
 
     #[derive(Debug)]
@@ -59,6 +65,22 @@ pub mod error {
         DataWrangling,
     }
 
+    #[derive(Debug)]
+    pub enum StorageAction {
+        Page,
+        PageOut,
+        PageCreate,
+        Insert,
+        SplitLeaf,
+    }
+
+    #[derive(Debug)]
+    pub enum StorageErrorCause {
+        OutOfBounds,
+        Error(Box<StorageError>),
+        Unknown,
+    }
+
     #[derive(Debug, Error)]
     pub enum StorageError {
         #[error("[row error][{action}]: {error}")]
@@ -71,6 +93,15 @@ pub mod error {
         Page {
             action: PageAction,
             cause: PageErrorCause,
+        },
+
+        #[error("[IO error] {0}")]
+        Io(#[from] io::Error),
+
+        #[error("[storage][{action:?}] {cause:?}")]
+        Storage {
+            action: StorageAction,
+            cause: StorageErrorCause,
         },
     }
 }

@@ -5,7 +5,7 @@ use super::{
     header::{
         page::{
             CELLS_PER_LEAF, PAGE_CELLS, PAGE_HEADER_SIZE, PAGE_ID, PAGE_INTERNAL, PAGE_KIND,
-            PAGE_LEAF, PAGE_SIZE,
+            PAGE_LEAF, PAGE_PARENT, PAGE_SIZE,
         },
         row::{INTERNAL_ROW_SIZE, LEAF_ROW_SIZE},
     },
@@ -14,10 +14,11 @@ use super::{
 
 #[derive(Debug, Clone)]
 pub(crate) struct Page {
-    cells: usize,
-    id: usize,
-    kind: Option<PageKind>,
-    offset: usize,
+    pub kind: Option<PageKind>,
+    pub id: usize,
+    pub offset: usize,
+    pub parent: usize,
+    pub cells: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -47,20 +48,40 @@ impl Ord for Page {
 }
 
 impl Page {
-    pub fn new(offset: usize, id: usize, kind: PageKind, cells: usize) -> Self {
+    pub fn new(offset: usize, id: usize, kind: PageKind, cells: usize, parent: usize) -> Self {
         Self {
             cells,
             id,
             kind: Some(kind),
             offset,
+            parent,
         }
+    }
+
+    pub fn leaf(&self) -> bool {
+        if let Some(kind) = &self.kind {
+            return match kind {
+                PageKind::Leaf { .. } => true,
+                _ => false,
+            };
+        }
+        println!("{:?}", self);
+        panic!("page unknown")
     }
 
     pub fn select(mut self) -> Result<Vec<Row>, StorageError> {
         if let Some(kind) = self.kind.take() {
-            match kind {
-                PageKind::Internal { offsets } => Ok(offsets),
-                PageKind::Leaf { rows } => Ok(rows),
+            match &kind {
+                PageKind::Internal { offsets } => {
+                    let out = offsets.clone();
+                    self.kind = Some(kind);
+                    Ok(out)
+                }
+                PageKind::Leaf { rows } => {
+                    let out = rows.clone();
+                    self.kind = Some(kind);
+                    Ok(out)
+                }
             }
         } else {
             Err(StorageError::Page {
@@ -88,6 +109,7 @@ impl Page {
             match &mut kind {
                 PageKind::Internal { offsets } => {
                     if self.cells >= CELLS_PER_INTERNAL {
+                        self.kind = Some(kind);
                         return Err(StorageError::Page {
                             action: PageAction::Insert,
                             cause: PageErrorCause::Full,
@@ -98,6 +120,7 @@ impl Page {
                 }
                 PageKind::Leaf { rows } => {
                     if self.cells >= CELLS_PER_LEAF {
+                        self.kind = Some(kind);
                         return Err(StorageError::Page {
                             action: PageAction::Insert,
                             cause: PageErrorCause::Full,
@@ -107,7 +130,6 @@ impl Page {
                     bin_insert(rows, row)?;
                 }
             };
-
             self.kind = Some(kind);
             self.cells += 1;
             Ok(())
@@ -139,7 +161,8 @@ impl From<Page> for [u8; PAGE_SIZE] {
         let mut buf = [0; PAGE_SIZE];
 
         buf[PAGE_ID..PAGE_CELLS].clone_from_slice(val.id.to_ne_bytes().as_ref());
-        buf[PAGE_CELLS..PAGE_KIND].clone_from_slice(val.cells.to_ne_bytes().as_ref());
+        buf[PAGE_CELLS..PAGE_PARENT].clone_from_slice(val.cells.to_ne_bytes().as_ref());
+        buf[PAGE_PARENT..PAGE_KIND].clone_from_slice(val.parent.to_ne_bytes().as_ref());
 
         let mut offset = PAGE_HEADER_SIZE;
         match val.kind.take() {
@@ -159,7 +182,9 @@ impl From<Page> for [u8; PAGE_SIZE] {
                     offset += LEAF_ROW_SIZE;
                 })
             }
-            None => panic!("unknown page: has no kind."),
+            None => {
+                panic!("unknown page: has no kind.")
+            }
         }
 
         buf
@@ -190,7 +215,14 @@ impl TryFrom<[u8; PAGE_SIZE]> for Page {
             }
         };
         let cells =
-            usize::from_ne_bytes(value[PAGE_CELLS..PAGE_KIND].try_into().map_err(|_| {
+            usize::from_ne_bytes(value[PAGE_CELLS..PAGE_PARENT].try_into().map_err(|_| {
+                StorageError::Page {
+                    action: PageAction::Read,
+                    cause: PageErrorCause::DataWrangling,
+                }
+            })?);
+        let parent =
+            usize::from_ne_bytes(value[PAGE_PARENT..PAGE_KIND].try_into().map_err(|_| {
                 StorageError::Page {
                     action: PageAction::Read,
                     cause: PageErrorCause::DataWrangling,
@@ -228,7 +260,7 @@ impl TryFrom<[u8; PAGE_SIZE]> for Page {
             }
         }
 
-        Ok(Page::new(offset, id, kind, cells))
+        Ok(Page::new(offset, id, kind, cells, parent))
     }
 }
 
@@ -240,7 +272,7 @@ mod tests {
 
     #[test]
     fn leaf_to_bytes() {
-        let mut page = Page::new(0, 100, PageKind::Leaf { rows: vec![] }, 0);
+        let mut page = Page::new(0, 100, PageKind::Leaf { rows: vec![] }, 0, 0);
         let mut row = Row::new();
         row.set_id(90);
         page.insert(row.clone()).unwrap();
@@ -250,13 +282,14 @@ mod tests {
         assert_eq!(page.offset, 0);
         assert_eq!(page.id, 100);
         assert_eq!(page.cells, 1);
+        assert_eq!(page.parent, 0);
         assert!(matches!(page.kind, Some(PageKind::Leaf { .. })));
         assert_eq!(page.select().unwrap(), vec![row]);
     }
 
     #[test]
     fn internal_to_bytes() {
-        let mut page = Page::new(0, 100, PageKind::Internal { offsets: vec![] }, 0);
+        let mut page = Page::new(0, 100, PageKind::Internal { offsets: vec![] }, 0, 0);
         let mut row = Row::new();
         row.set_id(90);
         page.insert(row.clone()).unwrap();
@@ -266,13 +299,14 @@ mod tests {
         assert_eq!(page.offset, 0);
         assert_eq!(page.id, 100);
         assert_eq!(page.cells, 1);
+        assert_eq!(page.parent, 0);
         assert!(matches!(page.kind, Some(PageKind::Internal { .. })));
         assert_eq!(page.select().unwrap(), vec![row]);
     }
 
     #[test]
     fn leaf_insert_cell() {
-        let mut page = Page::new(0, 0, PageKind::Leaf { rows: vec![] }, 0);
+        let mut page = Page::new(0, 0, PageKind::Leaf { rows: vec![] }, 0, 0);
         let mut row = Row::new();
         row.set_id(90);
         page.insert(row).unwrap();
@@ -282,7 +316,7 @@ mod tests {
 
     #[test]
     fn internal_insert_cell() {
-        let mut page = Page::new(0, 0, PageKind::Internal { offsets: vec![] }, 0);
+        let mut page = Page::new(0, 0, PageKind::Internal { offsets: vec![] }, 0, 0);
         let mut row = Row::new();
         row.set_id(90);
         page.insert(row).unwrap();
@@ -292,7 +326,7 @@ mod tests {
 
     #[test]
     fn leaf_select() {
-        let mut page = Page::new(0, 0, PageKind::Leaf { rows: vec![] }, 0);
+        let mut page = Page::new(0, 0, PageKind::Leaf { rows: vec![] }, 0, 0);
         let mut row = Row::new();
         row.set_id(90);
         page.insert(row.clone()).unwrap();
@@ -302,7 +336,7 @@ mod tests {
 
     #[test]
     fn internal() {
-        let mut page = Page::new(0, 0, PageKind::Leaf { rows: vec![] }, 0);
+        let mut page = Page::new(0, 0, PageKind::Leaf { rows: vec![] }, 0, 0);
         let mut row = Row::new();
         row.set_id(90);
         page.insert(row.clone()).unwrap();

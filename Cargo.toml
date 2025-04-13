@@ -11,3 +11,6 @@ test = true
 
 [dependencies]
 thiserror = "2.0.12"
+
+[dev-dependencies]
+tempdir = "0.3.7"
