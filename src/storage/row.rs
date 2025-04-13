@@ -6,13 +6,14 @@ pub(crate) const ROW_ALLOCATED_SPACE: usize = if INTERNAL_ROW_SIZE > LEAF_ROW_SI
     LEAF_ROW_SIZE
 };
 
+#[derive(Debug, Clone)]
 pub(crate) struct Row(pub [u8; ROW_ALLOCATED_SPACE]);
 
 pub fn byte_to_char(bytes: &[u8], mut cause: Option<String>) -> Result<Vec<char>, StorageError> {
     let mut out = Vec::new();
 
     for chunk in bytes.chunks(4) {
-        let ch = std::str::from_utf8(&chunk)
+        let ch = std::str::from_utf8(chunk)
             .map_err(|_| StorageError::Utility {
                 name: "byte_to_char - read character".into(),
                 cause: cause.take(),
@@ -44,6 +45,22 @@ pub fn char_to_byte(chars: &[char]) -> Vec<u8> {
 impl Row {
     pub fn new() -> Self {
         Self([0; ROW_ALLOCATED_SPACE])
+    }
+
+    pub fn offset(&self) -> Result<usize, StorageError> {
+        Ok(usize::from_ne_bytes(
+            self.0[ROW_OFFSET..ROW_OFFSET + ROW_OFFSET_SIZE]
+                .try_into()
+                .map_err(|_| StorageError::Row {
+                    action: "retrieve id".into(),
+                    error: "failed to get id bytes".into(),
+                })?,
+        ))
+    }
+
+    pub fn set_offset(&mut self, offset: usize) {
+        self.0[ROW_OFFSET..ROW_OFFSET + ROW_OFFSET_SIZE]
+            .clone_from_slice(offset.to_ne_bytes().as_ref());
     }
 
     pub fn id(&self) -> Result<usize, StorageError> {
@@ -83,6 +100,30 @@ impl Row {
     }
 }
 
+impl PartialEq for Row {
+    fn eq(&self, other: &Self) -> bool {
+        self.id()
+            .expect("row id eq")
+            .eq(&other.id().expect("row id eq"))
+    }
+}
+
+impl Eq for Row {}
+
+impl PartialOrd for Row {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for Row {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.id()
+            .expect("row id ord")
+            .cmp(&other.id().expect("row id ord"))
+    }
+}
+
 impl TryFrom<&[u8]> for Row {
     type Error = StorageError;
 
@@ -90,7 +131,7 @@ impl TryFrom<&[u8]> for Row {
         let mut buf = [0; ROW_ALLOCATED_SPACE];
         match value.len() {
             size if size == LEAF_ROW_SIZE || size == INTERNAL_ROW_SIZE => {
-                buf[..size].clone_from_slice(&value[..]);
+                buf[..size].clone_from_slice(value);
                 Ok(Self(buf))
             }
             l => Err(StorageError::Row {
@@ -101,18 +142,18 @@ impl TryFrom<&[u8]> for Row {
     }
 }
 
-impl Into<[u8; INTERNAL_ROW_SIZE]> for Row {
-    fn into(self) -> [u8; INTERNAL_ROW_SIZE] {
+impl From<&Row> for [u8; INTERNAL_ROW_SIZE] {
+    fn from(val: &Row) -> [u8; INTERNAL_ROW_SIZE] {
         let mut buf = [0; INTERNAL_ROW_SIZE];
-        buf[..].clone_from_slice(&self.0[..INTERNAL_ROW_SIZE]);
+        buf[..].clone_from_slice(&val.0[..INTERNAL_ROW_SIZE]);
         buf
     }
 }
 
-impl Into<[u8; LEAF_ROW_SIZE]> for Row {
-    fn into(self) -> [u8; LEAF_ROW_SIZE] {
+impl From<&Row> for [u8; LEAF_ROW_SIZE] {
+    fn from(val: &Row) -> [u8; LEAF_ROW_SIZE] {
         let mut buf = [0; LEAF_ROW_SIZE];
-        buf[..].clone_from_slice(&self.0[..LEAF_ROW_SIZE]);
+        buf[..].clone_from_slice(&val.0[..LEAF_ROW_SIZE]);
         buf
     }
 }
@@ -135,7 +176,7 @@ mod tests {
         let mut row = Row::new();
         row.set_id(90);
 
-        let bytes: [u8; INTERNAL_ROW_SIZE] = row.into();
+        let bytes: [u8; INTERNAL_ROW_SIZE] = (&row).into();
         let row: Row = (&bytes[..]).try_into().unwrap();
         assert_eq!(row.id().unwrap(), 90);
     }
@@ -146,9 +187,16 @@ mod tests {
         let email = convert_to_char_array::<EMAIL_MAX_LENGTH>(vec!['a', 'b'], '\0').unwrap();
         row.set_email(&email);
 
-        let bytes: [u8; LEAF_ROW_SIZE] = row.into();
+        let bytes: [u8; LEAF_ROW_SIZE] = (&row).into();
         let row: Row = (&bytes[..]).try_into().unwrap();
         assert_eq!(row.email().unwrap(), email.iter().collect::<String>());
+    }
+
+    #[test]
+    fn row_offset() {
+        let mut row = Row::new();
+        row.set_offset(10);
+        assert_eq!(row.offset().unwrap(), 10);
     }
 
     #[test]
