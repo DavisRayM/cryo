@@ -24,6 +24,8 @@ use super::{
 };
 
 const PAGE_IN_MEMORY: usize = 5;
+// Stop printing leaves in structure after pages surpass cutoff
+const LEAF_PRINT_CUTOFF: usize = 100;
 
 #[derive(Debug)]
 pub struct BTreeStorage {
@@ -171,7 +173,9 @@ impl BTreeStorage {
                 out += self.walk_tree(width + 2, visited)?.as_ref();
             }
         } else {
-            out += format!("  I{parent} -> L{id};\n").as_str();
+            if self.pages <= LEAF_PRINT_CUTOFF {
+                out += format!("  I{parent} -> L{id};\n").as_str();
+            }
         }
 
         Ok(out)
