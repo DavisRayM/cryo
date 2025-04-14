@@ -94,7 +94,7 @@ impl TryFrom<Command> for Statement {
     }
 }
 
-fn convert_to_char_array<const N: usize>(
+pub(crate) fn convert_to_char_array<const N: usize>(
     mut src: Vec<char>,
     fill: char,
 ) -> Result<[char; N], String> {

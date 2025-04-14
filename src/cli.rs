@@ -8,6 +8,10 @@ use std::io::{BufRead, Write};
 pub enum Command {
     /// Exit command `.exit`
     Exit,
+    /// Request the storage to print out it's structure
+    Structure,
+    /// Populate,
+    Populate(usize),
     /// DSL Statements
     Statement(String),
 }
@@ -30,6 +34,20 @@ where
 
     match s.trim_end() {
         ".exit" => Ok(Command::Exit),
+        ".structure" => Ok(Command::Structure),
+        s if s.starts_with(".populate") => {
+            let parts = s.split(' ').collect::<Vec<&str>>();
+            if parts.len() < 2 {
+                return Err(
+                    "populate command requires int argument for the number of records".into(),
+                );
+            }
+
+            let records = parts[1]
+                .parse::<usize>()
+                .map_err(|_| "number of records should be a valid number".to_string())?;
+            Ok(Command::Populate(records))
+        }
         s if !s.starts_with(".") => Ok(Command::Statement(s.to_string())),
         s => Err(format!("unrecognized command '{}'", s)),
     }
