@@ -154,32 +154,24 @@ impl BTreeStorage {
         let mut out = String::default();
         let page = self.page(self.current)?;
         let id = page.borrow().id;
+        let parent = self.page(page.borrow().parent)?.borrow().id;
 
-        let id = page.borrow().id;
         if visited.contains(&id) {
             return Ok(out);
         }
-        visited.push(page.borrow().id);
+        visited.push(id);
 
         if !page.borrow().leaf() {
-            let id = page.borrow().id;
+            out += format!("  I{parent} -> I{id}\n").as_str();
             let node = page.borrow_mut().select()?;
             for pointer in node {
                 self.current = pointer.left()?;
-                let child_id = self.page(self.current)?.borrow().id;
-                let child_type = if self.page(self.current)?.borrow().leaf() {
-                    "L"
-                } else {
-                    "I"
-                };
-
-                out += format!("I{id} -> {child_type}{child_id};\n").as_str();
                 out += self.walk_tree(width + 2, visited)?.as_ref();
                 self.current = pointer.right()?;
-                let child_id = self.page(self.current)?.borrow().id;
-                out += format!("I{id} -> {child_type}{child_id};\n").as_str();
                 out += self.walk_tree(width + 2, visited)?.as_ref();
             }
+        } else {
+            out += format!("  I{parent} -> L{id};\n").as_str();
         }
 
         Ok(out)
@@ -321,31 +313,22 @@ impl BTreeStorage {
             target.parent = parent.offset;
             self.root = parent.offset;
 
-            let left = target.offset;
-            let mut separator = Row::new();
-            separator.set_left(left);
+            let separator = self.split_child(target, row)?;
 
-            let (right, key) = self.split_child(target, row)?;
-            separator.set_id(key);
-            separator.set_right(right);
-
-            trace!("insert new separator key {key}, left: {left}, right: {right}");
+            trace!(
+                "insert new separator key {}, left: {}, right: {}",
+                separator.id()?,
+                separator.left()?,
+                separator.right()?
+            );
             parent.insert(separator)?;
             self.write_to_disk(parent)?;
             Ok(())
         } else {
             let parent_offset = target.parent;
-            let left = target.offset;
-
-            let (right, key) = self.split_child(target, row)?;
-
+            let pointer = self.split_child(target, row)?;
             self.current = parent_offset;
             let mut parent = self.read_from_disk(parent_offset)?;
-
-            let mut pointer = Row::new();
-            pointer.set_id(key);
-            pointer.set_left(left);
-            pointer.set_right(right);
 
             match parent.insert(pointer.clone()) {
                 Ok(()) => {
@@ -364,12 +347,13 @@ impl BTreeStorage {
         }
     }
 
-    fn split_child(&mut self, mut target: Page, row: Row) -> Result<(usize, usize), StorageError> {
+    fn split_child(&mut self, mut target: Page, row: Row) -> Result<Row, StorageError> {
         let parent_offset = target.parent;
         let parent = match self.uncache(parent_offset)? {
             Some(parent) => parent,
             None => self.read_from_disk(parent_offset)?,
         };
+        let mut pointer = Row::new();
 
         let mut left_candidates = target.select()?;
         let splitat = if target.leaf() {
@@ -381,7 +365,9 @@ impl BTreeStorage {
         let left_cells = left_candidates.len();
         let right_cells = right_candidates.len();
         let key = right_candidates[0].id()?;
-        trace!("selected split key: {key}");
+
+        pointer.set_id(key);
+        pointer.set_left(target.offset);
 
         let mut right = if target.leaf() {
             let right_offset = self.create(
@@ -425,20 +411,34 @@ impl BTreeStorage {
             target.cells = left_cells;
             self.read_from_disk(right_offset)?
         };
+        pointer.set_right(right.offset);
 
         let insert = row.id()?;
         if insert >= key {
+            if !target.leaf() {
+                // Update the links target page to point to the correct parent
+                let mut page = self
+                    .uncache(row.left()?)?
+                    .unwrap_or(self.read_from_disk(row.left()?)?);
+                page.parent = right.offset;
+                self.write_to_disk(page)?;
+
+                let mut page = self
+                    .uncache(row.right()?)?
+                    .unwrap_or(self.read_from_disk(row.right()?)?);
+                page.parent = right.offset;
+                self.write_to_disk(page)?;
+            }
             right.insert(row)?;
         } else {
             target.insert(row)?;
         }
 
-        let right_offset = right.offset;
         self.write_to_disk(parent)?;
         self.write_to_disk(target)?;
         self.write_to_disk(right)?;
 
-        Ok((right_offset, key))
+        Ok(pointer)
     }
 
     /// Searches an internal node for the position of `row`
@@ -710,7 +710,7 @@ mod tests {
         let dir = TempDir::new("InsertLeaf").unwrap();
         let path = dir.into_path();
         let mut storage = BTreeStorage::new(path.clone()).unwrap();
-        let cells = (CELLS_PER_INTERNAL * 2) + 4;
+        let cells = (CELLS_PER_INTERNAL * 2) + 3;
 
         storage.query(Command::Populate(cells)).unwrap();
 
@@ -739,7 +739,10 @@ mod tests {
         let mut storage = BTreeStorage::new(path.clone()).unwrap();
         let cmd = Command::Structure;
 
-        assert_eq!(storage.query(cmd).unwrap(), Some("leaf 0 0\n".into()));
+        assert_eq!(
+            storage.query(cmd).unwrap(),
+            Some("digraph {\n  I0 -> L0;\n}".into())
+        );
     }
 
     #[test]
