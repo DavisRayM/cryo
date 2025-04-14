@@ -23,7 +23,7 @@ use super::{
     row::Row,
 };
 
-const PAGE_IN_MEMORY: usize = 5;
+const PAGE_IN_MEMORY: usize = 10;
 // Stop printing leaves in structure after pages surpass cutoff
 const LEAF_PRINT_CUTOFF: usize = 100;
 
