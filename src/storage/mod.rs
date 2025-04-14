@@ -1,8 +1,10 @@
-use crate::cli::Command;
+use crate::Command;
 
 pub mod btree;
 pub mod page;
 pub mod row;
+
+pub use btree::BTreeStorage;
 
 pub mod header {
     pub mod row {

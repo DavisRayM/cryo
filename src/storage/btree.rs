@@ -9,13 +9,11 @@ use std::{
 
 use log::{debug, info, trace};
 
-use crate::{
-    cli::Command,
-    statement::Statement,
-    storage::{
-        error::{PageAction, StorageAction, StorageErrorCause},
-        header::page::PAGE_SIZE,
-    },
+use crate::Statement;
+use crate::storage::{
+    Command,
+    error::{PageAction, StorageAction, StorageErrorCause},
+    header::page::PAGE_SIZE,
 };
 
 use super::{
@@ -115,13 +113,16 @@ impl BTreeStorage {
             storage.create(PageKind::Leaf { rows: vec![] }, 0, 0)?;
         } else {
             trace!("locating root node");
-            let mut pos = 0;
-            let mut parent = storage.page(pos)?.borrow().parent;
+            let page = storage.page(0)?;
+            let mut pos = page.borrow().offset;
+            let mut parent = page.borrow().parent;
+
             while pos != parent {
+                trace!("traversing {} to parent {}", pos, parent);
                 pos = parent;
-                parent = storage.page(pos)?.borrow().parent;
+                parent = storage.page(parent)?.borrow().parent;
             }
-            storage.root = pos;
+            storage.root = parent;
             trace!("root located at: {pos}");
         }
         Ok(storage)
@@ -202,7 +203,7 @@ impl BTreeStorage {
             debug!("attempt to insert record at {}", self.current);
             if !page.borrow().leaf() {
                 debug!("page {} is internal, searching for leaf", page.borrow().id);
-                self.search_internal(&row);
+                self.search_internal(&row)?;
                 continue;
             }
 

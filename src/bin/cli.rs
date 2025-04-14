@@ -1,6 +1,6 @@
-use std::io;
+use std::{env::current_dir, io};
 
-use cryo::cli::{Command, prompt};
+use cryo::*;
 
 fn main() {
     env_logger::init();
@@ -9,6 +9,9 @@ fn main() {
     let mut writer;
     let stdio = io::stdin();
     let stdout = io::stdout();
+    let dir = current_dir().unwrap();
+    println!("storage created!");
+    let mut storage = BTreeStorage::new(dir).unwrap();
 
     loop {
         reader = stdio.lock();
@@ -17,9 +20,15 @@ fn main() {
         };
 
         match prompt(reader, writer) {
-            Ok(Command::Exit) => break,
-            Ok(Command::Statement(s)) => {
-                println!("Statement: {}", s);
+            Ok(Command::Exit) => {
+                storage.query(Command::Exit).unwrap();
+                break;
+            }
+            Ok(c) => {
+                let out = storage.query(c).unwrap();
+                if let Some(out) = out {
+                    println!("{out}");
+                }
             }
             Err(e) => eprintln!("{}", e),
         }
