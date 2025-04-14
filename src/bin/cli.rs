@@ -1,8 +1,8 @@
-use std::{env::current_dir, io};
+use std::{env::current_dir, error::Error, io};
 
 use cryo::*;
 
-fn main() {
+fn main() -> Result<(), Box<dyn Error>> {
     env_logger::init();
 
     let mut reader;
@@ -18,20 +18,31 @@ fn main() {
             inner: stdout.lock(),
         };
 
-        match prompt(reader, writer) {
-            Ok(Command::Exit) => {
-                storage.query(Command::Exit).unwrap();
-                break;
+        let cmd = match prompt(reader, writer) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("{}", e);
+                continue;
             }
-            Ok(c) => {
-                let out = storage.query(c).unwrap();
-                if let Some(out) = out {
-                    println!("{out}");
-                }
+        };
+
+        if let Command::Exit = cmd {
+            if let Err(e) = storage.close() {
+                eprintln!("failed to safely close database. error: {e}");
             }
-            Err(e) => eprintln!("{}", e),
+            break;
+        }
+
+        match storage.query(cmd) {
+            Ok(None) => {}
+            Ok(Some(out)) => println!("{out}"),
+            Err(e) => {
+                eprintln!("query error: {e}")
+            }
         }
     }
+
+    Ok(())
 }
 
 /// StdOut wrapper than automatically flushes content after every write.

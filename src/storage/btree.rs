@@ -9,12 +9,12 @@ use std::{
 
 use log::{debug, info, trace};
 
-use crate::Statement;
 use crate::storage::{
     Command,
     error::{PageAction, StorageAction, StorageErrorCause},
     header::page::PAGE_SIZE,
 };
+use crate::{Statement, storage::header::page::LEAF_SPLITAT};
 
 use super::{
     StorageBackend,
@@ -46,12 +46,10 @@ impl StorageBackend for BTreeStorage {
             }
             Command::Structure => Some(self.walk(None)?),
             cmd => {
-                trace!("storage received command: {cmd:?}");
                 let stmt: Statement = cmd.try_into().map_err(|e| StorageError::Storage {
                     action: StorageAction::Query,
                     cause: StorageErrorCause::Error(Box::new(e)),
                 })?;
-                debug!("received statement: {stmt:?}");
 
                 match stmt {
                     Statement::Insert {
@@ -59,13 +57,6 @@ impl StorageBackend for BTreeStorage {
                         username,
                         email,
                     } => {
-                        debug!(
-                            "creating row: {} {} {}",
-                            id,
-                            username.iter().collect::<String>(),
-                            email.iter().collect::<String>()
-                        );
-
                         let mut row = Row::new();
                         row.set_id(id);
                         row.set_email(email.as_ref());
@@ -198,6 +189,7 @@ impl BTreeStorage {
         Ok(offset)
     }
 
+    /// Inserts a new row into storage
     fn insert_row(&mut self, row: Row) -> Result<(), StorageError> {
         loop {
             let page = self.page(self.current)?;
@@ -208,9 +200,16 @@ impl BTreeStorage {
                 continue;
             }
 
-            debug!("page {} is a leaf; inserting value", page.borrow().id);
-            break match page.borrow_mut().insert(row) {
+            drop(page);
+            let mut page = match self.uncache(self.current)? {
+                Some(page) => page,
+                None => self.read_from_disk(self.current)?,
+            };
+            debug!("page {} is a leaf; inserting value", page.id);
+            trace!("record: {} {}", row.id()?, row.offset()?);
+            break match page.insert(row.clone()) {
                 Ok(_) => {
+                    self.write_to_disk(page)?;
                     debug!("row successfully inserted");
                     Ok(())
                 }
@@ -219,7 +218,7 @@ impl BTreeStorage {
                     ..
                 }) => {
                     debug!("current leaf node is full; splitting nodes");
-                    todo!("implement splitting again")
+                    self.split(page, row)
                 }
                 Err(e) => {
                     debug!("unexpected error during insert: {e:?}");
@@ -230,6 +229,103 @@ impl BTreeStorage {
                 }
             };
         }
+    }
+
+    /// Splits node to accommodate the new row.
+    fn split(&mut self, target: Page, row: Row) -> Result<(), StorageError> {
+        debug!(
+            "splitting node at {}; leaf: {}",
+            self.current,
+            target.leaf()
+        );
+
+        match target.leaf() {
+            true if target.offset == self.root => self.split_root_leaf(target, row),
+            true => {
+                todo!("none root leaf split")
+            }
+            false => {
+                todo!("Split internal node")
+            }
+        }
+    }
+
+    /// Splits a root leaf node into half
+    ///
+    /// NOTE: This only happens once...
+    fn split_root_leaf(&mut self, mut left: Page, row: Row) -> Result<(), StorageError> {
+        let parent_offset = self.create(PageKind::Internal { offsets: vec![] }, 0, 0)?;
+        trace!("creating new index at root, new root is {parent_offset}");
+
+        let mut parent = self.read_from_disk(parent_offset)?;
+        // Root nodes have themselves as their parent
+        parent.parent = parent.offset;
+        trace!(
+            "linking page {} at {} to new parent {} from {}",
+            left.id, left.offset, parent.offset, left.parent
+        );
+        // Update target to track new node as parent
+        left.parent = parent.offset;
+
+        let mut left_candidates = left.select()?;
+        let right_candidates = left_candidates.split_off(LEAF_SPLITAT);
+        trace!(
+            "left cells: {:?} right cells: {:?}",
+            left_candidates
+                .iter()
+                .map(|c| c.id().unwrap())
+                .collect::<Vec<usize>>(),
+            right_candidates
+                .iter()
+                .map(|c| c.id().unwrap())
+                .collect::<Vec<usize>>()
+        );
+        let left_cells = left_candidates.len();
+        let right_cells = right_candidates.len();
+        let key = right_candidates[0].id()?;
+        trace!("selected split key: {key}");
+
+        let right_offset = self.create(
+            PageKind::Leaf {
+                rows: right_candidates,
+            },
+            right_cells,
+            parent_offset,
+        )?;
+        let mut right = self.read_from_disk(right_offset)?;
+        trace!("creating right child, at offset {right_offset} with {right_cells} cells");
+
+        trace!("updating left child, assigning {left_cells} cells");
+        left.kind = Some(PageKind::Leaf {
+            rows: left_candidates,
+        });
+        left.cells = left_cells;
+
+        debug!(
+            "creating new index key: {key}\nleft: {}\nright: {right_offset}",
+            left.offset
+        );
+        let mut separator = Row::new();
+        separator.set_id(key);
+        separator.set_left(left.offset);
+        separator.set_right(right_offset);
+        parent.insert(separator)?;
+
+        let insert = row.id()?;
+        debug!("inserting key {} to the", row.id()?);
+        if insert >= key {
+            right.insert(row)?;
+        } else {
+            left.insert(row)?;
+        }
+
+        debug!("updating root to {parent_offset}");
+        self.root = parent_offset;
+        self.write_to_disk(parent)?;
+        self.write_to_disk(left)?;
+        self.write_to_disk(right)?;
+
+        Ok(())
     }
 
     /// Searches an internal node for the position of `row`
@@ -248,34 +344,22 @@ impl BTreeStorage {
         debug!("candidates: {:?}", pointers);
 
         let pos = match pointers.binary_search(&row) {
-            Ok(pos) => {
-                debug!("found candidate at location: {pos}, picking next pointer");
-                pos + 1
-            }
+            Ok(pos) => pointers[pos].right()?,
             Err(pos) => {
-                debug!("possible candidate at {pos}");
-                pos
+                let pointer = &pointers[pos - 1];
+                if pointer.id()? >= row.id()? {
+                    pointer.right()?
+                } else {
+                    pointer.left()?
+                }
             }
         };
+        debug!("possible candidate at {pos}");
 
-        if pos >= pointers.len() {
-            debug!(
-                "position({}) out of bounds, pointers {} current {}",
-                pos,
-                pointers.len(),
-                self.current
-            );
-            trace!("current page: {:?}", page);
-            Err(StorageError::Storage {
-                action: StorageAction::Search,
-                cause: StorageErrorCause::OutOfBounds,
-            })
-        } else {
-            let offset = pointers[pos].offset()?;
-            debug!("traversing to child at {offset}");
-            self.current = offset;
-            Ok(())
-        }
+        let offset = pos;
+        debug!("traversing to child at {offset}");
+        self.current = offset;
+        Ok(())
     }
 
     /// Retrieves page from cache if present of loads it from disk.
@@ -285,7 +369,6 @@ impl BTreeStorage {
     /// - If IO error occurs
     /// - If failed to load page from disk
     fn page(&mut self, offset: usize) -> Result<Arc<RefCell<Page>>, StorageError> {
-        trace!("paging in {offset} page");
         if offset >= self.pages * PAGE_SIZE {
             debug!(
                 "offset {offset} is out of bounds; current pages {1} maximum {0}",
@@ -333,7 +416,6 @@ impl BTreeStorage {
 
     /// Adds a new page into the cache.
     fn cache(&mut self, page: Page) -> Result<Arc<RefCell<Page>>, StorageError> {
-        trace!("caching page {}", page.id);
         let page = Arc::new(RefCell::new(page));
         let clone = Arc::clone(&page);
         self.cached.push_front(page);
@@ -420,7 +502,6 @@ impl BTreeStorage {
 
     /// Retrieves page from cache if any
     fn cached_page(&mut self, offset: usize) -> Result<Option<Arc<RefCell<Page>>>, StorageError> {
-        trace!("checking cache for page: {offset}");
         while self.cached.len() >= PAGE_IN_MEMORY {
             trace!(
                 "cache over capacity({}) {}, clearing page",
@@ -439,7 +520,7 @@ impl BTreeStorage {
             debug!("page {offset} is not cached");
             Ok(None)
         } else {
-            debug!("page {offset} cached (hits: {})", page.len());
+            debug!("retrieved from cache page {offset}(hits: {})", page.len());
             Ok(Some(Arc::clone(page[0])))
         }
     }

@@ -55,6 +55,38 @@ impl Row {
         Self([0; ROW_ALLOCATED_SPACE])
     }
 
+    pub fn left(&self) -> Result<usize, StorageError> {
+        Ok(usize::from_ne_bytes(
+            self.0[ROW_LEFT_OFFSET..ROW_LEFT_OFFSET + ROW_OFFSET_SIZE]
+                .try_into()
+                .map_err(|_| StorageError::Row {
+                    action: "retrieve id".into(),
+                    error: "failed to get id bytes".into(),
+                })?,
+        ))
+    }
+
+    pub fn set_left(&mut self, offset: usize) {
+        self.0[ROW_LEFT_OFFSET..ROW_LEFT_OFFSET + ROW_OFFSET_SIZE]
+            .clone_from_slice(offset.to_ne_bytes().as_ref());
+    }
+
+    pub fn right(&self) -> Result<usize, StorageError> {
+        Ok(usize::from_ne_bytes(
+            self.0[ROW_RIGHT_OFFSET..ROW_RIGHT_OFFSET + ROW_OFFSET_SIZE]
+                .try_into()
+                .map_err(|_| StorageError::Row {
+                    action: "retrieve id".into(),
+                    error: "failed to get id bytes".into(),
+                })?,
+        ))
+    }
+
+    pub fn set_right(&mut self, offset: usize) {
+        self.0[ROW_RIGHT_OFFSET..ROW_RIGHT_OFFSET + ROW_OFFSET_SIZE]
+            .clone_from_slice(offset.to_ne_bytes().as_ref());
+    }
+
     pub fn offset(&self) -> Result<usize, StorageError> {
         Ok(usize::from_ne_bytes(
             self.0[ROW_OFFSET..ROW_OFFSET + ROW_OFFSET_SIZE]

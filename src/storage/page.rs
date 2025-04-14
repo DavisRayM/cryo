@@ -1,3 +1,5 @@
+use log::trace;
+
 use crate::storage::{error::PageErrorCause, header::page::CELLS_PER_INTERNAL};
 
 use super::{
@@ -85,7 +87,7 @@ impl Page {
             }
         } else {
             Err(StorageError::Page {
-                action: PageAction::Insert,
+                action: PageAction::Select,
                 cause: PageErrorCause::Unknown,
             })
         }
@@ -158,6 +160,10 @@ impl Page {
 
 impl From<Page> for [u8; PAGE_SIZE] {
     fn from(mut val: Page) -> [u8; PAGE_SIZE] {
+        trace!(
+            "converting page to bytes {} cells: {} parent: {}",
+            val.id, val.cells, val.parent
+        );
         let mut buf = [0; PAGE_SIZE];
 
         buf[PAGE_ID..PAGE_CELLS].clone_from_slice(val.id.to_ne_bytes().as_ref());
@@ -169,6 +175,12 @@ impl From<Page> for [u8; PAGE_SIZE] {
             Some(PageKind::Internal { offsets }) => {
                 buf[PAGE_KIND] = PAGE_INTERNAL;
                 offsets.iter().for_each(|cell| {
+                    trace!(
+                        "writing internal cell {} left: {} right: {}",
+                        cell.id().unwrap(),
+                        cell.left().unwrap(),
+                        cell.right().unwrap()
+                    );
                     let bytes: [u8; INTERNAL_ROW_SIZE] = cell.into();
                     buf[offset..offset + INTERNAL_ROW_SIZE].clone_from_slice(&bytes[..]);
                     offset += INTERNAL_ROW_SIZE;
@@ -178,6 +190,7 @@ impl From<Page> for [u8; PAGE_SIZE] {
                 buf[PAGE_KIND] = PAGE_LEAF;
                 rows.iter().for_each(|cell| {
                     let bytes: [u8; LEAF_ROW_SIZE] = cell.into();
+                    trace!("writing leaf cell {}", cell.id().unwrap(),);
                     buf[offset..offset + LEAF_ROW_SIZE].clone_from_slice(&bytes[..]);
                     offset += LEAF_ROW_SIZE;
                 })
@@ -202,6 +215,8 @@ impl TryFrom<[u8; PAGE_SIZE]> for Page {
                 cause: PageErrorCause::DataWrangling,
             }
         })?);
+        trace!("reading page {id} from bytes");
+
         let mut kind = match value[PAGE_KIND] {
             PAGE_LEAF => PageKind::Leaf { rows: Vec::new() },
             PAGE_INTERNAL => PageKind::Internal {
@@ -230,6 +245,7 @@ impl TryFrom<[u8; PAGE_SIZE]> for Page {
             })?);
 
         let mut pos = PAGE_HEADER_SIZE;
+        trace!("cells: {cells}, parent: {parent}");
 
         match &mut kind {
             PageKind::Internal { offsets } => {
@@ -241,6 +257,12 @@ impl TryFrom<[u8; PAGE_SIZE]> for Page {
                         action: PageAction::Read,
                         cause: PageErrorCause::DataWrangling,
                     })?;
+                    trace!(
+                        "loading internal cell: {}, left: {}, right: {}",
+                        row.id()?,
+                        row.left()?,
+                        row.right()?
+                    );
                     offsets.push(row);
                     pos += INTERNAL_ROW_SIZE;
                 }
@@ -254,6 +276,7 @@ impl TryFrom<[u8; PAGE_SIZE]> for Page {
                         action: PageAction::Read,
                         cause: PageErrorCause::DataWrangling,
                     })?;
+                    trace!("loading leaf cell: {}", row.id()?);
                     rows.push(row);
                     pos += INTERNAL_ROW_SIZE;
                 }
