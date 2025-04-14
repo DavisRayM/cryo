@@ -186,16 +186,20 @@ impl BTreeStorage {
         visited.push(id);
 
         if !page.borrow().leaf() {
-            out += format!("  I{parent} -> I{id}\n").as_str();
             let node = page.borrow_mut().select()?;
             for pointer in node {
+                out += format!("  {id} -> {};\n", pointer.id()?).as_str();
+
                 self.current = pointer.left()?;
+                out += format!("  {} -> {}[color=green];\n", pointer.id()?, self.current).as_str();
                 out += self.walk_tree(width + 2, visited)?.as_ref();
+
                 self.current = pointer.right()?;
+                out += format!("  {} -> {}[color=blue];\n", pointer.id()?, self.current).as_str();
                 out += self.walk_tree(width + 2, visited)?.as_ref();
             }
         } else if self.pages <= LEAF_PRINT_CUTOFF {
-            out += format!("  I{parent} -> L{id};\n").as_str();
+            let parent = self.page(page.borrow().parent)?.borrow().id;
         }
 
         Ok(out)
