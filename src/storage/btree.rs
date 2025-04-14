@@ -65,10 +65,20 @@ impl StorageBackend for BTreeStorage {
                         self.insert(row)?;
                         None
                     }
-                    Statement::Select => {
-                        debug!("executing select statement");
-                        todo!()
-                    }
+                    Statement::Select => Some(
+                        self.select()?
+                            .iter()
+                            .map(|r| {
+                                format!(
+                                    "{} {} {}",
+                                    r.id().unwrap(),
+                                    r.username().unwrap(),
+                                    r.email().unwrap()
+                                )
+                            })
+                            .collect::<Vec<String>>()
+                            .join("\n"),
+                    ),
                 }
             }
         })
@@ -168,6 +178,18 @@ impl BTreeStorage {
     fn insert(&mut self, row: Row) -> Result<(), StorageError> {
         self.current = self.root;
         self.insert_row(row)
+    }
+
+    /// Selects all leaf cells
+    fn select(&mut self) -> Result<Vec<Row>, StorageError> {
+        self.current = self.root;
+        let page = self.page(self.current)?;
+
+        if page.borrow().leaf() {
+            Ok(page.borrow_mut().select()?)
+        } else {
+            todo!()
+        }
     }
 
     /// Creates a new page and returns the offset to the page
