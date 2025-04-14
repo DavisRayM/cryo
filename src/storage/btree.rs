@@ -45,6 +45,13 @@ impl StorageBackend for BTreeStorage {
                 Some("connection closed\n".into())
             }
             Command::Structure => Some(self.structure()?),
+            Command::Populate(records) => {
+                for i in 1..=records {
+                    let cmd = Command::Statement(format!("insert {} test test@populate.com", i));
+                    self.query(cmd)?;
+                }
+                Some(format!("populated database with {records} records"))
+            }
             cmd => {
                 let stmt: Statement = cmd.try_into().map_err(|e| StorageError::Storage {
                     action: StorageAction::Query,
