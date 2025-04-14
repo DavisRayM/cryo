@@ -132,9 +132,23 @@ impl BTreeStorage {
 
     /// Walks the BTree and prints all the nodes
     pub(crate) fn walk(&mut self, width: Option<usize>) -> Result<String, StorageError> {
+        let mut visited = Vec::new();
+        self.walk_tree(width.unwrap_or(0), &mut visited)
+    }
+
+    fn walk_tree(
+        &mut self,
+        width: usize,
+        visited: &mut Vec<usize>,
+    ) -> Result<String, StorageError> {
         let mut out = String::default();
         let page = self.page(self.current)?;
-        let width = width.unwrap_or(0);
+
+        let id = page.borrow().id;
+        if visited.contains(&id) {
+            return Ok(out);
+        }
+        visited.push(page.borrow().id);
 
         if page.borrow().leaf() {
             out += format!(
@@ -158,9 +172,9 @@ impl BTreeStorage {
             let node = page.borrow_mut().select()?;
             for pointer in node {
                 self.current = pointer.left()?;
-                out += self.walk(Some(width + 2))?.as_ref();
+                out += self.walk_tree(width + 2, visited)?.as_ref();
                 self.current = pointer.right()?;
-                out += self.walk(Some(width + 2))?.as_ref();
+                out += self.walk_tree(width + 2, visited)?.as_ref();
             }
         }
 
@@ -177,19 +191,20 @@ impl BTreeStorage {
     }
 
     /// Inserts a new Row into the BTree storage
-    pub fn insert(&mut self, row: Row) -> Result<(), StorageError> {
+    pub(crate) fn insert(&mut self, row: Row) -> Result<(), StorageError> {
         self.current = self.root;
         self.insert_row(row)
     }
 
     /// Selects all leaf cells
-    pub fn select(&mut self) -> Result<Vec<Row>, StorageError> {
+    pub(crate) fn select(&mut self) -> Result<Vec<Row>, StorageError> {
         self.current = self.root;
-        self.select_traverse()
+        let mut visited = Vec::new();
+        self.select_traverse(&mut visited)
     }
 
     /// Prints out the current structure of the BTree
-    pub fn structure(&mut self) -> Result<String, StorageError> {
+    pub(crate) fn structure(&mut self) -> Result<String, StorageError> {
         self.current = self.root;
         self.walk(None)
     }
@@ -214,20 +229,25 @@ impl BTreeStorage {
     }
 
     /// Recursively traverses and selects all leaf cells in the entire tree
-    fn select_traverse(&mut self) -> Result<Vec<Row>, StorageError> {
+    fn select_traverse(&mut self, visited: &mut Vec<usize>) -> Result<Vec<Row>, StorageError> {
         let page = self.page(self.current)?;
+        let mut out = Vec::new();
+
+        if visited.contains(&page.borrow().id) {
+            return Ok(out);
+        }
+        visited.push(page.borrow().id);
 
         if page.borrow().leaf() {
             return Ok(page.borrow_mut().select()?);
         }
 
-        let mut out = Vec::new();
         let pointers = page.borrow_mut().select()?;
         for pointer in pointers {
             self.current = pointer.left()?;
-            out.extend_from_slice(self.select_traverse()?.as_slice());
+            out.extend_from_slice(self.select_traverse(visited)?.as_slice());
             self.current = pointer.right()?;
-            out.extend_from_slice(self.select_traverse()?.as_slice());
+            out.extend_from_slice(self.select_traverse(visited)?.as_slice());
         }
 
         Ok(out)
@@ -276,7 +296,7 @@ impl BTreeStorage {
     }
 
     /// Splits node to accommodate the new row.
-    fn split(&mut self, target: Page, row: Row) -> Result<(), StorageError> {
+    fn split(&mut self, mut target: Page, row: Row) -> Result<(), StorageError> {
         debug!(
             "splitting node at {}; leaf: {}",
             self.current,
@@ -284,9 +304,95 @@ impl BTreeStorage {
         );
 
         match target.leaf() {
-            true if target.offset == self.root => self.split_root_leaf(target, row),
+            true if target.offset == self.root => {
+                let parent_offset =
+                    self.create(PageKind::Internal { offsets: vec![] }, 0, self.root)?;
+                let mut parent = self.read_from_disk(parent_offset)?;
+                // Root nodes have themselves as their parent
+                parent.parent = parent.offset;
+
+                trace!(
+                    "linking page {} at {} to new parent {} from {}",
+                    target.id, target.offset, parent.offset, target.parent
+                );
+                // Update target to track new node as parent
+                target.parent = parent.offset;
+                self.root = parent.offset;
+                self.write_to_disk(parent)?;
+
+                let left = target.offset;
+                let (right, key) = self.split_leaf(target, row)?;
+                let parent = self.page(parent_offset)?;
+
+                let mut separator = Row::new();
+                separator.set_id(key);
+                separator.set_left(left);
+                separator.set_right(right);
+                trace!("insert new separator key {key}, left: {left}, right: {right}");
+                parent.borrow_mut().insert(separator)?;
+                Ok(())
+            }
             true => {
-                todo!("none root leaf split")
+                let parent_offset = target.parent;
+                let left = target.offset;
+                let (right, key) = self.split_leaf(target, row)?;
+                self.current = parent_offset;
+                let mut parent = self.read_from_disk(parent_offset)?;
+
+                let mut pointer = Row::new();
+                pointer.set_id(key);
+                pointer.set_left(left);
+                pointer.set_right(right);
+
+                let pointers = parent.select()?;
+
+                trace!(
+                    "Updating index pointers: {:?}",
+                    pointers
+                        .iter()
+                        .map(|p| p.id().unwrap())
+                        .collect::<Vec<usize>>()
+                );
+
+                match pointers.binary_search(&pointer) {
+                    Ok(pos) => {
+                        todo!("handle updating existing keys")
+                    }
+                    Err(pos) => {
+                        trace!("inserting index {key} pointer at: {pos}");
+                        parent.insert(pointer)?;
+                        let mut kind = parent.kind.take();
+                        if let Some(PageKind::Internal { offsets }) = &mut kind {
+                            if pos > 0 {
+                                let left_pointer = &mut offsets[pos - 1];
+                                trace!(
+                                    "updating right pointer for {} to {} from {}",
+                                    left_pointer.id()?,
+                                    left,
+                                    left_pointer.left()?
+                                );
+                                left_pointer.set_right(left);
+                            }
+
+                            if pos + 1 < offsets.len() {
+                                let right_pointer = &mut offsets[pos + 1];
+                                trace!(
+                                    "updating left pointer for {} to {} from {}",
+                                    right_pointer.id()?,
+                                    right,
+                                    right_pointer.left()?
+                                );
+                                right_pointer.set_left(right);
+                            }
+                        } else {
+                            panic!("leaf cell as parent of another");
+                        }
+                        parent.kind = kind;
+                    }
+                }
+
+                self.write_to_disk(parent)?;
+                Ok(())
             }
             false => {
                 todo!("Split internal node")
@@ -294,36 +400,15 @@ impl BTreeStorage {
         }
     }
 
-    /// Splits a root leaf node into half
-    ///
-    /// NOTE: This only happens once...
-    fn split_root_leaf(&mut self, mut left: Page, row: Row) -> Result<(), StorageError> {
-        let parent_offset = self.create(PageKind::Internal { offsets: vec![] }, 0, 0)?;
-        trace!("creating new index at root, new root is {parent_offset}");
+    fn split_leaf(&mut self, mut target: Page, row: Row) -> Result<(usize, usize), StorageError> {
+        let parent_offset = target.parent;
+        let parent = match self.uncache(parent_offset)? {
+            Some(parent) => parent,
+            None => self.read_from_disk(parent_offset)?,
+        };
 
-        let mut parent = self.read_from_disk(parent_offset)?;
-        // Root nodes have themselves as their parent
-        parent.parent = parent.offset;
-        trace!(
-            "linking page {} at {} to new parent {} from {}",
-            left.id, left.offset, parent.offset, left.parent
-        );
-        // Update target to track new node as parent
-        left.parent = parent.offset;
-
-        let mut left_candidates = left.select()?;
+        let mut left_candidates = target.select()?;
         let right_candidates = left_candidates.split_off(LEAF_SPLITAT);
-        trace!(
-            "left cells: {:?} right cells: {:?}",
-            left_candidates
-                .iter()
-                .map(|c| c.id().unwrap())
-                .collect::<Vec<usize>>(),
-            right_candidates
-                .iter()
-                .map(|c| c.id().unwrap())
-                .collect::<Vec<usize>>()
-        );
         let left_cells = left_candidates.len();
         let right_cells = right_candidates.len();
         let key = right_candidates[0].id()?;
@@ -337,38 +422,30 @@ impl BTreeStorage {
             parent_offset,
         )?;
         let mut right = self.read_from_disk(right_offset)?;
-        trace!("creating right child, at offset {right_offset} with {right_cells} cells");
 
         trace!("updating left child, assigning {left_cells} cells");
-        left.kind = Some(PageKind::Leaf {
+        target.kind = Some(PageKind::Leaf {
             rows: left_candidates,
         });
-        left.cells = left_cells;
+        target.cells = left_cells;
 
         debug!(
             "creating new index key: {key}\nleft: {}\nright: {right_offset}",
-            left.offset
+            target.offset
         );
-        let mut separator = Row::new();
-        separator.set_id(key);
-        separator.set_left(left.offset);
-        separator.set_right(right_offset);
-        parent.insert(separator)?;
 
         let insert = row.id()?;
         if insert >= key {
             right.insert(row)?;
         } else {
-            left.insert(row)?;
+            target.insert(row)?;
         }
 
-        debug!("updating root to {parent_offset}");
-        self.root = parent_offset;
         self.write_to_disk(parent)?;
-        self.write_to_disk(left)?;
+        self.write_to_disk(target)?;
         self.write_to_disk(right)?;
 
-        Ok(())
+        Ok((right_offset, key))
     }
 
     /// Searches an internal node for the position of `row`
@@ -384,16 +461,21 @@ impl BTreeStorage {
 
         debug!("searching internal node {} for {}", self.current, row.id()?);
         let pointers = page.borrow_mut().select()?;
-        debug!("candidates: {:?}", pointers);
+        trace!("candidates: {:?}", pointers);
 
         let pos = match pointers.binary_search(&row) {
             Ok(pos) => pointers[pos].right()?,
             Err(pos) => {
-                let pointer = &pointers[pos - 1];
-                if pointer.id()? >= row.id()? {
-                    pointer.right()?
+                let pointer = if pos == pointers.len() {
+                    &pointers[pos - 1]
                 } else {
+                    &pointers[pos]
+                };
+                trace!("candidate {} row {}", pointer.id()?, row.id()?);
+                if pointer.id()? >= row.id()? {
                     pointer.left()?
+                } else {
+                    pointer.right()?
                 }
             }
         };
@@ -677,7 +759,7 @@ mod tests {
         let dir = TempDir::new("InsertInternalMulti").unwrap();
         let path = dir.into_path();
         let mut storage = BTreeStorage::new(path.clone()).unwrap();
-        let mut tree = "";
+        let tree = "";
 
         for i in 0..CELLS_PER_LEAF * (CELLS_PER_INTERNAL * 2) + 1 {
             let mut row = Row::new();
