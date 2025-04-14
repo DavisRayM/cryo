@@ -38,9 +38,9 @@ where
         s if s.starts_with(".populate") => {
             let parts = s.split(' ').collect::<Vec<&str>>();
             if parts.len() < 2 {
-                return Err(format!(
-                    "populate command requires int argument for the number of records"
-                ));
+                return Err(
+                    "populate command requires int argument for the number of records".into(),
+                );
             }
 
             let records = parts[1]
