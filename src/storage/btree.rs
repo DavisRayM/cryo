@@ -140,7 +140,10 @@ impl BTreeStorage {
     /// Walks the BTree and prints all the nodes
     pub(crate) fn walk(&mut self, width: Option<usize>) -> Result<String, StorageError> {
         let mut visited = Vec::new();
-        self.walk_tree(width.unwrap_or(0), &mut visited)
+        Ok(format!(
+            "digraph {{\n{}}}",
+            self.walk_tree(width.unwrap_or(0), &mut visited)?
+        ))
     }
 
     fn walk_tree(
@@ -150,6 +153,7 @@ impl BTreeStorage {
     ) -> Result<String, StorageError> {
         let mut out = String::default();
         let page = self.page(self.current)?;
+        let id = page.borrow().id;
 
         let id = page.borrow().id;
         if visited.contains(&id) {
@@ -157,26 +161,25 @@ impl BTreeStorage {
         }
         visited.push(page.borrow().id);
 
-        if page.borrow().leaf() {
-            out += "|"
-        } else {
-            out += format!(
-                "{:width$}internal {} {}\n",
-                "",
-                page.borrow().id,
-                page.borrow().cells,
-                width = width
-            )
-            .as_ref();
-
+        if !page.borrow().leaf() {
+            let id = page.borrow().id;
             let node = page.borrow_mut().select()?;
             for pointer in node {
                 self.current = pointer.left()?;
+                let child_id = self.page(self.current)?.borrow().id;
+                let child_type = if self.page(self.current)?.borrow().leaf() {
+                    "L"
+                } else {
+                    "I"
+                };
+
+                out += format!("I{id} -> {child_type}{child_id};\n").as_str();
                 out += self.walk_tree(width + 2, visited)?.as_ref();
                 self.current = pointer.right()?;
+                let child_id = self.page(self.current)?.borrow().id;
+                out += format!("I{id} -> {child_type}{child_id};\n").as_str();
                 out += self.walk_tree(width + 2, visited)?.as_ref();
             }
-            out += "\n";
         }
 
         Ok(out)
