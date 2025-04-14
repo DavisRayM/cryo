@@ -1,7 +1,7 @@
 use std::{
     cell::RefCell,
     collections::VecDeque,
-    fs::OpenOptions,
+    fs::{File, OpenOptions},
     io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write},
     path::PathBuf,
     rc::Rc,
@@ -29,11 +29,12 @@ const LEAF_PRINT_CUTOFF: usize = 100;
 
 #[derive(Debug)]
 pub struct BTreeStorage {
+    cached: VecDeque<Rc<RefCell<Page>>>,
+    pub current: usize,
     pub pages: usize,
     pub root: usize,
-    pub current: usize,
-    cached: VecDeque<Rc<RefCell<Page>>>,
-    path: Option<PathBuf>,
+    reader: BufReader<File>,
+    writer: BufWriter<File>,
 }
 
 impl StorageBackend for BTreeStorage {
@@ -111,12 +112,16 @@ impl BTreeStorage {
         let pages = size / PAGE_SIZE;
         let root = 0;
 
+        let writer = BufWriter::new(f.try_clone()?);
+        let reader = BufReader::new(f.try_clone()?);
+
         let mut storage = Self {
-            pages,
-            root,
-            current: root,
             cached: VecDeque::with_capacity(PAGE_IN_MEMORY),
-            path: Some(path),
+            current: root,
+            pages,
+            reader,
+            root,
+            writer,
         };
 
         if pages == 0 {
@@ -187,6 +192,7 @@ impl BTreeStorage {
         while !self.cached.is_empty() {
             self.free()?;
         }
+        self.writer.flush()?;
         Ok(())
     }
 
@@ -574,52 +580,31 @@ impl BTreeStorage {
     /// Reads page at specified offset.
     fn read_from_disk(&mut self, offset: usize) -> Result<Page, StorageError> {
         trace!("reading from disk, offset {offset}");
-        if let Some(path) = self.path.take() {
-            let f = OpenOptions::new().read(true).open(&path)?;
-            let mut reader = BufReader::new(f);
+        self.writer.flush()?;
 
-            reader.seek(SeekFrom::Start(offset as u64))?;
-            let mut buf = [0; PAGE_SIZE];
-            reader.read_exact(&mut buf)?;
+        self.reader.seek(SeekFrom::Start(offset as u64))?;
+        let mut buf = [0; PAGE_SIZE];
+        self.reader.read_exact(&mut buf)?;
 
-            let mut page: Page = buf.try_into().map_err(|e| StorageError::Storage {
-                action: StorageAction::Page,
-                cause: StorageErrorCause::Error(Box::new(e)),
-            })?;
-            page.offset = offset;
-            debug!("read page {} at {offset}", page.id);
-            self.path = Some(path);
-            Ok(page)
-        } else {
-            debug!("storage does not have access to disk path.");
-            Err(StorageError::Storage {
-                action: StorageAction::Page,
-                cause: StorageErrorCause::Unknown,
-            })
-        }
+        let mut page: Page = buf.try_into().map_err(|e| StorageError::Storage {
+            action: StorageAction::Page,
+            cause: StorageErrorCause::Error(Box::new(e)),
+        })?;
+        page.offset = offset;
+        debug!("read page {} at {offset}", page.id);
+        Ok(page)
     }
 
     /// Writes a page out to the disk location.
     fn write_to_disk(&mut self, page: Page) -> Result<(), StorageError> {
         trace!("writing to disk, offset {}", page.offset);
-        if let Some(path) = self.path.take() {
-            let offset = page.offset;
-            let bytes: [u8; PAGE_SIZE] = page.into();
+        let offset = page.offset;
+        let bytes: [u8; PAGE_SIZE] = page.into();
 
-            let f = OpenOptions::new().write(true).open(&path)?;
-            let mut writer = BufWriter::new(f);
+        self.writer.seek(SeekFrom::Start(offset as u64))?;
+        self.writer.write_all(&bytes)?;
 
-            writer.seek(SeekFrom::Start(offset as u64))?;
-            writer.write_all(&bytes)?;
-            self.path = Some(path);
-            Ok(())
-        } else {
-            debug!("storage does not have access to disk path.");
-            Err(StorageError::Storage {
-                action: StorageAction::PageOut,
-                cause: StorageErrorCause::Unknown,
-            })
-        }
+        Ok(())
     }
 
     /// Retrieves page from cache if any
