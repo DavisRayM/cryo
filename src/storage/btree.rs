@@ -44,7 +44,7 @@ impl StorageBackend for BTreeStorage {
                 self.close()?;
                 Some("connection closed\n".into())
             }
-            Command::Structure => Some(self.walk(None)?),
+            Command::Structure => Some(self.structure()?),
             cmd => {
                 let stmt: Statement = cmd.try_into().map_err(|e| StorageError::Storage {
                     action: StorageAction::Query,
@@ -156,8 +156,10 @@ impl BTreeStorage {
             .as_ref();
 
             let node = page.borrow_mut().select()?;
-            for child in node {
-                self.current = child.offset()?;
+            for pointer in node {
+                self.current = pointer.left()?;
+                out += self.walk(Some(width + 2))?.as_ref();
+                self.current = pointer.right()?;
                 out += self.walk(Some(width + 2))?.as_ref();
             }
         }
@@ -175,13 +177,13 @@ impl BTreeStorage {
     }
 
     /// Inserts a new Row into the BTree storage
-    fn insert(&mut self, row: Row) -> Result<(), StorageError> {
+    pub fn insert(&mut self, row: Row) -> Result<(), StorageError> {
         self.current = self.root;
         self.insert_row(row)
     }
 
     /// Selects all leaf cells
-    fn select(&mut self) -> Result<Vec<Row>, StorageError> {
+    pub fn select(&mut self) -> Result<Vec<Row>, StorageError> {
         self.current = self.root;
         let page = self.page(self.current)?;
 
@@ -190,6 +192,12 @@ impl BTreeStorage {
         } else {
             todo!()
         }
+    }
+
+    /// Prints out the current structure of the BTree
+    pub fn structure(&mut self) -> Result<String, StorageError> {
+        self.current = self.root;
+        self.walk(None)
     }
 
     /// Creates a new page and returns the offset to the page
@@ -334,7 +342,6 @@ impl BTreeStorage {
         parent.insert(separator)?;
 
         let insert = row.id()?;
-        debug!("inserting key {} to the", row.id()?);
         if insert >= key {
             right.insert(row)?;
         } else {
