@@ -91,7 +91,7 @@ impl Page {
     }
 
     pub fn insert(&mut self, row: Row) -> Result<(), StorageError> {
-        let bin_insert = |items: &mut Vec<Row>, row: Row| -> Result<(), StorageError> {
+        let bin_insert = |items: &mut Vec<Row>, row: Row| -> Result<usize, StorageError> {
             match items.binary_search(&row) {
                 Ok(_) => Err(StorageError::Page {
                     action: PageAction::Insert,
@@ -99,7 +99,7 @@ impl Page {
                 }),
                 Err(pos) => {
                     items.insert(pos, row);
-                    Ok(())
+                    Ok(pos)
                 }
             }
         };
@@ -115,7 +115,17 @@ impl Page {
                         });
                     }
 
-                    bin_insert(offsets, row)?;
+                    let pos = bin_insert(offsets, row)?;
+
+                    // Update links
+                    let offset = offsets[pos].offset()?;
+                    if pos > 0 {
+                        offsets[pos - 1].set_right(offset);
+                    }
+
+                    if pos + 1 < offsets.len() {
+                        offsets[pos + 1].set_left(offset);
+                    }
                 }
                 PageKind::Leaf { rows } => {
                     if self.cells >= CELLS_PER_LEAF {

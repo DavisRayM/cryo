@@ -158,14 +158,7 @@ impl BTreeStorage {
         visited.push(page.borrow().id);
 
         if page.borrow().leaf() {
-            out += format!(
-                "{:width$}leaf {} {}\n",
-                "",
-                page.borrow().id,
-                page.borrow().cells,
-                width = width
-            )
-            .as_ref();
+            out += "|"
         } else {
             out += format!(
                 "{:width$}internal {} {}\n",
@@ -183,6 +176,7 @@ impl BTreeStorage {
                 self.current = pointer.right()?;
                 out += self.walk_tree(width + 2, visited)?.as_ref();
             }
+            out += "\n";
         }
 
         Ok(out)
@@ -225,8 +219,8 @@ impl BTreeStorage {
     ) -> Result<usize, StorageError> {
         let offset = self.pages * PAGE_SIZE;
         debug!(
-            "creating page\noffset: {}\ntype: {:?}\ncells: {}\nparent: {}",
-            offset, kind, cells, parent
+            "creating page\noffset: {}\ncells: {}\nparent: {}",
+            offset, cells, parent
         );
 
         let page = Page::new(offset, self.pages, kind, cells, parent);
@@ -350,53 +344,6 @@ impl BTreeStorage {
             pointer.set_left(left);
             pointer.set_right(right);
 
-            let pointers = parent.select()?;
-
-            trace!(
-                "Updating index pointers: {:?}",
-                pointers
-                    .iter()
-                    .map(|p| p.id().unwrap())
-                    .collect::<Vec<usize>>()
-            );
-
-            match pointers.binary_search(&pointer) {
-                Ok(_) => {
-                    // TODO: No idea what might cause this at the moment...
-                    todo!("handle updating existing keys")
-                }
-                Err(pos) => {
-                    trace!("inserting index {key} pointer at: {pos}");
-                    let mut kind = parent.kind.take();
-                    if let Some(PageKind::Internal { offsets }) = &mut kind {
-                        if pos > 0 {
-                            let left_pointer = &mut offsets[pos - 1];
-                            trace!(
-                                "updating right pointer for {} to {} from {}",
-                                left_pointer.id()?,
-                                left,
-                                left_pointer.left()?
-                            );
-                            left_pointer.set_right(left);
-                        }
-
-                        if pos < offsets.len() {
-                            let right_pointer = &mut offsets[pos];
-                            trace!(
-                                "updating left pointer for {} to {} from {}",
-                                right_pointer.id()?,
-                                right,
-                                right_pointer.left()?
-                            );
-                            right_pointer.set_left(right);
-                        }
-                    } else {
-                        panic!("leaf cell as parent of another");
-                    }
-                    parent.kind = kind;
-                }
-            }
-
             match parent.insert(pointer.clone()) {
                 Ok(()) => {
                     self.write_to_disk(parent)?;
@@ -448,6 +395,12 @@ impl BTreeStorage {
             target.cells = left_cells;
             self.read_from_disk(right_offset)?
         } else {
+            // Update links to this child
+            let child_pages = right_candidates
+                .iter()
+                .map(|r| r.offset().unwrap())
+                .collect::<Vec<usize>>();
+
             let right_offset = self.create(
                 PageKind::Internal {
                     offsets: right_candidates,
@@ -455,6 +408,13 @@ impl BTreeStorage {
                 right_cells,
                 parent_offset,
             )?;
+
+            for child in child_pages {
+                let mut page = self.uncache(child)?.unwrap_or(self.read_from_disk(child)?);
+                page.parent = right_offset;
+                self.write_to_disk(page)?;
+            }
+
             trace!("updating left child, assigning {left_cells} cells");
             target.kind = Some(PageKind::Internal {
                 offsets: left_candidates,
@@ -462,11 +422,6 @@ impl BTreeStorage {
             target.cells = left_cells;
             self.read_from_disk(right_offset)?
         };
-
-        debug!(
-            "creating new index key: {key}\nleft: {}\nright: {}",
-            target.offset, right.offset
-        );
 
         let insert = row.id()?;
         if insert >= key {
@@ -738,16 +693,13 @@ mod tests {
         let dir = TempDir::new("InsertLeaf").unwrap();
         let path = dir.into_path();
         let mut storage = BTreeStorage::new(path.clone()).unwrap();
+        let cells = (CELLS_PER_LEAF * 2) + 1;
 
-        for i in 0..=CELLS_PER_LEAF * 2 {
-            let mut row = Row::new();
-            row.set_id(i);
-            storage.insert(row).unwrap();
-        }
+        storage.query(Command::Populate(cells)).unwrap();
 
         assert_eq!(storage.pages, 4);
         let rows = storage.select().unwrap();
-        assert_eq!(rows.len(), (CELLS_PER_LEAF * 2) + 1);
+        assert_eq!(rows.len(), cells);
     }
 
     #[test]
@@ -755,16 +707,13 @@ mod tests {
         let dir = TempDir::new("InsertLeaf").unwrap();
         let path = dir.into_path();
         let mut storage = BTreeStorage::new(path.clone()).unwrap();
+        let cells = (CELLS_PER_INTERNAL * 2) + 4;
 
-        for i in 0..=CELLS_PER_LEAF * CELLS_PER_INTERNAL {
-            let mut row = Row::new();
-            row.set_id(i);
-            storage.insert(row).unwrap();
-        }
+        storage.query(Command::Populate(cells)).unwrap();
 
         let rows = storage.select().unwrap();
         eprintln!("{}", storage.structure().unwrap());
-        assert_eq!(rows.len(), (CELLS_PER_LEAF * CELLS_PER_INTERNAL) + 1);
+        assert_eq!(rows.len(), cells);
     }
 
     #[test]
