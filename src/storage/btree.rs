@@ -7,12 +7,19 @@ use std::{
     sync::Arc,
 };
 
-use crate::storage::{
-    error::{StorageAction, StorageErrorCause},
-    header::page::PAGE_SIZE,
+use log::{debug, info, trace};
+
+use crate::{
+    cli::Command,
+    statement::Statement,
+    storage::{
+        error::{PageAction, StorageAction, StorageErrorCause},
+        header::page::PAGE_SIZE,
+    },
 };
 
 use super::{
+    StorageBackend,
     error::{PageErrorCause, StorageError},
     page::{Page, PageKind},
     row::Row,
@@ -20,7 +27,7 @@ use super::{
 
 const PAGE_IN_MEMORY: usize = 5;
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct BTreeStorage {
     pub pages: usize,
     pub root: usize,
@@ -29,10 +36,61 @@ pub struct BTreeStorage {
     path: Option<PathBuf>,
 }
 
+impl StorageBackend for BTreeStorage {
+    type Error = StorageError;
+
+    fn query(&mut self, cmd: Command) -> Result<Option<String>, Self::Error> {
+        Ok(match cmd {
+            Command::Exit => {
+                trace!("received exit command; flushing database cache");
+                self.close()?;
+                Some("connection closed.".into())
+            }
+            cmd => {
+                trace!("storage received command: {cmd:?}");
+                let stmt: Statement = cmd.try_into().map_err(|e| StorageError::Storage {
+                    action: StorageAction::Query,
+                    cause: StorageErrorCause::Error(Box::new(e)),
+                })?;
+                debug!("received statement: {stmt:?}");
+
+                match stmt {
+                    Statement::Insert {
+                        id,
+                        username,
+                        email,
+                    } => {
+                        debug!(
+                            "creating row: {} {} {}",
+                            id,
+                            username.iter().collect::<String>(),
+                            email.iter().collect::<String>()
+                        );
+
+                        let mut row = Row::new();
+                        row.set_id(id);
+                        row.set_email(email.as_ref());
+                        row.set_username(&username);
+
+                        self.insert(row)?;
+                        None
+                    }
+                    Statement::Select => {
+                        debug!("executing select statement");
+                        todo!()
+                    }
+                }
+            }
+        })
+    }
+}
+
 impl BTreeStorage {
     /// Create a new BTreeStorage backend and configures persistence to the directory
     pub fn new(dir: PathBuf) -> Result<Self, StorageError> {
         let path = dir.join("btree.db");
+        trace!("opening btree storage at: {:?}", path);
+
         let f = OpenOptions::new()
             .read(true)
             .write(true)
@@ -53,32 +111,34 @@ impl BTreeStorage {
         };
 
         if pages == 0 {
+            trace!("no pages detected; creating starting leaf node.");
             storage.create(PageKind::Leaf { rows: vec![] }, 0, 0)?;
         } else {
+            trace!("locating root node");
             let mut pos = 0;
             let mut parent = storage.page(pos)?.borrow().parent;
             while pos != parent {
                 pos = parent;
                 parent = storage.page(pos)?.borrow().parent;
             }
+            storage.root = pos;
+            trace!("root located at: {pos}");
         }
         Ok(storage)
     }
 
     /// Walks the BTree and prints all the nodes
     pub(crate) fn walk(&mut self, width: Option<usize>) -> Result<String, StorageError> {
-        let page_offset = self.current;
-        let page = self.page(page_offset)?;
         let mut out = String::default();
-        let page = page.borrow().clone();
+        let page = self.page(self.current)?;
         let width = width.unwrap_or(0);
 
-        if page.leaf() {
+        if page.borrow().leaf() {
             out += format!(
                 "{:width$}leaf {} {}\n",
                 "",
-                page.id,
-                page.cells,
+                page.borrow().id,
+                page.borrow().cells,
                 width = width
             )
             .as_ref();
@@ -86,12 +146,13 @@ impl BTreeStorage {
             out += format!(
                 "{:width$}internal {} {}\n",
                 "",
-                page.id,
-                page.cells,
+                page.borrow().id,
+                page.borrow().cells,
                 width = width
             )
             .as_ref();
-            let node = page.select()?;
+
+            let node = page.borrow_mut().select()?;
             for child in node {
                 self.current = child.offset()?;
                 out += self.walk(Some(width + 2))?.as_ref();
@@ -102,11 +163,18 @@ impl BTreeStorage {
     }
 
     /// Flushes pager cache to disk
-    pub fn close(mut self) -> Result<(), StorageError> {
+    pub fn close(&mut self) -> Result<(), StorageError> {
+        debug!("closing database; emptying cache");
         while !self.cached.is_empty() {
             self.free()?;
         }
         Ok(())
+    }
+
+    /// Inserts a new Row into the BTree storage
+    fn insert(&mut self, row: Row) -> Result<(), StorageError> {
+        self.current = self.root;
+        self.insert_row(row)
     }
 
     /// Creates a new page and returns the offset to the page
@@ -117,196 +185,94 @@ impl BTreeStorage {
         parent: usize,
     ) -> Result<usize, StorageError> {
         let offset = self.pages * PAGE_SIZE;
+        debug!(
+            "creating page\noffset: {}\ntype: {:?}\ncells: {}\nparent: {}",
+            offset, kind, cells, parent
+        );
+
         let page = Page::new(offset, self.pages, kind, cells, parent);
-
-        if let Some(path) = self.path.take() {
-            let f = OpenOptions::new().write(true).open(&path)?;
-            let mut writer = BufWriter::new(f);
-
-            writer.seek(SeekFrom::Start(offset as u64))?;
-            let buf: [u8; PAGE_SIZE] = page.into();
-            writer.write_all(&buf)?;
-            writer.flush()?;
-            self.path = Some(path);
-            self.pages += 1;
-            self.page(self.pages - 1)?;
-        } else {
-            self.cached.push_back(Arc::new(RefCell::new(page)));
-            self.pages += 1;
-        };
-
+        self.write_to_disk(page)?;
+        self.pages += 1;
         Ok(offset)
     }
 
-    /// Inserts a new Row into the BTree storage
-    fn insert(&mut self, row: Row) -> Result<(), StorageError> {
-        let page_offset = self.current;
-        let page = self.page(page_offset)?;
+    fn insert_row(&mut self, row: Row) -> Result<(), StorageError> {
+        loop {
+            let page = self.page(self.current)?;
+            debug!("attempt to insert record at {}", self.current);
+            if !page.borrow().leaf() {
+                debug!("page {} is internal, searching for leaf", page.borrow().id);
+                self.search_internal(&row);
+                continue;
+            }
 
-        if page.borrow().leaf() {
-            let mut page = page.borrow().clone();
-            match page.insert(row.clone()) {
+            debug!("page {} is a leaf; inserting value", page.borrow().id);
+            break match page.borrow_mut().insert(row) {
                 Ok(_) => {
-                    self.page(page_offset)?.borrow_mut().cells = page.cells;
-                    self.page(page_offset)?.borrow_mut().kind = page.kind;
+                    debug!("row successfully inserted");
                     Ok(())
                 }
                 Err(StorageError::Page {
                     cause: PageErrorCause::Full,
                     ..
                 }) => {
-                    self.split_leaf(page_offset == self.root)?;
-                    self.insert(row)
+                    debug!("current leaf node is full; splitting nodes");
+                    todo!("implement splitting again")
                 }
-                Err(e) => Err(StorageError::Storage {
-                    action: StorageAction::Insert,
-                    cause: StorageErrorCause::Error(Box::new(e)),
-                }),
-            }
-        } else {
-            let children = page.borrow().clone().select()?;
-            let pos = match children.binary_search(&row) {
-                Ok(pos) => children[pos].offset()?,
-                Err(pos) => {
-                    if pos == 0 {
-                        self.current = self.root;
-                        eprintln!("{}", self.walk(None).unwrap());
-                    }
-                    children[pos - 1].offset()?
+                Err(e) => {
+                    debug!("unexpected error during insert: {e:?}");
+                    Err(StorageError::Storage {
+                        action: StorageAction::Insert,
+                        cause: StorageErrorCause::Error(Box::new(e)),
+                    })
                 }
             };
-            self.current = pos;
-            self.insert(row)
         }
     }
 
-    /// Splits an Internal node at the current position
-    fn split_internal(&mut self, root: bool) -> Result<(), StorageError> {
-        if root {
-            let parent_offset =
-                self.create(PageKind::Internal { offsets: vec![] }, 0, self.root)?;
-            let child_offset = self.current;
-            let right_offset =
-                self.create(PageKind::Internal { offsets: vec![] }, 0, parent_offset)?;
-
-            // Link child to parent
-            self.page(child_offset)?.borrow_mut().parent = parent_offset;
-            self.page(parent_offset)?.borrow_mut().parent = parent_offset;
-
-            // Add children
-            for child in vec![child_offset, right_offset] {
-                let mut row = Row::new();
-                row.set_offset(self.page(child)?.borrow().offset);
-                row.set_id(self.page(child)?.borrow().id);
-                self.page(parent_offset)?.borrow_mut().insert(row)?;
-            }
-
-            // Ensure root parent ID is itself.
-            self.root = parent_offset;
-            self.current = right_offset;
-            Ok(())
-        } else {
-            let parent = self.page(self.current)?.borrow().parent;
-            let offset = self.create(PageKind::Internal { offsets: vec![] }, 0, parent)?;
-            self.current = parent;
-            self.split_insert(offset)
-        }
-    }
-
-    /// Splits a Leaf node at the current position
+    /// Searches an internal node for the position of `row`
     ///
-    /// TODO: Handle median/max keys
-    fn split_leaf(&mut self, root: bool) -> Result<(), StorageError> {
-        if root {
-            let parent_offset =
-                self.create(PageKind::Internal { offsets: vec![] }, 0, self.root)?;
-            let child_offset = self.current;
-            let right_offset = self.create(PageKind::Leaf { rows: vec![] }, 0, parent_offset)?;
+    /// # Panics
+    ///
+    /// This function panics if called by a leaf node.
+    fn search_internal(&mut self, row: &Row) -> Result<(), StorageError> {
+        let page = self.page(self.current)?;
+        if page.borrow().leaf() {
+            panic!("tried to search a leaf node.");
+        }
 
-            // Link child to parent
-            self.page(child_offset)?.borrow_mut().parent = parent_offset;
-            self.page(parent_offset)?.borrow_mut().parent = parent_offset;
+        debug!("searching internal node {} for {}", self.current, row.id()?);
+        let pointers = page.borrow_mut().select()?;
+        debug!("candidates: {:?}", pointers);
 
-            // Add children
-            for child in vec![child_offset, right_offset] {
-                let mut row = Row::new();
-                row.set_offset(self.page(child)?.borrow().offset);
-                row.set_id(self.page(child)?.borrow().id);
-                self.page(parent_offset)?.borrow_mut().insert(row)?;
+        let pos = match pointers.binary_search(&row) {
+            Ok(pos) => {
+                debug!("found candidate at location: {pos}, picking next pointer");
+                pos + 1
             }
+            Err(pos) => {
+                debug!("possible candidate at {pos}");
+                pos
+            }
+        };
 
-            // Ensure root parent ID is itself.
-            self.root = parent_offset;
-            self.current = self.root;
-            Ok(())
-        } else {
-            let parent = self.page(self.current)?.borrow().parent;
-            let offset = self.create(PageKind::Leaf { rows: vec![] }, 0, parent)?;
-            self.current = parent;
-            self.split_insert(offset)
-        }
-    }
-
-    /// Splits the current node and inserts a new child to it
-    fn split_insert(&mut self, child: usize) -> Result<(), StorageError> {
-        let mut row = Row::new();
-        let offset = self.page(child)?.borrow().offset;
-        let id = self.page(child)?.borrow().id;
-
-        row.set_id(id);
-        row.set_offset(offset);
-
-        let res = self.page(self.current)?.borrow_mut().insert(row);
-        if let Ok(_) = res {
-            return Ok(());
-        }
-
-        if let Err(StorageError::Page {
-            cause: PageErrorCause::Full,
-            ..
-        }) = res
-        {
-            let root = self.current == self.root;
-            self.split_internal(root)?;
-
-            let mut row = Row::new();
-            row.set_id(id);
-            row.set_offset(offset);
-
-            self.page(self.current)?.borrow_mut().insert(row)?;
-            self.page(child)?.borrow_mut().parent = self.current;
-            return Ok(());
-        }
-
-        res
-    }
-
-    // Clear a page from cache and write it to disk
-    //
-    // # Panics
-    // If no path has been configured for the storage
-    fn free(&mut self) -> Result<(), StorageError> {
-        if let Some(path) = self.path.take() {
-            let page = self.cached.pop_front().ok_or(StorageError::Storage {
-                action: StorageAction::PageOut,
-                cause: StorageErrorCause::Unknown,
-            })?;
-            let page = page.borrow().clone();
-            let offset = page.offset;
-            let bytes: [u8; PAGE_SIZE] = page.into();
-
-            let f = OpenOptions::new().write(true).open(&path)?;
-            let mut writer = BufWriter::new(f);
-
-            writer.seek(SeekFrom::Start(offset as u64))?;
-            writer.write_all(&bytes)?;
-            self.path = Some(path);
-            Ok(())
-        } else {
+        if pos >= pointers.len() {
+            debug!(
+                "position({}) out of bounds, pointers {} current {}",
+                pos,
+                pointers.len(),
+                self.current
+            );
+            trace!("current page: {:?}", page);
             Err(StorageError::Storage {
-                action: StorageAction::PageOut,
-                cause: StorageErrorCause::Unknown,
+                action: StorageAction::Search,
+                cause: StorageErrorCause::OutOfBounds,
             })
+        } else {
+            let offset = pointers[pos].offset()?;
+            debug!("traversing to child at {offset}");
+            self.current = offset;
+            Ok(())
         }
     }
 
@@ -317,27 +283,92 @@ impl BTreeStorage {
     /// - If IO error occurs
     /// - If failed to load page from disk
     fn page(&mut self, offset: usize) -> Result<Arc<RefCell<Page>>, StorageError> {
+        trace!("paging in {offset} page");
         if offset >= self.pages * PAGE_SIZE {
+            debug!(
+                "offset {offset} is out of bounds; current pages {1} maximum {0}",
+                self.pages * PAGE_SIZE,
+                self.pages
+            );
             return Err(StorageError::Storage {
                 action: StorageAction::Page,
                 cause: StorageErrorCause::OutOfBounds,
             });
         }
 
-        let cached = self.cached.len();
+        if let Ok(Some(page)) = self.cached_page(offset) {
+            return Ok(page);
+        }
 
-        for page in self.cached.iter() {
-            if page.borrow().offset == offset {
-                return Ok(Arc::clone(&page));
+        let page = self.read_from_disk(offset)?;
+        self.cache(page)
+    }
+
+    // Clear a page from cache and write it to disk
+    //
+    // # Panics
+    // If no path has been configured for the storage
+    fn free(&mut self) -> Result<(), StorageError> {
+        let page = self.cached.pop_front().ok_or(StorageError::Storage {
+            action: StorageAction::PageOut,
+            cause: StorageErrorCause::CacheMiss,
+        })?;
+        match Arc::try_unwrap(page) {
+            Ok(rc) => {
+                let inner = rc.into_inner();
+                self.write_to_disk(inner)?;
+                Ok(())
+            }
+            Err(_) => {
+                info!("failed to free page; currently in use.");
+                Err(StorageError::Page {
+                    action: PageAction::Write,
+                    cause: PageErrorCause::InUse,
+                })
             }
         }
+    }
 
-        if cached >= PAGE_IN_MEMORY {
-            self.free()?;
+    /// Adds a new page into the cache.
+    fn cache(&mut self, page: Page) -> Result<Arc<RefCell<Page>>, StorageError> {
+        trace!("caching page {}", page.id);
+        let page = Arc::new(RefCell::new(page));
+        let clone = Arc::clone(&page);
+        self.cached.push_front(page);
+        Ok(clone)
+    }
+
+    /// Removes a page from the cache.
+    fn uncache(&mut self, offset: usize) -> Result<Option<Page>, StorageError> {
+        debug!("attempt to remove page {} from cache", offset);
+        let pos = match self
+            .cached
+            .iter()
+            .position(|page| page.borrow().offset == offset)
+        {
+            Some(pos) => pos,
+            None => return Ok(None),
+        };
+        debug!("page located at {pos} in cache; attempting removal");
+
+        let page = self.cached.remove(pos).expect("page should be at position");
+        match Arc::try_unwrap(page) {
+            Ok(rc) => {
+                let page = rc.into_inner();
+                debug!("page {} successfully uncached.", page.id);
+                Ok(Some(page))
+            }
+            Err(_) => Err(StorageError::Storage {
+                action: StorageAction::PageOut,
+                cause: StorageErrorCause::PageInUse,
+            }),
         }
+    }
 
+    /// Reads page at specified offset.
+    fn read_from_disk(&mut self, offset: usize) -> Result<Page, StorageError> {
+        trace!("reading from disk, offset {offset}");
         if let Some(path) = self.path.take() {
-            let offset = offset;
             let f = OpenOptions::new().read(true).open(&path)?;
             let mut reader = BufReader::new(f);
 
@@ -350,14 +381,64 @@ impl BTreeStorage {
                 cause: StorageErrorCause::Error(Box::new(e)),
             })?;
             page.offset = offset;
-            self.cached.push_front(Arc::new(RefCell::new(page)));
+            debug!("read page {} at {offset}", page.id);
             self.path = Some(path);
-            self.page(offset)
+            Ok(page)
         } else {
+            debug!("storage does not have access to disk path.");
             Err(StorageError::Storage {
                 action: StorageAction::Page,
                 cause: StorageErrorCause::Unknown,
             })
+        }
+    }
+
+    /// Writes a page out to the disk location.
+    fn write_to_disk(&mut self, page: Page) -> Result<(), StorageError> {
+        trace!("writing to disk, offset {}", page.offset);
+        if let Some(path) = self.path.take() {
+            let offset = page.offset;
+            let bytes: [u8; PAGE_SIZE] = page.into();
+
+            let f = OpenOptions::new().write(true).open(&path)?;
+            let mut writer = BufWriter::new(f);
+
+            writer.seek(SeekFrom::Start(offset as u64))?;
+            writer.write_all(&bytes)?;
+            self.path = Some(path);
+            Ok(())
+        } else {
+            debug!("storage does not have access to disk path.");
+            Err(StorageError::Storage {
+                action: StorageAction::PageOut,
+                cause: StorageErrorCause::Unknown,
+            })
+        }
+    }
+
+    /// Retrieves page from cache if any
+    fn cached_page(&mut self, offset: usize) -> Result<Option<Arc<RefCell<Page>>>, StorageError> {
+        trace!("checking cache for page: {offset}");
+        while self.cached.len() >= PAGE_IN_MEMORY {
+            trace!(
+                "cache over capacity({}) {}, clearing page",
+                PAGE_IN_MEMORY,
+                self.cached.len()
+            );
+            self.free()?;
+        }
+
+        let page = self
+            .cached
+            .iter()
+            .filter(|p| p.borrow().offset == offset)
+            .collect::<Vec<&Arc<RefCell<Page>>>>();
+        if page.is_empty() {
+            debug!("page {offset} is not cached");
+            Ok(None)
+        } else {
+            debug!("page {offset} cached (hits: {})", page.len());
+            Ok(Some(Arc::clone(page[0])))
         }
     }
 }
@@ -368,15 +449,6 @@ mod tests {
 
     use super::*;
     use tempdir::TempDir;
-
-    #[test]
-    fn storage_create_page() {
-        let mut storage = BTreeStorage::default();
-        storage
-            .create(PageKind::Leaf { rows: vec![] }, 0, 0)
-            .unwrap();
-        assert_eq!(storage.pages, 1);
-    }
 
     #[test]
     fn storage_create_page_disk() {

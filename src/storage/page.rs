@@ -69,7 +69,7 @@ impl Page {
         panic!("page unknown")
     }
 
-    pub fn select(mut self) -> Result<Vec<Row>, StorageError> {
+    pub fn select(&mut self) -> Result<Vec<Row>, StorageError> {
         if let Some(kind) = self.kind.take() {
             match &kind {
                 PageKind::Internal { offsets } => {
@@ -278,7 +278,7 @@ mod tests {
         page.insert(row.clone()).unwrap();
         let bytes: [u8; PAGE_SIZE] = page.into();
 
-        let page: Page = bytes.try_into().unwrap();
+        let mut page: Page = bytes.try_into().unwrap();
         assert_eq!(page.offset, 0);
         assert_eq!(page.id, 100);
         assert_eq!(page.cells, 1);
@@ -295,7 +295,7 @@ mod tests {
         page.insert(row.clone()).unwrap();
         let bytes: [u8; PAGE_SIZE] = page.into();
 
-        let page: Page = bytes.try_into().unwrap();
+        let mut page: Page = bytes.try_into().unwrap();
         assert_eq!(page.offset, 0);
         assert_eq!(page.id, 100);
         assert_eq!(page.cells, 1);

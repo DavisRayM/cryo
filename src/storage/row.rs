@@ -1,3 +1,5 @@
+use std::fmt;
+
 use super::{error::StorageError, header::row::*};
 
 pub(crate) const ROW_ALLOCATED_SPACE: usize = if INTERNAL_ROW_SIZE > LEAF_ROW_SIZE {
@@ -40,6 +42,12 @@ pub fn char_to_byte(chars: &[char]) -> Vec<u8> {
     }
 
     out
+}
+
+impl fmt::Display for Row {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.id().unwrap())
+    }
 }
 
 impl Row {

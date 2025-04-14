@@ -1,3 +1,5 @@
+use crate::cli::Command;
+
 pub mod btree;
 pub mod page;
 pub mod row;
@@ -55,6 +57,7 @@ pub mod error {
     pub enum PageAction {
         Read,
         Insert,
+        Write,
     }
 
     #[derive(Debug)]
@@ -63,6 +66,7 @@ pub mod error {
         Duplicate,
         Unknown,
         DataWrangling,
+        InUse,
     }
 
     #[derive(Debug)]
@@ -72,13 +76,17 @@ pub mod error {
         PageCreate,
         Insert,
         SplitLeaf,
+        Query,
+        Search,
     }
 
     #[derive(Debug)]
     pub enum StorageErrorCause {
         OutOfBounds,
-        Error(Box<StorageError>),
+        Error(Box<dyn Error>),
         Unknown,
+        CacheMiss,
+        PageInUse,
     }
 
     #[derive(Debug, Error)]
@@ -104,4 +112,11 @@ pub mod error {
             cause: StorageErrorCause,
         },
     }
+}
+
+/// Trait implemented by storage backends
+pub trait StorageBackend {
+    type Error;
+
+    fn query(&mut self, cmd: Command) -> Result<Option<String>, Self::Error>;
 }

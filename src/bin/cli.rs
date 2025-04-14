@@ -3,6 +3,8 @@ use std::io;
 use cryo::cli::{Command, prompt};
 
 fn main() {
+    env_logger::init();
+
     let mut reader;
     let mut writer;
     let stdio = io::stdin();
