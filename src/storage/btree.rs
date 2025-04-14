@@ -89,6 +89,23 @@ impl StorageBackend for BTreeStorage {
                             .collect::<Vec<String>>()
                             .join("\n"),
                     ),
+                    Statement::Update {
+                        id,
+                        username,
+                        email,
+                    } => {
+                        let mut row = Row::new();
+                        row.set_id(id);
+                        row.set_email(email.as_ref());
+                        row.set_username(&username);
+                        let r = self.update(row)?;
+                        Some(format!(
+                            "{} {} {}",
+                            r.id().unwrap(),
+                            r.username().unwrap(),
+                            r.email().unwrap()
+                        ))
+                    }
                 }
             }
         })
@@ -255,6 +272,27 @@ impl BTreeStorage {
         }
 
         Ok(out)
+    }
+
+    fn update(&mut self, row: Row) -> Result<Row, StorageError> {
+        loop {
+            let page = self.page(self.current)?;
+            debug!("attempt to update record at {}", self.current);
+            if !page.borrow().leaf() {
+                debug!("page {} is internal, searching for leaf", page.borrow().id);
+                self.search_internal(&row)?;
+                continue;
+            }
+
+            drop(page);
+            let mut page = match self.uncache(self.current)? {
+                Some(page) => page,
+                None => self.read_from_disk(self.current)?,
+            };
+            debug!("page {} is a leaf; updating value", page.id);
+            trace!("record: {} {}", row.id()?, row.offset()?);
+            break page.update(row);
+        }
     }
 
     /// Inserts a new row into storage
@@ -740,5 +778,26 @@ mod tests {
         let cmd = Command::Statement("insert 1 dave dave".into());
 
         assert_eq!(storage.query(cmd).unwrap(), None);
+    }
+
+    #[test]
+    fn storage_update() {
+        let dir = TempDir::new("StorageUpdate").unwrap();
+        let path = dir.into_path();
+        let mut storage = BTreeStorage::new(path).unwrap();
+        let cmd = Command::Statement("insert 1 dave dave".into());
+        storage.query(cmd).unwrap();
+
+        let cmd = Command::Statement("update 1 sam sam".into());
+        storage.query(cmd).unwrap();
+
+        assert_eq!(
+            "1 dave dave",
+            storage
+                .query(Command::Statement("select".into()))
+                .unwrap()
+                .unwrap()
+                .replace("\0", "")
+        )
     }
 }
