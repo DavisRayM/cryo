@@ -44,6 +44,7 @@ impl StorageBackend for BTreeStorage {
                 self.close()?;
                 Some("connection closed.".into())
             }
+            Command::Structure => Some(self.walk(None)?),
             cmd => {
                 trace!("storage received command: {cmd:?}");
                 let stmt: Statement = cmd.try_into().map_err(|e| StorageError::Storage {

@@ -10,7 +10,6 @@ fn main() {
     let stdio = io::stdin();
     let stdout = io::stdout();
     let dir = current_dir().unwrap();
-    println!("storage created!");
     let mut storage = BTreeStorage::new(dir).unwrap();
 
     loop {

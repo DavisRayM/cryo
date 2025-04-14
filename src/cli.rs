@@ -8,6 +8,8 @@ use std::io::{BufRead, Write};
 pub enum Command {
     /// Exit command `.exit`
     Exit,
+    /// Request the storage to print out it's structure
+    Structure,
     /// DSL Statements
     Statement(String),
 }
@@ -30,6 +32,7 @@ where
 
     match s.trim_end() {
         ".exit" => Ok(Command::Exit),
+        ".structure" => Ok(Command::Structure),
         s if !s.starts_with(".") => Ok(Command::Statement(s.to_string())),
         s => Err(format!("unrecognized command '{}'", s)),
     }
