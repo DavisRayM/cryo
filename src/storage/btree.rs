@@ -42,7 +42,7 @@ impl StorageBackend for BTreeStorage {
             Command::Exit => {
                 trace!("received exit command; flushing database cache");
                 self.close()?;
-                Some("connection closed.".into())
+                Some("connection closed\n".into())
             }
             Command::Structure => Some(self.walk(None)?),
             cmd => {
@@ -564,5 +564,38 @@ mod tests {
 
         storage.current = storage.root;
         assert_eq!(storage.walk(None).unwrap().trim(), tree.to_string().trim());
+    }
+
+    #[test]
+    fn storage_query_exit() {
+        let dir = TempDir::new("InsertInternalMulti").unwrap();
+        let path = dir.into_path();
+        let mut storage = BTreeStorage::new(path.clone()).unwrap();
+        let cmd = Command::Exit;
+
+        assert_eq!(
+            storage.query(cmd).unwrap(),
+            Some("connection closed\n".into())
+        );
+    }
+
+    #[test]
+    fn storage_query_structure() {
+        let dir = TempDir::new("InsertInternalMulti").unwrap();
+        let path = dir.into_path();
+        let mut storage = BTreeStorage::new(path.clone()).unwrap();
+        let cmd = Command::Structure;
+
+        assert_eq!(storage.query(cmd).unwrap(), Some("leaf 0 0\n".into()));
+    }
+
+    #[test]
+    fn storage_query_statement() {
+        let dir = TempDir::new("InsertInternalMulti").unwrap();
+        let path = dir.into_path();
+        let mut storage = BTreeStorage::new(path.clone()).unwrap();
+        let cmd = Command::Statement("insert 1 dave dave".into());
+
+        assert_eq!(storage.query(cmd).unwrap(), None);
     }
 }
