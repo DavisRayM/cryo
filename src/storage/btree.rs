@@ -185,13 +185,7 @@ impl BTreeStorage {
     /// Selects all leaf cells
     pub fn select(&mut self) -> Result<Vec<Row>, StorageError> {
         self.current = self.root;
-        let page = self.page(self.current)?;
-
-        if page.borrow().leaf() {
-            Ok(page.borrow_mut().select()?)
-        } else {
-            todo!()
-        }
+        self.select_traverse()
     }
 
     /// Prints out the current structure of the BTree
@@ -217,6 +211,26 @@ impl BTreeStorage {
         self.write_to_disk(page)?;
         self.pages += 1;
         Ok(offset)
+    }
+
+    /// Recursively traverses and selects all leaf cells in the entire tree
+    fn select_traverse(&mut self) -> Result<Vec<Row>, StorageError> {
+        let page = self.page(self.current)?;
+
+        if page.borrow().leaf() {
+            return Ok(page.borrow_mut().select()?);
+        }
+
+        let mut out = Vec::new();
+        let pointers = page.borrow_mut().select()?;
+        for pointer in pointers {
+            self.current = pointer.left()?;
+            out.extend_from_slice(self.select_traverse()?.as_slice());
+            self.current = pointer.right()?;
+            out.extend_from_slice(self.select_traverse()?.as_slice());
+        }
+
+        Ok(out)
     }
 
     /// Inserts a new row into storage
