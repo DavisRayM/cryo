@@ -41,7 +41,6 @@ pub mod header {
         pub(crate) const PAGE_CELLS: usize = PAGE_ID + PAGE_ID_SIZE;
         pub(crate) const PAGE_PARENT: usize = PAGE_CELLS + PAGE_CELLS_SIZE;
         pub(crate) const PAGE_KIND: usize = PAGE_PARENT + PAGE_PARENT_SIZE;
-        pub(crate) const HEADER_END: usize = PAGE_HEADER_SIZE;
 
         pub(crate) const CELLS_PER_LEAF: usize = (PAGE_SIZE - PAGE_HEADER_SIZE) / LEAF_ROW_SIZE;
         pub(crate) const CELLS_PER_INTERNAL: usize =
