@@ -1,3 +1,5 @@
+use std::cell;
+
 use log::trace;
 
 use crate::storage::{error::PageErrorCause, header::page::CELLS_PER_INTERNAL};
@@ -217,10 +219,26 @@ impl TryFrom<[u8; PAGE_SIZE]> for Page {
         })?);
         trace!("reading page {id} from bytes");
 
+        let parent =
+            usize::from_ne_bytes(value[PAGE_PARENT..PAGE_KIND].try_into().map_err(|_| {
+                StorageError::Page {
+                    action: PageAction::Read,
+                    cause: PageErrorCause::DataWrangling,
+                }
+            })?);
+        let cells =
+            usize::from_ne_bytes(value[PAGE_CELLS..PAGE_PARENT].try_into().map_err(|_| {
+                StorageError::Page {
+                    action: PageAction::Read,
+                    cause: PageErrorCause::DataWrangling,
+                }
+            })?);
         let mut kind = match value[PAGE_KIND] {
-            PAGE_LEAF => PageKind::Leaf { rows: Vec::new() },
+            PAGE_LEAF => PageKind::Leaf {
+                rows: Vec::with_capacity(cells),
+            },
             PAGE_INTERNAL => PageKind::Internal {
-                offsets: Vec::new(),
+                offsets: Vec::with_capacity(cells),
             },
             _ => {
                 return Err(StorageError::Page {
@@ -229,20 +247,6 @@ impl TryFrom<[u8; PAGE_SIZE]> for Page {
                 });
             }
         };
-        let cells =
-            usize::from_ne_bytes(value[PAGE_CELLS..PAGE_PARENT].try_into().map_err(|_| {
-                StorageError::Page {
-                    action: PageAction::Read,
-                    cause: PageErrorCause::DataWrangling,
-                }
-            })?);
-        let parent =
-            usize::from_ne_bytes(value[PAGE_PARENT..PAGE_KIND].try_into().map_err(|_| {
-                StorageError::Page {
-                    action: PageAction::Read,
-                    cause: PageErrorCause::DataWrangling,
-                }
-            })?);
 
         let mut pos = PAGE_HEADER_SIZE;
         trace!("cells: {cells}, parent: {parent}");
@@ -278,7 +282,7 @@ impl TryFrom<[u8; PAGE_SIZE]> for Page {
                     })?;
                     trace!("loading leaf cell: {}", row.id()?);
                     rows.push(row);
-                    pos += INTERNAL_ROW_SIZE;
+                    pos += LEAF_ROW_SIZE;
                 }
             }
         }
