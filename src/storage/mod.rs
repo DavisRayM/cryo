@@ -50,6 +50,7 @@ pub mod header {
         pub(crate) const PAGE_LEAF: u8 = 0x0;
 
         pub(crate) const LEAF_SPLITAT: usize = (CELLS_PER_LEAF / 2) + 1;
+        pub(crate) const INTERNAL_SPLITAT: usize = CELLS_PER_INTERNAL / 2;
     }
 }
 

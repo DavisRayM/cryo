@@ -12,7 +12,7 @@ use log::{debug, info, trace};
 use crate::storage::{
     Command,
     error::{PageAction, StorageAction, StorageErrorCause},
-    header::page::PAGE_SIZE,
+    header::page::{INTERNAL_SPLITAT, PAGE_SIZE},
 };
 use crate::{Statement, storage::header::page::LEAF_SPLITAT};
 
@@ -303,115 +303,111 @@ impl BTreeStorage {
             target.leaf()
         );
 
-        match target.leaf() {
-            true if target.offset == self.root => {
-                let parent_offset =
-                    self.create(PageKind::Internal { offsets: vec![] }, 0, self.root)?;
-                let mut parent = self.read_from_disk(parent_offset)?;
-                // Root nodes have themselves as their parent
-                parent.parent = parent.offset;
+        if target.offset == self.root {
+            let parent_offset =
+                self.create(PageKind::Internal { offsets: vec![] }, 0, self.root)?;
+            let mut parent = self.read_from_disk(parent_offset)?;
+            parent.parent = parent.offset;
 
-                trace!(
-                    "linking page {} at {} to new parent {} from {}",
-                    target.id, target.offset, parent.offset, target.parent
-                );
-                // Update target to track new node as parent
-                target.parent = parent.offset;
-                self.root = parent.offset;
-                self.write_to_disk(parent)?;
+            trace!(
+                "linking page {} at {} to new parent {} from {}",
+                target.id, target.offset, parent.offset, target.parent
+            );
+            // Update target to track new node as parent
+            target.parent = parent.offset;
+            self.root = parent.offset;
 
-                let left = target.offset;
-                let (right, key) = self.split_leaf(target, row)?;
-                let parent = self.page(parent_offset)?;
+            let left = target.offset;
+            let mut separator = Row::new();
+            separator.set_left(left);
 
-                let mut separator = Row::new();
-                separator.set_id(key);
-                separator.set_left(left);
-                separator.set_right(right);
-                trace!("insert new separator key {key}, left: {left}, right: {right}");
-                parent.borrow_mut().insert(separator)?;
-                Ok(())
-            }
-            true => {
-                let parent_offset = target.parent;
-                let left = target.offset;
-                let (right, key) = self.split_leaf(target, row)?;
-                self.current = parent_offset;
-                let mut parent = self.read_from_disk(parent_offset)?;
+            let (right, key) = self.split_child(target, row)?;
+            separator.set_id(key);
+            separator.set_right(right);
 
-                let mut pointer = Row::new();
-                pointer.set_id(key);
-                pointer.set_left(left);
-                pointer.set_right(right);
+            trace!("insert new separator key {key}, left: {left}, right: {right}");
+            parent.insert(separator)?;
+            self.write_to_disk(parent)?;
+            Ok(())
+        } else {
+            let parent_offset = target.parent;
+            let left = target.offset;
 
-                let pointers = parent.select()?;
+            let (right, key) = self.split_child(target, row)?;
 
-                trace!(
-                    "Updating index pointers: {:?}",
-                    pointers
-                        .iter()
-                        .map(|p| p.id().unwrap())
-                        .collect::<Vec<usize>>()
-                );
+            self.current = parent_offset;
+            let mut parent = self.read_from_disk(parent_offset)?;
 
-                match pointers.binary_search(&pointer) {
-                    Ok(_) => {
-                        // TODO: No idea what might cause this at the moment...
-                        todo!("handle updating existing keys")
-                    }
-                    Err(pos) => {
-                        trace!("inserting index {key} pointer at: {pos}");
-                        let mut kind = parent.kind.take();
-                        if let Some(PageKind::Internal { offsets }) = &mut kind {
-                            if pos > 0 {
-                                let left_pointer = &mut offsets[pos - 1];
-                                trace!(
-                                    "updating right pointer for {} to {} from {}",
-                                    left_pointer.id()?,
-                                    left,
-                                    left_pointer.left()?
-                                );
-                                left_pointer.set_right(left);
-                            }
+            let mut pointer = Row::new();
+            pointer.set_id(key);
+            pointer.set_left(left);
+            pointer.set_right(right);
 
-                            if pos < offsets.len() {
-                                let right_pointer = &mut offsets[pos];
-                                trace!(
-                                    "updating left pointer for {} to {} from {}",
-                                    right_pointer.id()?,
-                                    right,
-                                    right_pointer.left()?
-                                );
-                                right_pointer.set_left(right);
-                            }
-                        } else {
-                            panic!("leaf cell as parent of another");
+            let pointers = parent.select()?;
+
+            trace!(
+                "Updating index pointers: {:?}",
+                pointers
+                    .iter()
+                    .map(|p| p.id().unwrap())
+                    .collect::<Vec<usize>>()
+            );
+
+            match pointers.binary_search(&pointer) {
+                Ok(_) => {
+                    // TODO: No idea what might cause this at the moment...
+                    todo!("handle updating existing keys")
+                }
+                Err(pos) => {
+                    trace!("inserting index {key} pointer at: {pos}");
+                    let mut kind = parent.kind.take();
+                    if let Some(PageKind::Internal { offsets }) = &mut kind {
+                        if pos > 0 {
+                            let left_pointer = &mut offsets[pos - 1];
+                            trace!(
+                                "updating right pointer for {} to {} from {}",
+                                left_pointer.id()?,
+                                left,
+                                left_pointer.left()?
+                            );
+                            left_pointer.set_right(left);
                         }
-                        parent.kind = kind;
-                    }
-                }
 
-                match parent.insert(pointer) {
-                    Ok(()) => {
-                        self.write_to_disk(parent)?;
-                        Ok(())
+                        if pos < offsets.len() {
+                            let right_pointer = &mut offsets[pos];
+                            trace!(
+                                "updating left pointer for {} to {} from {}",
+                                right_pointer.id()?,
+                                right,
+                                right_pointer.left()?
+                            );
+                            right_pointer.set_left(right);
+                        }
+                    } else {
+                        panic!("leaf cell as parent of another");
                     }
-                    Err(StorageError::Page {
-                        cause: PageErrorCause::Full,
-                        ..
-                    }) => {
-                        todo!()
-                    }
-                    e => e,
+                    parent.kind = kind;
                 }
             }
-            false => {
-                todo!("Split internal node")
+
+            match parent.insert(pointer.clone()) {
+                Ok(()) => {
+                    self.write_to_disk(parent)?;
+                    Ok(())
+                }
+                Err(StorageError::Page {
+                    cause: PageErrorCause::Full,
+                    ..
+                }) => {
+                    self.current = parent.offset;
+                    self.split(parent, pointer)
+                }
+                e => e,
             }
         }
     }
 
-    fn split_leaf(&mut self, mut target: Page, row: Row) -> Result<(usize, usize), StorageError> {
+    fn split_child(&mut self, mut target: Page, row: Row) -> Result<(usize, usize), StorageError> {
         let parent_offset = target.parent;
         let parent = match self.uncache(parent_offset)? {
             Some(parent) => parent,
@@ -419,30 +415,50 @@ impl BTreeStorage {
         };
 
         let mut left_candidates = target.select()?;
-        let right_candidates = left_candidates.split_off(LEAF_SPLITAT);
+        let splitat = if target.leaf() {
+            LEAF_SPLITAT
+        } else {
+            INTERNAL_SPLITAT
+        };
+        let right_candidates = left_candidates.split_off(splitat);
         let left_cells = left_candidates.len();
         let right_cells = right_candidates.len();
         let key = right_candidates[0].id()?;
         trace!("selected split key: {key}");
 
-        let right_offset = self.create(
-            PageKind::Leaf {
-                rows: right_candidates,
-            },
-            right_cells,
-            parent_offset,
-        )?;
-        let mut right = self.read_from_disk(right_offset)?;
-
-        trace!("updating left child, assigning {left_cells} cells");
-        target.kind = Some(PageKind::Leaf {
-            rows: left_candidates,
-        });
-        target.cells = left_cells;
+        let mut right = if target.leaf() {
+            let right_offset = self.create(
+                PageKind::Leaf {
+                    rows: right_candidates,
+                },
+                right_cells,
+                parent_offset,
+            )?;
+            trace!("updating left child, assigning {left_cells} cells");
+            target.kind = Some(PageKind::Leaf {
+                rows: left_candidates,
+            });
+            target.cells = left_cells;
+            self.read_from_disk(right_offset)?
+        } else {
+            let right_offset = self.create(
+                PageKind::Internal {
+                    offsets: right_candidates,
+                },
+                right_cells,
+                parent_offset,
+            )?;
+            trace!("updating left child, assigning {left_cells} cells");
+            target.kind = Some(PageKind::Internal {
+                offsets: left_candidates,
+            });
+            target.cells = left_cells;
+            self.read_from_disk(right_offset)?
+        };
 
         debug!(
-            "creating new index key: {key}\nleft: {}\nright: {right_offset}",
-            target.offset
+            "creating new index key: {key}\nleft: {}\nright: {}",
+            target.offset, right.offset
         );
 
         let insert = row.id()?;
@@ -452,6 +468,7 @@ impl BTreeStorage {
             target.insert(row)?;
         }
 
+        let right_offset = right.offset;
         self.write_to_disk(parent)?;
         self.write_to_disk(target)?;
         self.write_to_disk(right)?;
@@ -739,6 +756,7 @@ mod tests {
         }
 
         let rows = storage.select().unwrap();
+        eprintln!("{}", storage.structure().unwrap());
         assert_eq!(rows.len(), (CELLS_PER_LEAF * CELLS_PER_INTERNAL) + 1);
     }
 
