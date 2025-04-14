@@ -91,21 +91,72 @@ impl Page {
     }
 
     pub fn insert(&mut self, row: Row) -> Result<(), StorageError> {
-        let bin_insert = |items: &mut Vec<Row>, row: Row| -> Result<usize, StorageError> {
-            match items.binary_search(&row) {
-                Ok(_) => Err(StorageError::Page {
-                    action: PageAction::Insert,
-                    cause: PageErrorCause::Duplicate,
-                }),
-                Err(pos) => {
-                    items.insert(pos, row);
-                    Ok(pos)
+        let bin_insert =
+            |items: &mut Vec<Row>, row: Row| -> Result<(usize, Option<Row>), StorageError> {
+                match items.binary_search(&row) {
+                    Ok(_) => Err(StorageError::Page {
+                        action: PageAction::Insert,
+                        cause: PageErrorCause::Duplicate,
+                    }),
+                    Err(pos) => {
+                        items.insert(pos, row);
+                        Ok((pos, None))
+                    }
                 }
-            }
-        };
+            };
 
+        self.cell_task(row, bin_insert)?;
+        self.cells += 1;
+        Ok(())
+    }
+
+    pub fn update(&mut self, row: Row) -> Result<Row, StorageError> {
+        let bin_update =
+            |items: &mut Vec<Row>, row: Row| -> Result<(usize, Option<Row>), StorageError> {
+                match items.binary_search(&row) {
+                    Ok(pos) => {
+                        let out = items.remove(pos);
+                        items.insert(pos, row);
+                        Ok((pos, Some(out)))
+                    }
+                    Err(_) => Err(StorageError::Page {
+                        action: PageAction::Update,
+                        cause: PageErrorCause::Missing,
+                    }),
+                }
+            };
+
+        Ok(self.cell_task(row, bin_update)?.ok_or(StorageError::Page {
+            action: PageAction::Update,
+            cause: PageErrorCause::Missing,
+        })?)
+    }
+
+    fn retrieve(&mut self, row: Row) -> Result<Row, StorageError> {
+        let retrieve =
+            |items: &mut Vec<Row>, row: Row| -> Result<(usize, Option<Row>), StorageError> {
+                match items.binary_search(&row) {
+                    Ok(pos) => Ok((pos, Some(items[pos].clone()))),
+                    Err(_) => Err(StorageError::Page {
+                        action: PageAction::Retrieve,
+                        cause: PageErrorCause::Missing,
+                    }),
+                }
+            };
+
+        Ok(self.cell_task(row, retrieve)?.ok_or(StorageError::Page {
+            action: PageAction::Update,
+            cause: PageErrorCause::Missing,
+        })?)
+    }
+
+    fn cell_task(
+        &mut self,
+        row: Row,
+        task: impl Fn(&mut Vec<Row>, Row) -> Result<(usize, Option<Row>), StorageError>,
+    ) -> Result<Option<Row>, StorageError> {
         if let Some(mut kind) = self.kind.take() {
-            match &mut kind {
+            let out = match &mut kind {
                 PageKind::Internal { offsets } => {
                     if self.cells >= CELLS_PER_INTERNAL {
                         self.kind = Some(kind);
@@ -115,7 +166,7 @@ impl Page {
                         });
                     }
 
-                    let pos = bin_insert(offsets, row)?;
+                    let (pos, row) = task(offsets, row)?;
 
                     // Update links
                     let offset = offsets[pos].offset()?;
@@ -126,6 +177,7 @@ impl Page {
                     if pos + 1 < offsets.len() {
                         offsets[pos + 1].set_left(offset);
                     }
+                    row
                 }
                 PageKind::Leaf { rows } => {
                     if self.cells >= CELLS_PER_LEAF {
@@ -136,12 +188,12 @@ impl Page {
                         });
                     }
 
-                    bin_insert(rows, row)?;
+                    let (_, row) = task(rows, row)?;
+                    row
                 }
             };
             self.kind = Some(kind);
-            self.cells += 1;
-            Ok(())
+            Ok(out)
         } else {
             Err(StorageError::Page {
                 action: PageAction::Insert,
@@ -298,7 +350,10 @@ impl TryFrom<[u8; PAGE_SIZE]> for Page {
 
 #[cfg(test)]
 mod tests {
-    use crate::storage::row::Row;
+    use crate::{
+        statement::{USERNAME_MAX_LENGTH, convert_to_char_array},
+        storage::row::Row,
+    };
 
     use super::*;
 
@@ -344,6 +399,62 @@ mod tests {
         page.insert(row).unwrap();
 
         assert_eq!(page.cells, 1);
+    }
+
+    #[test]
+    fn leaf_retrieve_cell() {
+        let mut page = Page::new(0, 0, PageKind::Leaf { rows: vec![] }, 0, 0);
+        let mut row = Row::new();
+        let expected = vec!['t', 'e', 's', 't'];
+        row.set_id(90);
+        row.set_username(
+            convert_to_char_array::<USERNAME_MAX_LENGTH>(expected.clone(), '\0')
+                .unwrap()
+                .as_ref(),
+        );
+        page.insert(row).unwrap();
+
+        row = Row::new();
+        row.set_id(90);
+        let retrieved = page.retrieve(row).unwrap();
+
+        assert_eq!(
+            retrieved.username().unwrap().replace("\0", ""),
+            expected.iter().collect::<String>()
+        );
+    }
+
+    #[test]
+    fn leaf_update_cell() {
+        let mut page = Page::new(0, 0, PageKind::Leaf { rows: vec![] }, 0, 0);
+        let mut row = Row::new();
+        let initial = vec!['t', 'e', 's', 't'];
+        row.set_id(90);
+        row.set_username(
+            convert_to_char_array::<USERNAME_MAX_LENGTH>(initial, '\0')
+                .unwrap()
+                .as_ref(),
+        );
+        page.insert(row).unwrap();
+
+        row = Row::new();
+        let expected = vec!['c', 'h', 'a', 'n', 'g', 'e', 'd'];
+        row.set_id(90);
+        row.set_username(
+            convert_to_char_array::<USERNAME_MAX_LENGTH>(expected.clone(), '\0')
+                .unwrap()
+                .as_ref(),
+        );
+        page.update(row).unwrap();
+
+        row = Row::new();
+        row.set_id(90);
+        let retrieved = page.retrieve(row).unwrap();
+
+        assert_eq!(
+            retrieved.username().unwrap().replace("\0", ""),
+            expected.iter().collect::<String>()
+        );
     }
 
     #[test]

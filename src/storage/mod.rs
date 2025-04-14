@@ -69,6 +69,10 @@ pub mod error {
         Select,
         #[error("PageWrite")]
         Write,
+        #[error("PageUpdate")]
+        Update,
+        #[error("PageRetrieve")]
+        Retrieve,
     }
 
     #[derive(Debug, Error)]
@@ -83,6 +87,8 @@ pub mod error {
         DataWrangling,
         #[error("page currently in use")]
         InUse,
+        #[error("page item currently missing")]
+        Missing,
     }
 
     #[derive(Debug, Error)]

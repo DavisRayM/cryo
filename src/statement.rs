@@ -13,6 +13,11 @@ pub enum Statement {
         email: Box<[char; EMAIL_MAX_LENGTH]>,
     },
     Select,
+    Update {
+        id: usize,
+        username: [char; USERNAME_MAX_LENGTH],
+        email: Box<[char; EMAIL_MAX_LENGTH]>,
+    },
 }
 
 #[derive(Error, Debug)]
@@ -39,7 +44,7 @@ impl TryFrom<Command> for Statement {
                 let mut parts = s.split(' ');
 
                 match parts.next().unwrap_or("").to_lowercase().as_str() {
-                    "insert" => {
+                    p if p == "insert" || p == "update" => {
                         let content = parts.collect::<Vec<&str>>();
                         if content.len() < 3 {
                             return Err(StatementError::InvalidStatement(
@@ -73,11 +78,19 @@ impl TryFrom<Command> for Statement {
                             ))
                         })?;
 
-                        Ok(Statement::Insert {
-                            id,
-                            username,
-                            email: Box::new(email),
-                        })
+                        if p == "insert" {
+                            Ok(Statement::Insert {
+                                id,
+                                username,
+                                email: Box::new(email),
+                            })
+                        } else {
+                            Ok(Statement::Update {
+                                id,
+                                username,
+                                email: Box::new(email),
+                            })
+                        }
                     }
                     "select" => Ok(Statement::Select),
                     kind => {
