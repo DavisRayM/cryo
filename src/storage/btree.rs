@@ -4,7 +4,7 @@ use std::{
     fs::OpenOptions,
     io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write},
     path::PathBuf,
-    sync::Arc,
+    rc::Rc,
 };
 
 use log::{debug, info, trace};
@@ -30,7 +30,7 @@ pub struct BTreeStorage {
     pub pages: usize,
     pub root: usize,
     pub current: usize,
-    cached: VecDeque<Arc<RefCell<Page>>>,
+    cached: VecDeque<Rc<RefCell<Page>>>,
     path: Option<PathBuf>,
 }
 
@@ -239,7 +239,7 @@ impl BTreeStorage {
         visited.push(page.borrow().id);
 
         if page.borrow().leaf() {
-            return Ok(page.borrow_mut().select()?);
+            return page.borrow_mut().select();
         }
 
         let pointers = page.borrow_mut().select()?;
@@ -361,7 +361,6 @@ impl BTreeStorage {
                     }
                     Err(pos) => {
                         trace!("inserting index {key} pointer at: {pos}");
-                        parent.insert(pointer)?;
                         let mut kind = parent.kind.take();
                         if let Some(PageKind::Internal { offsets }) = &mut kind {
                             if pos > 0 {
@@ -375,8 +374,8 @@ impl BTreeStorage {
                                 left_pointer.set_right(left);
                             }
 
-                            if pos + 1 < offsets.len() {
-                                let right_pointer = &mut offsets[pos + 1];
+                            if pos < offsets.len() {
+                                let right_pointer = &mut offsets[pos];
                                 trace!(
                                     "updating left pointer for {} to {} from {}",
                                     right_pointer.id()?,
@@ -392,8 +391,19 @@ impl BTreeStorage {
                     }
                 }
 
-                self.write_to_disk(parent)?;
-                Ok(())
+                match parent.insert(pointer) {
+                    Ok(()) => {
+                        self.write_to_disk(parent)?;
+                        Ok(())
+                    }
+                    Err(StorageError::Page {
+                        cause: PageErrorCause::Full,
+                        ..
+                    }) => {
+                        todo!()
+                    }
+                    e => e,
+                }
             }
             false => {
                 todo!("Split internal node")
@@ -464,7 +474,7 @@ impl BTreeStorage {
         let pointers = page.borrow_mut().select()?;
         trace!("candidates: {:?}", pointers);
 
-        let pos = match pointers.binary_search(&row) {
+        let pos = match pointers.binary_search(row) {
             Ok(pos) => pointers[pos].right()?,
             Err(pos) => {
                 let pointer = if pos == pointers.len() {
@@ -494,7 +504,7 @@ impl BTreeStorage {
     /// - If `offset` is OutOfBounds
     /// - If IO error occurs
     /// - If failed to load page from disk
-    fn page(&mut self, offset: usize) -> Result<Arc<RefCell<Page>>, StorageError> {
+    fn page(&mut self, offset: usize) -> Result<Rc<RefCell<Page>>, StorageError> {
         if offset >= self.pages * PAGE_SIZE {
             debug!(
                 "offset {offset} is out of bounds; current pages {1} maximum {0}",
@@ -524,7 +534,7 @@ impl BTreeStorage {
             action: StorageAction::PageOut,
             cause: StorageErrorCause::CacheMiss,
         })?;
-        match Arc::try_unwrap(page) {
+        match Rc::try_unwrap(page) {
             Ok(rc) => {
                 let inner = rc.into_inner();
                 self.write_to_disk(inner)?;
@@ -541,9 +551,9 @@ impl BTreeStorage {
     }
 
     /// Adds a new page into the cache.
-    fn cache(&mut self, page: Page) -> Result<Arc<RefCell<Page>>, StorageError> {
-        let page = Arc::new(RefCell::new(page));
-        let clone = Arc::clone(&page);
+    fn cache(&mut self, page: Page) -> Result<Rc<RefCell<Page>>, StorageError> {
+        let page = Rc::new(RefCell::new(page));
+        let clone = Rc::clone(&page);
         self.cached.push_front(page);
         Ok(clone)
     }
@@ -562,7 +572,7 @@ impl BTreeStorage {
         debug!("page located at {pos} in cache; attempting removal");
 
         let page = self.cached.remove(pos).expect("page should be at position");
-        match Arc::try_unwrap(page) {
+        match Rc::try_unwrap(page) {
             Ok(rc) => {
                 let page = rc.into_inner();
                 debug!("page {} successfully uncached.", page.id);
@@ -627,7 +637,7 @@ impl BTreeStorage {
     }
 
     /// Retrieves page from cache if any
-    fn cached_page(&mut self, offset: usize) -> Result<Option<Arc<RefCell<Page>>>, StorageError> {
+    fn cached_page(&mut self, offset: usize) -> Result<Option<Rc<RefCell<Page>>>, StorageError> {
         while self.cached.len() >= PAGE_IN_MEMORY {
             trace!(
                 "cache over capacity({}) {}, clearing page",
@@ -641,13 +651,13 @@ impl BTreeStorage {
             .cached
             .iter()
             .filter(|p| p.borrow().offset == offset)
-            .collect::<Vec<&Arc<RefCell<Page>>>>();
+            .collect::<Vec<&Rc<RefCell<Page>>>>();
         if page.is_empty() {
             debug!("page {offset} is not cached");
             Ok(None)
         } else {
             debug!("retrieved from cache page {offset}(hits: {})", page.len());
-            Ok(Some(Arc::clone(page[0])))
+            Ok(Some(Rc::clone(page[0])))
         }
     }
 }

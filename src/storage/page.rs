@@ -1,5 +1,3 @@
-use std::cell;
-
 use log::trace;
 
 use crate::storage::{error::PageErrorCause, header::page::CELLS_PER_INTERNAL};
@@ -64,10 +62,7 @@ impl Page {
 
     pub fn leaf(&self) -> bool {
         if let Some(kind) = &self.kind {
-            return match kind {
-                PageKind::Leaf { .. } => true,
-                _ => false,
-            };
+            return matches!(kind, PageKind::Leaf { .. });
         }
         println!("{:?}", self);
         panic!("page unknown")
