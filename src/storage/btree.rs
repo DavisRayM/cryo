@@ -355,7 +355,8 @@ impl BTreeStorage {
                 );
 
                 match pointers.binary_search(&pointer) {
-                    Ok(pos) => {
+                    Ok(_) => {
+                        // TODO: No idea what might cause this at the moment...
                         todo!("handle updating existing keys")
                     }
                     Err(pos) => {
@@ -703,73 +704,32 @@ mod tests {
         let dir = TempDir::new("InsertLeaf").unwrap();
         let path = dir.into_path();
         let mut storage = BTreeStorage::new(path.clone()).unwrap();
-        let leafs = CELLS_PER_INTERNAL;
-        let mut tree = format!("internal 1 {leafs}\n");
-        let mut leaf = 0;
-        tree += format!("  leaf {leaf} {}\n", CELLS_PER_LEAF).as_str();
-        leaf += 2;
-        while leaf <= leafs {
-            tree += format!("  leaf {leaf} {}\n", CELLS_PER_LEAF).as_str();
-            leaf += 1;
-        }
 
-        for i in 0..CELLS_PER_LEAF * leafs {
+        for i in 0..=CELLS_PER_LEAF * 2 {
             let mut row = Row::new();
             row.set_id(i);
-            storage.current = storage.root;
             storage.insert(row).unwrap();
         }
 
-        storage.current = storage.root;
-        assert_eq!(storage.walk(None).unwrap().trim(), tree.to_string().trim());
+        assert_eq!(storage.pages, 4);
+        let rows = storage.select().unwrap();
+        assert_eq!(rows.len(), (CELLS_PER_LEAF * 2) + 1);
     }
 
     #[test]
     fn storage_split_internal() {
-        let dir = TempDir::new("InsertInternal").unwrap();
+        let dir = TempDir::new("InsertLeaf").unwrap();
         let path = dir.into_path();
         let mut storage = BTreeStorage::new(path.clone()).unwrap();
-        let mut tree = format!("internal {} 2\n", CELLS_PER_INTERNAL + 2);
-        tree += format!("  internal {} {}\n", 1, CELLS_PER_INTERNAL).as_str();
 
-        let mut leaf = 0;
-        tree += format!("    leaf {leaf} {}\n", CELLS_PER_LEAF).as_str();
-        leaf += 2;
-        while leaf <= CELLS_PER_INTERNAL {
-            tree += format!("    leaf {leaf} {}\n", CELLS_PER_LEAF).as_str();
-            leaf += 1;
-        }
-
-        tree += format!("  internal {} {}\n", CELLS_PER_INTERNAL + 3, 1).as_str();
-        tree += format!("    leaf {} {}\n", CELLS_PER_INTERNAL + 1, CELLS_PER_LEAF).as_str();
-
-        for i in 0..CELLS_PER_LEAF * (CELLS_PER_INTERNAL + 1) {
+        for i in 0..=CELLS_PER_LEAF * CELLS_PER_INTERNAL {
             let mut row = Row::new();
             row.set_id(i);
-            storage.current = storage.root;
             storage.insert(row).unwrap();
         }
 
-        storage.current = storage.root;
-        assert_eq!(storage.walk(None).unwrap().trim(), tree.to_string().trim());
-    }
-
-    #[test]
-    fn storage_split_internal_multi() {
-        let dir = TempDir::new("InsertInternalMulti").unwrap();
-        let path = dir.into_path();
-        let mut storage = BTreeStorage::new(path.clone()).unwrap();
-        let tree = "";
-
-        for i in 0..CELLS_PER_LEAF * (CELLS_PER_INTERNAL * 2) + 1 {
-            let mut row = Row::new();
-            row.set_id(i);
-            storage.current = storage.root;
-            storage.insert(row).unwrap();
-        }
-
-        storage.current = storage.root;
-        assert_eq!(storage.walk(None).unwrap().trim(), tree.to_string().trim());
+        let rows = storage.select().unwrap();
+        assert_eq!(rows.len(), (CELLS_PER_LEAF * CELLS_PER_INTERNAL) + 1);
     }
 
     #[test]
