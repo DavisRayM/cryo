@@ -2,14 +2,37 @@ use std::fmt;
 
 use super::{error::StorageError, header::row::*};
 
-pub(crate) const ROW_ALLOCATED_SPACE: usize = if INTERNAL_ROW_SIZE > LEAF_ROW_SIZE {
-    INTERNAL_ROW_SIZE
-} else {
-    LEAF_ROW_SIZE
-};
-
 #[derive(Debug, Clone)]
-pub(crate) struct Row(pub [u8; ROW_ALLOCATED_SPACE]);
+pub(crate) struct Row(pub Vec<u8>);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum RowType {
+    Internal,
+    Leaf,
+}
+
+impl TryInto<RowType> for u8 {
+    type Error = StorageError;
+    fn try_into(self) -> Result<RowType, Self::Error> {
+        match self {
+            0x0 => Ok(RowType::Internal),
+            0x1 => Ok(RowType::Leaf),
+            _ => Err(StorageError::Row {
+                action: "read row type".into(),
+                error: "unknown type".into(),
+            }),
+        }
+    }
+}
+
+impl From<RowType> for u8 {
+    fn from(value: RowType) -> Self {
+        match value {
+            RowType::Internal => 0x0,
+            RowType::Leaf => 0x1,
+        }
+    }
+}
 
 pub fn byte_to_char(bytes: &[u8], mut cause: Option<String>) -> Result<Vec<char>, StorageError> {
     let mut out = Vec::new();
@@ -51,8 +74,15 @@ impl fmt::Display for Row {
 }
 
 impl Row {
-    pub fn new() -> Self {
-        Self([0; ROW_ALLOCATED_SPACE])
+    pub fn new(t: RowType) -> Self {
+        let size = if t == RowType::Internal {
+            ROW_RIGHT_OFFSET + ROW_OFFSET_SIZE
+        } else {
+            ROW_BODY_SIZE
+        };
+        let mut inner = vec![0; size];
+        inner[ROW_TYPE] = t.into();
+        Self(vec![0; size])
     }
 
     pub fn left(&self) -> Result<usize, StorageError> {
@@ -67,8 +97,8 @@ impl Row {
     }
 
     pub fn set_left(&mut self, offset: usize) {
-        self.0[ROW_LEFT_OFFSET..ROW_LEFT_OFFSET + ROW_OFFSET_SIZE]
-            .clone_from_slice(offset.to_ne_bytes().as_ref());
+        let end = ROW_LEFT_OFFSET + ROW_OFFSET_SIZE;
+        self.0[ROW_LEFT_OFFSET..end].clone_from_slice(offset.to_ne_bytes().as_ref());
     }
 
     pub fn right(&self) -> Result<usize, StorageError> {
@@ -83,8 +113,8 @@ impl Row {
     }
 
     pub fn set_right(&mut self, offset: usize) {
-        self.0[ROW_RIGHT_OFFSET..ROW_RIGHT_OFFSET + ROW_OFFSET_SIZE]
-            .clone_from_slice(offset.to_ne_bytes().as_ref());
+        let end = ROW_RIGHT_OFFSET + ROW_OFFSET_SIZE;
+        self.0[ROW_RIGHT_OFFSET..end].clone_from_slice(offset.to_ne_bytes().as_ref());
     }
 
     pub fn offset(&self) -> Result<usize, StorageError> {
@@ -98,14 +128,9 @@ impl Row {
         ))
     }
 
-    pub fn set_offset(&mut self, offset: usize) {
-        self.0[ROW_OFFSET..ROW_OFFSET + ROW_OFFSET_SIZE]
-            .clone_from_slice(offset.to_ne_bytes().as_ref());
-    }
-
     pub fn id(&self) -> Result<usize, StorageError> {
         Ok(usize::from_ne_bytes(
-            self.0[ROW_ID..ROW_USERNAME]
+            self.0[ROW_ID..ROW_TYPE]
                 .try_into()
                 .map_err(|_| StorageError::Row {
                     action: "retrieve id".into(),
@@ -115,28 +140,51 @@ impl Row {
     }
 
     pub fn set_id(&mut self, id: usize) {
-        self.0[ROW_ID..ROW_USERNAME].clone_from_slice(id.to_ne_bytes().as_ref());
+        self.0[ROW_ID..ROW_TYPE].clone_from_slice(id.to_ne_bytes().as_ref());
     }
 
-    pub fn username(&self) -> Result<String, StorageError> {
-        let bytes = &self.0[ROW_USERNAME..ROW_EMAIL];
-        let chars = byte_to_char(bytes, Some(format!("row({}) username", self.id()?)))?;
-        Ok(chars.iter().collect())
+    pub fn size(&self) -> Result<usize, StorageError> {
+        Ok(match self.row_type()? {
+            RowType::Internal => ROW_RIGHT_OFFSET + ROW_OFFSET_SIZE,
+            RowType::Leaf => {
+                let size =
+                    usize::from_ne_bytes(self.0[ROW_VALUE..ROW_BODY_SIZE].try_into().map_err(
+                        |_| StorageError::Row {
+                            action: "retrieve id".into(),
+                            error: "failed to get row size bytes".into(),
+                        },
+                    )?);
+                ROW_BODY_SIZE + size
+            }
+        })
     }
 
-    pub fn set_username(&mut self, username: &[char]) {
-        self.0[ROW_USERNAME..ROW_EMAIL].clone_from_slice(&char_to_byte(username));
+    pub fn row_type(&self) -> Result<RowType, StorageError> {
+        self.0[ROW_TYPE].try_into()
     }
 
-    pub fn email(&self) -> Result<String, StorageError> {
-        let bytes = &self.0[ROW_EMAIL..self.0.len()];
-        let chars = byte_to_char(bytes, Some(format!("row({}) email", self.id()?)))?;
-        Ok(chars.iter().collect())
+    pub fn set_type(&mut self, t: RowType) {
+        self.0[ROW_TYPE] = t.into();
     }
 
-    pub fn set_email(&mut self, email: &[char]) {
-        let end = self.0.len();
-        self.0[ROW_EMAIL..end].clone_from_slice(&char_to_byte(email));
+    pub fn value(&self) -> Result<&[u8], StorageError> {
+        let size =
+            usize::from_ne_bytes(self.0[ROW_VALUE..ROW_BODY_SIZE].try_into().map_err(|_| {
+                StorageError::Row {
+                    action: "retrieve id".into(),
+                    error: "failed to get row size bytes".into(),
+                }
+            })?);
+        Ok(&self.0[ROW_BODY_SIZE..ROW_BODY_SIZE + size])
+    }
+
+    pub fn set_value(&mut self, value: &[u8]) {
+        let end = ROW_BODY_SIZE + value.len();
+        if self.0.len() < end {
+            self.0.resize(end, 0);
+        }
+        self.0[ROW_VALUE..ROW_BODY_SIZE].clone_from_slice(value.len().to_ne_bytes().as_ref());
+        self.0[ROW_BODY_SIZE..end].clone_from_slice(value);
     }
 }
 
@@ -168,39 +216,27 @@ impl TryFrom<&[u8]> for Row {
     type Error = StorageError;
 
     fn try_from(value: &[u8]) -> Result<Self, Self::Error> {
-        let mut buf = [0; ROW_ALLOCATED_SPACE];
-        match value.len() {
-            size if size == LEAF_ROW_SIZE || size == INTERNAL_ROW_SIZE => {
-                buf[..size].clone_from_slice(value);
-                Ok(Self(buf))
-            }
-            l => Err(StorageError::Row {
+        if value.len() < ROW_BODY_SIZE {
+            return Err(StorageError::Row {
                 action: "read bytes".into(),
-                error: format!("unexpected size '{}'", l),
-            }),
+                error: format!("unexpected size '{}'", value.len()),
+            });
         }
+        let mut row = Row(value.to_vec());
+        row.set_type(row.row_type()?);
+        Ok(row)
     }
 }
 
-impl From<&Row> for [u8; INTERNAL_ROW_SIZE] {
-    fn from(val: &Row) -> [u8; INTERNAL_ROW_SIZE] {
-        let mut buf = [0; INTERNAL_ROW_SIZE];
-        buf[..].clone_from_slice(&val.0[..INTERNAL_ROW_SIZE]);
-        buf
-    }
-}
-
-impl From<&Row> for [u8; LEAF_ROW_SIZE] {
-    fn from(val: &Row) -> [u8; LEAF_ROW_SIZE] {
-        let mut buf = [0; LEAF_ROW_SIZE];
-        buf[..].clone_from_slice(&val.0[..LEAF_ROW_SIZE]);
-        buf
+impl From<&Row> for Vec<u8> {
+    fn from(value: &Row) -> Self {
+        value.0.clone()
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use crate::statement::{EMAIL_MAX_LENGTH, USERNAME_MAX_LENGTH, convert_to_char_array};
+    use crate::statement::{EMAIL_MAX_LENGTH, convert_to_char_array};
 
     use super::*;
 
@@ -213,52 +249,37 @@ mod tests {
 
     #[test]
     fn internal_cell() {
-        let mut row = Row::new();
+        let mut row = Row::new(RowType::Internal);
         row.set_id(90);
 
-        let bytes: [u8; INTERNAL_ROW_SIZE] = (&row).into();
+        let bytes: Vec<u8> = (&row).into();
         let row: Row = (&bytes[..]).try_into().unwrap();
         assert_eq!(row.id().unwrap(), 90);
     }
 
     #[test]
     fn leaf_cell() {
-        let mut row = Row::new();
+        let mut row = Row::new(RowType::Leaf);
         let email = convert_to_char_array::<EMAIL_MAX_LENGTH>(vec!['a', 'b'], '\0').unwrap();
-        row.set_email(&email);
+        let email = char_to_byte(&email);
+        row.set_value(&email);
 
-        let bytes: [u8; LEAF_ROW_SIZE] = (&row).into();
+        let bytes: Vec<u8> = (&row).into();
         let row: Row = (&bytes[..]).try_into().unwrap();
-        assert_eq!(row.email().unwrap(), email.iter().collect::<String>());
+        assert_eq!(row.value().unwrap(), email);
     }
 
     #[test]
     fn row_offset() {
-        let mut row = Row::new();
-        row.set_offset(10);
+        let mut row = Row::new(RowType::Internal);
+        row.set_left(10);
         assert_eq!(row.offset().unwrap(), 10);
     }
 
     #[test]
     fn row_id() {
-        let mut row = Row::new();
+        let mut row = Row::new(RowType::Internal);
         row.set_id(10);
         assert_eq!(row.id().unwrap(), 10);
-    }
-
-    #[test]
-    fn row_username() {
-        let mut row = Row::new();
-        let username = convert_to_char_array::<USERNAME_MAX_LENGTH>(vec!['a', 'b'], '\0').unwrap();
-        row.set_username(&username);
-        assert_eq!(row.username().unwrap(), username.iter().collect::<String>());
-    }
-
-    #[test]
-    fn row_email() {
-        let mut row = Row::new();
-        let email = convert_to_char_array::<EMAIL_MAX_LENGTH>(vec!['a', 'b'], '\0').unwrap();
-        row.set_email(&email);
-        assert_eq!(row.email().unwrap(), email.iter().collect::<String>());
     }
 }
