@@ -162,6 +162,7 @@ impl BTreeStorage {
             trace!("no pages detected; creating starting leaf node.");
             storage.write_header()?;
             storage.root = storage.create(PageKind::Leaf { rows: vec![] }, 0, 0)?;
+            storage.page(storage.root)?.borrow_mut().parent = storage.root;
             storage.write_header()?;
         } else {
             storage.read_header()?;
@@ -180,15 +181,16 @@ impl BTreeStorage {
         self.reader.read_exact(&mut buf)?;
         let reclaim_keys = usize::from_ne_bytes(buf);
 
-        eprintln!("keys: {}", reclaim_keys);
+        debug!("reclaim keys len: {}", reclaim_keys);
         self.reclaim = Vec::new();
 
         for _ in 0..reclaim_keys {
             let mut buf = [0; RECLAIM_OFFSET_SIZE];
             self.reader.read_exact(&mut buf)?;
-            let offset = usize::from_be_bytes(buf);
+            let offset = usize::from_ne_bytes(buf);
             self.reclaim.push(offset);
         }
+        debug!("reclaim keys: {:?}", self.reclaim);
         Ok(())
     }
 
@@ -248,7 +250,7 @@ impl BTreeStorage {
                 out += self.walk_tree(width + 2, visited)?.as_ref();
             }
         } else if self.pages <= LEAF_PRINT_CUTOFF {
-            let parent = self.page(page.borrow().parent)?.borrow().id;
+            let parent = self.page(page.borrow().parent)?.borrow().offset;
             out += format!("  {} -> {}[color=red]", id, parent).as_str();
         }
 
@@ -556,11 +558,12 @@ impl BTreeStorage {
             offset, cells, parent
         );
 
-        let page = if let Some(reclaim_offset) = self.reclaim.pop() {
-            Page::new(reclaim_offset, self.pages, kind, cells, parent)
+        let offset = if let Some(reclaim_offset) = self.reclaim.pop() {
+            reclaim_offset
         } else {
-            Page::new(offset, self.pages, kind, cells, parent)
+            offset
         };
+        let page = Page::new(offset, self.pages, kind, cells, parent);
 
         self.write_to_disk(page)?;
         self.pages += 1;
