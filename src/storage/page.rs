@@ -105,8 +105,28 @@ impl Page {
                 }
             };
 
-        self.cell_task(row, bin_insert)?;
+        self.cell_task(row, PageAction::Insert, bin_insert)?;
         self.cells += 1;
+        Ok(())
+    }
+
+    pub fn delete(&mut self, row: Row) -> Result<(), StorageError> {
+        let delete =
+            |items: &mut Vec<Row>, row: Row| -> Result<(usize, Option<Row>), StorageError> {
+                match items.binary_search(&row) {
+                    Ok(pos) => {
+                        items.remove(pos);
+                        Ok((pos, None))
+                    }
+                    Err(_) => Err(StorageError::Page {
+                        action: PageAction::Delete,
+                        cause: PageErrorCause::Missing,
+                    }),
+                }
+            };
+
+        self.cell_task(row, PageAction::Delete, delete)?;
+        self.cells -= 1;
         Ok(())
     }
 
@@ -126,13 +146,14 @@ impl Page {
                 }
             };
 
-        Ok(self.cell_task(row, bin_update)?.ok_or(StorageError::Page {
-            action: PageAction::Update,
-            cause: PageErrorCause::Missing,
-        })?)
+        self.cell_task(row, PageAction::Update, bin_update)?
+            .ok_or(StorageError::Page {
+                action: PageAction::Update,
+                cause: PageErrorCause::Missing,
+            })
     }
 
-    fn retrieve(&mut self, row: Row) -> Result<Row, StorageError> {
+    pub fn retrieve(&mut self, row: Row) -> Result<Row, StorageError> {
         let retrieve =
             |items: &mut Vec<Row>, row: Row| -> Result<(usize, Option<Row>), StorageError> {
                 match items.binary_search(&row) {
@@ -144,15 +165,17 @@ impl Page {
                 }
             };
 
-        Ok(self.cell_task(row, retrieve)?.ok_or(StorageError::Page {
-            action: PageAction::Update,
-            cause: PageErrorCause::Missing,
-        })?)
+        self.cell_task(row, PageAction::Retrieve, retrieve)?
+            .ok_or(StorageError::Page {
+                action: PageAction::Update,
+                cause: PageErrorCause::Missing,
+            })
     }
 
     fn cell_task(
         &mut self,
         row: Row,
+        action: PageAction,
         task: impl Fn(&mut Vec<Row>, Row) -> Result<(usize, Option<Row>), StorageError>,
     ) -> Result<Option<Row>, StorageError> {
         if let Some(mut kind) = self.kind.take() {
@@ -161,7 +184,7 @@ impl Page {
                     if self.cells >= CELLS_PER_INTERNAL {
                         self.kind = Some(kind);
                         return Err(StorageError::Page {
-                            action: PageAction::Insert,
+                            action,
                             cause: PageErrorCause::Full,
                         });
                     }
@@ -169,13 +192,16 @@ impl Page {
                     let (pos, row) = task(offsets, row)?;
 
                     // Update links
-                    let offset = offsets[pos].offset()?;
-                    if pos > 0 {
-                        offsets[pos - 1].set_right(offset);
-                    }
+                    if pos < offsets.len() {
+                        let offset = offsets[pos].left()?;
+                        if pos > 0 {
+                            offsets[pos - 1].set_right(offset);
+                        }
 
-                    if pos + 1 < offsets.len() {
-                        offsets[pos + 1].set_left(offset);
+                        let offset = offsets[pos].right()?;
+                        if pos + 1 < offsets.len() {
+                            offsets[pos + 1].set_left(offset);
+                        }
                     }
                     row
                 }
@@ -183,7 +209,7 @@ impl Page {
                     if self.cells >= CELLS_PER_LEAF {
                         self.kind = Some(kind);
                         return Err(StorageError::Page {
-                            action: PageAction::Insert,
+                            action,
                             cause: PageErrorCause::Full,
                         });
                     }
@@ -455,6 +481,36 @@ mod tests {
             retrieved.username().unwrap().replace("\0", ""),
             expected.iter().collect::<String>()
         );
+    }
+
+    #[test]
+    fn leaf_delete_cell() {
+        let mut page = Page::new(0, 0, PageKind::Leaf { rows: vec![] }, 0, 0);
+        let mut row = Row::new();
+        let initial = vec!['t', 'e', 's', 't'];
+        row.set_id(90);
+        row.set_username(
+            convert_to_char_array::<USERNAME_MAX_LENGTH>(initial, '\0')
+                .unwrap()
+                .as_ref(),
+        );
+        page.insert(row).unwrap();
+
+        row = Row::new();
+        row.set_id(90);
+        page.delete(row).unwrap();
+
+        row = Row::new();
+        row.set_id(90);
+        let retrieved = page.retrieve(row);
+        if let Err(StorageError::Page {
+            cause: PageErrorCause::Missing,
+            ..
+        }) = retrieved
+        {
+        } else {
+            assert!(false)
+        }
     }
 
     #[test]

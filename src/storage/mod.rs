@@ -73,6 +73,8 @@ pub mod error {
         Update,
         #[error("PageRetrieve")]
         Retrieve,
+        #[error("PageDelete")]
+        Delete,
     }
 
     #[derive(Debug, Error)]
@@ -107,6 +109,8 @@ pub mod error {
         Query,
         #[error("Search")]
         Search,
+        #[error("Delete")]
+        Delete,
     }
 
     #[derive(Debug, Error)]

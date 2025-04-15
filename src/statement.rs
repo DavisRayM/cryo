@@ -18,6 +18,9 @@ pub enum Statement {
         username: [char; USERNAME_MAX_LENGTH],
         email: Box<[char; EMAIL_MAX_LENGTH]>,
     },
+    Delete {
+        id: usize,
+    },
 }
 
 #[derive(Error, Debug)]
@@ -44,12 +47,29 @@ impl TryFrom<Command> for Statement {
                 let mut parts = s.split(' ');
 
                 match parts.next().unwrap_or("").to_lowercase().as_str() {
+                    "delete" => {
+                        let content = parts.collect::<Vec<&str>>();
+                        if content.is_empty() {
+                            return Err(StatementError::InvalidStatement(
+                                "delete requires id.".into(),
+                            ));
+                        }
+
+                        let id = content[0].parse::<usize>().map_err(|_| {
+                            StatementError::InvalidStatement(format!(
+                                "insert 'id' field should be an integer, got '{}'",
+                                content[0]
+                            ))
+                        })?;
+
+                        Ok(Statement::Delete { id })
+                    }
                     p if p == "insert" || p == "update" => {
                         let content = parts.collect::<Vec<&str>>();
                         if content.len() < 3 {
-                            return Err(StatementError::InvalidStatement(
-                                "insert requires id, username, email fields.".into(),
-                            ));
+                            return Err(StatementError::InvalidStatement(format!(
+                                "{p} requires id, username, email fields."
+                            )));
                         }
 
                         let id = content[0].parse::<usize>().map_err(|_| {
