@@ -466,6 +466,7 @@ impl BTreeStorage {
 
         self.write_to_disk(parent)?;
         self.write_to_disk(successor)?;
+        self.reclaim.push(ancestor.offset);
         self.write_to_disk(ancestor)?;
 
         if let Some((parent_offset, key)) = self.breadcrumbs.pop() {
@@ -550,7 +551,12 @@ impl BTreeStorage {
             offset, cells, parent
         );
 
-        let page = Page::new(offset, self.pages, kind, cells, parent);
+        let page = if let Some(reclaim_offset) = self.reclaim.pop() {
+            Page::new(reclaim_offset, self.pages, kind, cells, parent)
+        } else {
+            Page::new(offset, self.pages, kind, cells, parent)
+        };
+
         self.write_to_disk(page)?;
         self.pages += 1;
         Ok(offset)
