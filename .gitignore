@@ -1,0 +1,6 @@
+# Rust artifacts
+/target
+
+# Cryo artifacts
+*.dot
+*.svg
