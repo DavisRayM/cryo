@@ -1,15 +1,18 @@
 use log::trace;
 
-use crate::storage::{error::PageErrorCause, header::page::CELLS_PER_INTERNAL};
+use crate::storage::{
+    error::PageErrorCause,
+    header::row::{ROW_OFFSET_SIZE, ROW_RIGHT_OFFSET, ROW_VALUE, ROW_VALUE_SIZE},
+};
 
 use super::{
     error::{PageAction, StorageError},
     header::{
         page::{
-            CELLS_PER_LEAF, PAGE_CELLS, PAGE_HEADER_SIZE, PAGE_ID, PAGE_INTERNAL, PAGE_KIND,
-            PAGE_LEAF, PAGE_PARENT, PAGE_SIZE,
+            PAGE_CELLS, PAGE_HEADER_SIZE, PAGE_ID, PAGE_INTERNAL, PAGE_KIND, PAGE_LEAF,
+            PAGE_PARENT, PAGE_SIZE,
         },
-        row::{INTERNAL_ROW_SIZE, LEAF_ROW_SIZE},
+        row::ROW_BODY_SIZE,
     },
     row::Row,
 };
@@ -105,8 +108,9 @@ impl Page {
                 }
             };
 
+        let size = row.size()?;
         self.cell_task(row, PageAction::Insert, bin_insert)?;
-        self.cells += 1;
+        self.cells += size;
         Ok(())
     }
 
@@ -114,10 +118,7 @@ impl Page {
         let delete =
             |items: &mut Vec<Row>, row: Row| -> Result<(usize, Option<Row>), StorageError> {
                 match items.binary_search(&row) {
-                    Ok(pos) => {
-                        items.remove(pos);
-                        Ok((pos, None))
-                    }
+                    Ok(pos) => Ok((pos, Some(items.remove(pos)))),
                     Err(_) => Err(StorageError::Page {
                         action: PageAction::Delete,
                         cause: PageErrorCause::Missing,
@@ -125,8 +126,10 @@ impl Page {
                 }
             };
 
-        self.cell_task(row, PageAction::Delete, delete)?;
-        self.cells -= 1;
+        let row = self.cell_task(row, PageAction::Delete, delete)?;
+        if let Some(row) = row {
+            self.cells -= row.size()?;
+        }
         Ok(())
     }
 
@@ -146,11 +149,17 @@ impl Page {
                 }
             };
 
-        self.cell_task(row, PageAction::Update, bin_update)?
-            .ok_or(StorageError::Page {
-                action: PageAction::Update,
-                cause: PageErrorCause::Missing,
-            })
+        let replaced = row.size()? as isize;
+        let actual =
+            self.cell_task(row, PageAction::Update, bin_update)?
+                .ok_or(StorageError::Page {
+                    action: PageAction::Update,
+                    cause: PageErrorCause::Missing,
+                })?;
+        let change: isize = replaced - actual.size()? as isize;
+        self.cells = (self.cells as isize + change) as usize;
+
+        Ok(actual)
     }
 
     pub fn retrieve(&mut self, row: Row) -> Result<Row, StorageError> {
@@ -181,7 +190,7 @@ impl Page {
         if let Some(mut kind) = self.kind.take() {
             let out = match &mut kind {
                 PageKind::Internal { offsets } => {
-                    if self.cells >= CELLS_PER_INTERNAL {
+                    if self.cells + row.size()? >= PAGE_SIZE {
                         self.kind = Some(kind);
                         return Err(StorageError::Page {
                             action,
@@ -206,7 +215,7 @@ impl Page {
                     row
                 }
                 PageKind::Leaf { rows } => {
-                    if self.cells >= CELLS_PER_LEAF {
+                    if self.cells + row.size()? >= PAGE_SIZE {
                         self.kind = Some(kind);
                         return Err(StorageError::Page {
                             action,
@@ -266,18 +275,22 @@ impl From<Page> for [u8; PAGE_SIZE] {
                         cell.left().unwrap(),
                         cell.right().unwrap()
                     );
-                    let bytes: [u8; INTERNAL_ROW_SIZE] = cell.into();
-                    buf[offset..offset + INTERNAL_ROW_SIZE].clone_from_slice(&bytes[..]);
-                    offset += INTERNAL_ROW_SIZE;
+                    let bytes: Vec<u8> = cell.into();
+                    buf[offset..offset + bytes.len()].clone_from_slice(&bytes[..]);
+                    offset += bytes.len();
                 })
             }
             Some(PageKind::Leaf { rows }) => {
                 buf[PAGE_KIND] = PAGE_LEAF;
                 rows.iter().for_each(|cell| {
-                    let bytes: [u8; LEAF_ROW_SIZE] = cell.into();
-                    trace!("writing leaf cell {}", cell.id().unwrap(),);
-                    buf[offset..offset + LEAF_ROW_SIZE].clone_from_slice(&bytes[..]);
-                    offset += LEAF_ROW_SIZE;
+                    trace!(
+                        "writing leaf cell {} {}",
+                        cell.id().unwrap(),
+                        cell.size().unwrap()
+                    );
+                    let bytes: Vec<u8> = cell.into();
+                    buf[offset..offset + bytes.len()].clone_from_slice(&bytes[..]);
+                    offset += bytes.len();
                 })
             }
             None => {
@@ -336,36 +349,61 @@ impl TryFrom<[u8; PAGE_SIZE]> for Page {
 
         match &mut kind {
             PageKind::Internal { offsets } => {
-                for _ in 0..cells {
-                    let mut buf = [0; INTERNAL_ROW_SIZE];
+                let mut offset = 0;
+                while offset < cells {
+                    let mut buf = [0; ROW_RIGHT_OFFSET + ROW_OFFSET_SIZE];
+                    pos += offset;
 
-                    buf[..].clone_from_slice(&value[pos..pos + INTERNAL_ROW_SIZE]);
+                    buf[..].clone_from_slice(&value[pos..pos + ROW_RIGHT_OFFSET + ROW_OFFSET_SIZE]);
                     let row: Row = (&buf[..]).try_into().map_err(|_| StorageError::Page {
                         action: PageAction::Read,
                         cause: PageErrorCause::DataWrangling,
                     })?;
+
                     trace!(
                         "loading internal cell: {}, left: {}, right: {}",
                         row.id()?,
                         row.left()?,
                         row.right()?
                     );
+                    offset += row.size()?;
                     offsets.push(row);
-                    pos += INTERNAL_ROW_SIZE;
                 }
             }
             PageKind::Leaf { rows } => {
-                for _ in 0..cells {
-                    let mut buf = [0; LEAF_ROW_SIZE];
+                let mut offset = 0;
+                while offset < cells {
+                    let mut buf = [0; ROW_BODY_SIZE];
+                    pos += offset;
 
-                    buf[..].clone_from_slice(&value[pos..pos + LEAF_ROW_SIZE]);
-                    let row: Row = (&buf[..]).try_into().map_err(|_| StorageError::Page {
+                    buf[..].clone_from_slice(&value[pos..pos + ROW_BODY_SIZE]);
+                    let mut row: Row = (&buf[..]).try_into().map_err(|_| StorageError::Page {
                         action: PageAction::Read,
                         cause: PageErrorCause::DataWrangling,
                     })?;
+
+                    let len = usize::from_ne_bytes(
+                        value[pos + ROW_VALUE..pos + ROW_VALUE + ROW_VALUE_SIZE]
+                            .try_into()
+                            .map_err(|_| StorageError::Page {
+                                action: PageAction::Read,
+                                cause: PageErrorCause::DataWrangling,
+                            })?,
+                    );
+                    trace!(
+                        "pos: {} offset: {} len: {} cells: {} row: {}",
+                        pos,
+                        offset,
+                        len,
+                        cells,
+                        row.id()?
+                    );
+                    let content = &value[pos + ROW_BODY_SIZE..pos + ROW_BODY_SIZE + len];
+                    row.set_value(content);
+
                     trace!("loading leaf cell: {}", row.id()?);
+                    offset += row.size()?;
                     rows.push(row);
-                    pos += LEAF_ROW_SIZE;
                 }
             }
         }
@@ -376,25 +414,23 @@ impl TryFrom<[u8; PAGE_SIZE]> for Page {
 
 #[cfg(test)]
 mod tests {
-    use crate::{
-        statement::{USERNAME_MAX_LENGTH, convert_to_char_array},
-        storage::row::Row,
-    };
+    use crate::storage::row::{Row, RowType, char_to_byte};
 
     use super::*;
 
     #[test]
     fn leaf_to_bytes() {
         let mut page = Page::new(0, 100, PageKind::Leaf { rows: vec![] }, 0, 0);
-        let mut row = Row::new();
+        let mut row = Row::new(RowType::Leaf);
         row.set_id(90);
+        let expected_cells = row.size().unwrap();
         page.insert(row.clone()).unwrap();
         let bytes: [u8; PAGE_SIZE] = page.into();
 
         let mut page: Page = bytes.try_into().unwrap();
         assert_eq!(page.offset, 0);
         assert_eq!(page.id, 100);
-        assert_eq!(page.cells, 1);
+        assert_eq!(page.cells, expected_cells);
         assert_eq!(page.parent, 0);
         assert!(matches!(page.kind, Some(PageKind::Leaf { .. })));
         assert_eq!(page.select().unwrap(), vec![row]);
@@ -403,15 +439,16 @@ mod tests {
     #[test]
     fn internal_to_bytes() {
         let mut page = Page::new(0, 100, PageKind::Internal { offsets: vec![] }, 0, 0);
-        let mut row = Row::new();
+        let mut row = Row::new(RowType::Internal);
         row.set_id(90);
+        let expected_cells = row.size().unwrap();
         page.insert(row.clone()).unwrap();
         let bytes: [u8; PAGE_SIZE] = page.into();
 
         let mut page: Page = bytes.try_into().unwrap();
         assert_eq!(page.offset, 0);
         assert_eq!(page.id, 100);
-        assert_eq!(page.cells, 1);
+        assert_eq!(page.cells, expected_cells);
         assert_eq!(page.parent, 0);
         assert!(matches!(page.kind, Some(PageKind::Internal { .. })));
         assert_eq!(page.select().unwrap(), vec![row]);
@@ -420,88 +457,71 @@ mod tests {
     #[test]
     fn leaf_insert_cell() {
         let mut page = Page::new(0, 0, PageKind::Leaf { rows: vec![] }, 0, 0);
-        let mut row = Row::new();
+        let mut row = Row::new(RowType::Leaf);
         row.set_id(90);
+        let expected = row.size().unwrap();
         page.insert(row).unwrap();
 
-        assert_eq!(page.cells, 1);
+        assert_eq!(page.cells, expected);
     }
 
     #[test]
     fn leaf_retrieve_cell() {
         let mut page = Page::new(0, 0, PageKind::Leaf { rows: vec![] }, 0, 0);
-        let mut row = Row::new();
-        let expected = vec!['t', 'e', 's', 't'];
+        let mut row = Row::new(RowType::Leaf);
+        let expected = char_to_byte(vec!['t', 'e', 's', 't'].as_ref());
         row.set_id(90);
-        row.set_username(
-            convert_to_char_array::<USERNAME_MAX_LENGTH>(expected.clone(), '\0')
-                .unwrap()
-                .as_ref(),
-        );
+        row.set_value(&expected);
         page.insert(row).unwrap();
 
-        row = Row::new();
+        row = Row::new(RowType::Leaf);
         row.set_id(90);
         let retrieved = page.retrieve(row).unwrap();
 
-        assert_eq!(
-            retrieved.username().unwrap().replace("\0", ""),
-            expected.iter().collect::<String>()
-        );
+        assert_eq!(retrieved.value().unwrap(), expected);
     }
 
     #[test]
     fn leaf_update_cell() {
         let mut page = Page::new(0, 0, PageKind::Leaf { rows: vec![] }, 0, 0);
-        let mut row = Row::new();
-        let initial = vec!['t', 'e', 's', 't'];
+        let mut row = Row::new(RowType::Leaf);
+        let initial = char_to_byte(vec!['t', 'e', 's', 't'].as_ref());
         row.set_id(90);
-        row.set_username(
-            convert_to_char_array::<USERNAME_MAX_LENGTH>(initial, '\0')
-                .unwrap()
-                .as_ref(),
-        );
+        row.set_value(&initial);
         page.insert(row).unwrap();
 
-        row = Row::new();
-        let expected = vec!['c', 'h', 'a', 'n', 'g', 'e', 'd'];
+        row = Row::new(RowType::Leaf);
+        let expected = char_to_byte(vec!['c', 'h', 'a', 'n', 'g', 'e', 'd'].as_ref());
         row.set_id(90);
-        row.set_username(
-            convert_to_char_array::<USERNAME_MAX_LENGTH>(expected.clone(), '\0')
-                .unwrap()
-                .as_ref(),
-        );
+        row.set_value(&expected);
+        let size = row.size().unwrap();
         page.update(row).unwrap();
 
-        row = Row::new();
+        row = Row::new(RowType::Leaf);
         row.set_id(90);
         let retrieved = page.retrieve(row).unwrap();
 
-        assert_eq!(
-            retrieved.username().unwrap().replace("\0", ""),
-            expected.iter().collect::<String>()
-        );
+        assert_eq!(retrieved.value().unwrap(), expected);
+        assert_eq!(page.cells, size);
     }
 
     #[test]
     fn leaf_delete_cell() {
         let mut page = Page::new(0, 0, PageKind::Leaf { rows: vec![] }, 0, 0);
-        let mut row = Row::new();
-        let initial = vec!['t', 'e', 's', 't'];
+        let mut row = Row::new(RowType::Leaf);
+        let initial = char_to_byte(vec!['t', 'e', 's', 't'].as_ref());
         row.set_id(90);
-        row.set_username(
-            convert_to_char_array::<USERNAME_MAX_LENGTH>(initial, '\0')
-                .unwrap()
-                .as_ref(),
-        );
+        row.set_value(&initial);
         page.insert(row).unwrap();
 
-        row = Row::new();
+        row = Row::new(RowType::Leaf);
         row.set_id(90);
+        row.set_type(RowType::Leaf);
         page.delete(row).unwrap();
 
-        row = Row::new();
+        row = Row::new(RowType::Leaf);
         row.set_id(90);
+        row.set_type(RowType::Leaf);
         let retrieved = page.retrieve(row);
         if let Err(StorageError::Page {
             cause: PageErrorCause::Missing,
@@ -516,17 +536,18 @@ mod tests {
     #[test]
     fn internal_insert_cell() {
         let mut page = Page::new(0, 0, PageKind::Internal { offsets: vec![] }, 0, 0);
-        let mut row = Row::new();
+        let mut row = Row::new(RowType::Internal);
         row.set_id(90);
+        let expected = row.size().unwrap();
         page.insert(row).unwrap();
 
-        assert_eq!(page.cells, 1);
+        assert_eq!(page.cells, expected);
     }
 
     #[test]
     fn leaf_select() {
         let mut page = Page::new(0, 0, PageKind::Leaf { rows: vec![] }, 0, 0);
-        let mut row = Row::new();
+        let mut row = Row::new(RowType::Leaf);
         row.set_id(90);
         page.insert(row.clone()).unwrap();
 
@@ -534,9 +555,9 @@ mod tests {
     }
 
     #[test]
-    fn internal() {
+    fn internal_select() {
         let mut page = Page::new(0, 0, PageKind::Leaf { rows: vec![] }, 0, 0);
-        let mut row = Row::new();
+        let mut row = Row::new(RowType::Internal);
         row.set_id(90);
         page.insert(row.clone()).unwrap();
 

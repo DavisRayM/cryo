@@ -13,20 +13,17 @@ use crate::storage::{
     Command,
     error::{PageAction, StorageAction, StorageErrorCause},
     header::page::{
-        CELLS_PER_LEAF, INTERNAL_SPLITAT, MAX_RECLAIM_KEYS, PAGE_SIZE, RECLAIM_COUNT_SIZE,
-        RECLAIM_OFFSET_SIZE,
+        MAX_RECLAIM_KEYS, PAGE_SIZE, RECLAIM_COUNT_SIZE, RECLAIM_OFFSET_SIZE, SPACE_FOR_CELLS,
     },
 };
-use crate::{Statement, storage::header::page::LEAF_SPLITAT};
+use crate::{Statement, statement::USERNAME_MAX_LENGTH};
 
 use super::{
     StorageBackend,
     error::{PageErrorCause, StorageError},
-    header::page::{
-        CELLS_PER_INTERNAL, RECLAIM_COUNT, STORAGE_HEADER, STORAGE_ROOT, STORAGE_ROOT_SIZE,
-    },
+    header::page::{RECLAIM_COUNT, STORAGE_HEADER, STORAGE_ROOT, STORAGE_ROOT_SIZE},
     page::{Page, PageKind},
-    row::Row,
+    row::{Row, RowType, byte_to_char, char_to_byte},
 };
 
 const PAGE_IN_MEMORY: usize = 10;
@@ -75,16 +72,18 @@ impl StorageBackend for BTreeStorage {
                         username,
                         email,
                     } => {
-                        let mut row = Row::new();
+                        let mut row = Row::new(RowType::Leaf);
                         row.set_id(id);
-                        row.set_email(email.as_ref());
-                        row.set_username(&username);
+                        let mut value = username.to_vec();
+                        value.extend_from_slice(email.as_ref());
+                        let value = char_to_byte(&value);
+                        row.set_value(&value);
 
                         self.insert(row)?;
                         None
                     }
                     Statement::Delete { id } => {
-                        let mut row = Row::new();
+                        let mut row = Row::new(RowType::Leaf);
                         row.set_id(id);
 
                         self.delete(row)?;
@@ -94,12 +93,23 @@ impl StorageBackend for BTreeStorage {
                         self.select()?
                             .iter()
                             .map(|r| {
-                                format!(
-                                    "{} {} {}",
-                                    r.id().unwrap(),
-                                    r.username().unwrap(),
-                                    r.email().unwrap()
+                                let value = r.value().unwrap();
+                                let username = byte_to_char(
+                                    &value[..USERNAME_MAX_LENGTH * 4],
+                                    Some("select row".into()),
                                 )
+                                .unwrap()
+                                .iter()
+                                .collect::<String>();
+                                let email = byte_to_char(
+                                    &value[USERNAME_MAX_LENGTH * 4..],
+                                    Some("select row".into()),
+                                )
+                                .unwrap()
+                                .iter()
+                                .collect::<String>();
+
+                                format!("{} {} {}", r.id().unwrap(), username, email)
                             })
                             .collect::<Vec<String>>()
                             .join("\n"),
@@ -109,17 +119,29 @@ impl StorageBackend for BTreeStorage {
                         username,
                         email,
                     } => {
-                        let mut row = Row::new();
+                        let mut row = Row::new(RowType::Leaf);
                         row.set_id(id);
-                        row.set_email(email.as_ref());
-                        row.set_username(&username);
+                        let mut value = username.to_vec();
+                        value.extend_from_slice(email.as_ref());
+                        let value = char_to_byte(&value);
+                        row.set_value(&value);
+
                         let r = self.update(row)?;
-                        Some(format!(
-                            "{} {} {}",
-                            r.id().unwrap(),
-                            r.username().unwrap(),
-                            r.email().unwrap()
-                        ))
+                        let value = r.value()?;
+                        let username = byte_to_char(
+                            &value[..USERNAME_MAX_LENGTH * 4],
+                            Some("select row".into()),
+                        )?
+                        .iter()
+                        .collect::<String>();
+                        let email = byte_to_char(
+                            &value[USERNAME_MAX_LENGTH * 4..],
+                            Some("select row".into()),
+                        )?
+                        .iter()
+                        .collect::<String>();
+
+                        Some(format!("{} {} {}", r.id()?, username, email))
                     }
                 }
             }
@@ -350,11 +372,11 @@ impl BTreeStorage {
 
                 let sibling_cells = self.page(sibling)?.borrow().cells;
                 debug!(
-                    "attempt merge: {} < {CELLS_PER_LEAF}?",
+                    "attempt merge: {} <= {SPACE_FOR_CELLS}?",
                     page.cells + sibling_cells
                 );
 
-                if page.cells + sibling_cells < CELLS_PER_LEAF {
+                if page.cells + sibling_cells <= SPACE_FOR_CELLS {
                     let sibling = match self.uncache(sibling)? {
                         Some(page) => page,
                         None => self.read_from_disk(sibling)?,
@@ -398,7 +420,7 @@ impl BTreeStorage {
 
         parent.delete(pointers[pointer_pos].clone())?;
         if pointer_pos > 0 {
-            let mut left_pointer = Row::new();
+            let mut left_pointer = Row::new(RowType::Internal);
             left_pointer.set_id(pointers[pointer_pos - 1].id()?);
             left_pointer.set_left(pointers[pointer_pos - 1].left()?);
             left_pointer.set_right(successor.offset);
@@ -411,7 +433,7 @@ impl BTreeStorage {
         }
 
         if pointer_pos + 1 < pointers.len() {
-            let mut right_pointer = Row::new();
+            let mut right_pointer = Row::new(RowType::Internal);
             right_pointer.set_id(pointers[pointer_pos + 1].id()?);
             right_pointer.set_right(pointers[pointer_pos + 1].right()?);
             right_pointer.set_left(successor.offset);
@@ -431,7 +453,7 @@ impl BTreeStorage {
                 successor.parent = successor.offset;
                 self.breadcrumbs.clear();
             } else if let Some((parent_offset, key)) = self.breadcrumbs.pop() {
-                let mut row = Row::new();
+                let mut row = Row::new(RowType::Internal);
                 let max_key = successor
                     .select()?
                     .iter()
@@ -495,7 +517,7 @@ impl BTreeStorage {
             };
 
             let other = self.page(other_offset)?;
-            if parent.cells + other.borrow().cells < CELLS_PER_INTERNAL {
+            if parent.cells + other.borrow().cells <= SPACE_FOR_CELLS {
                 debug!("parent requires merge; requesting merge of parent");
                 drop(other);
                 let other = self
@@ -657,14 +679,10 @@ impl BTreeStorage {
             Some(parent) => parent,
             None => self.read_from_disk(parent_offset)?,
         };
-        let mut pointer = Row::new();
+        let mut pointer = Row::new(RowType::Internal);
 
         let mut left_candidates = target.select()?;
-        let splitat = if target.leaf() {
-            LEAF_SPLITAT
-        } else {
-            INTERNAL_SPLITAT
-        };
+        let splitat = (left_candidates.len() / 2) - 1;
         let right_candidates = left_candidates.split_off(splitat);
         let left_cells = left_candidates.len();
         let right_cells = right_candidates.len();
@@ -934,8 +952,6 @@ impl BTreeStorage {
 
 #[cfg(test)]
 mod tests {
-    use crate::storage::header::page::{CELLS_PER_INTERNAL, CELLS_PER_LEAF};
-
     use super::*;
     use tempdir::TempDir;
 
@@ -970,13 +986,14 @@ mod tests {
         let path = dir.into_path();
         let mut storage = BTreeStorage::new(path.clone()).unwrap();
 
-        let row = Row::new();
+        let row = Row::new(RowType::Leaf);
+        let expected = row.size().unwrap();
         storage.insert(row).unwrap();
         storage.close().unwrap();
 
         let mut storage = BTreeStorage::new(path.clone()).unwrap();
         let page = storage.page(storage.root).unwrap().borrow_mut().clone();
-        assert_eq!(1, page.cells);
+        assert_eq!(expected, page.cells);
     }
 
     #[test]
@@ -984,7 +1001,7 @@ mod tests {
         let dir = TempDir::new("InsertLeaf").unwrap();
         let path = dir.into_path();
         let mut storage = BTreeStorage::new(path.clone()).unwrap();
-        let cells = (CELLS_PER_LEAF * 2) + 1;
+        let cells = 100;
 
         storage.query(Command::Populate(cells)).unwrap();
 
@@ -998,12 +1015,11 @@ mod tests {
         let dir = TempDir::new("InsertLeaf").unwrap();
         let path = dir.into_path();
         let mut storage = BTreeStorage::new(path.clone()).unwrap();
-        let cells = (CELLS_PER_INTERNAL * 2) + 3;
+        let cells = 200;
 
         storage.query(Command::Populate(cells)).unwrap();
 
         let rows = storage.select().unwrap();
-        eprintln!("{}", storage.structure().unwrap());
         assert_eq!(rows.len(), cells);
     }
 
