@@ -7,18 +7,24 @@ use std::{
     rc::Rc,
 };
 
-use log::{debug, info, trace};
+use log::{debug, info, trace, warn};
 
 use crate::storage::{
     Command,
     error::{PageAction, StorageAction, StorageErrorCause},
-    header::page::{INTERNAL_SPLITAT, PAGE_SIZE},
+    header::page::{
+        CELLS_PER_LEAF, INTERNAL_SPLITAT, MAX_RECLAIM_KEYS, PAGE_SIZE, RECLAIM_COUNT_SIZE,
+        RECLAIM_OFFSET_SIZE,
+    },
 };
 use crate::{Statement, storage::header::page::LEAF_SPLITAT};
 
 use super::{
     StorageBackend,
     error::{PageErrorCause, StorageError},
+    header::page::{
+        CELLS_PER_INTERNAL, RECLAIM_COUNT, STORAGE_HEADER, STORAGE_ROOT, STORAGE_ROOT_SIZE,
+    },
     page::{Page, PageKind},
     row::Row,
 };
@@ -35,6 +41,8 @@ pub struct BTreeStorage {
     pub root: usize,
     reader: BufReader<File>,
     writer: BufWriter<File>,
+    breadcrumbs: Vec<(usize, usize)>,
+    reclaim: Vec<usize>,
 }
 
 impl StorageBackend for BTreeStorage {
@@ -73,6 +81,13 @@ impl StorageBackend for BTreeStorage {
                         row.set_username(&username);
 
                         self.insert(row)?;
+                        None
+                    }
+                    Statement::Delete { id } => {
+                        let mut row = Row::new();
+                        row.set_id(id);
+
+                        self.delete(row)?;
                         None
                     }
                     Statement::Select => Some(
@@ -133,32 +148,69 @@ impl BTreeStorage {
         let reader = BufReader::new(f.try_clone()?);
 
         let mut storage = Self {
+            breadcrumbs: Vec::new(),
             cached: VecDeque::with_capacity(PAGE_IN_MEMORY),
             current: root,
             pages,
             reader,
+            reclaim: Vec::new(),
             root,
             writer,
         };
 
         if pages == 0 {
             trace!("no pages detected; creating starting leaf node.");
-            storage.create(PageKind::Leaf { rows: vec![] }, 0, 0)?;
+            storage.write_header()?;
+            storage.root = storage.create(PageKind::Leaf { rows: vec![] }, 0, 0)?;
+            storage.page(storage.root)?.borrow_mut().parent = storage.root;
+            storage.write_header()?;
         } else {
-            trace!("locating root node");
-            let page = storage.page(0)?;
-            let mut pos = page.borrow().offset;
-            let mut parent = page.borrow().parent;
-
-            while pos != parent {
-                trace!("traversing {} to parent {}", pos, parent);
-                pos = parent;
-                parent = storage.page(parent)?.borrow().parent;
-            }
-            storage.root = parent;
-            trace!("root located at: {pos}");
+            storage.read_header()?;
         }
         Ok(storage)
+    }
+
+    pub(crate) fn read_header(&mut self) -> Result<(), StorageError> {
+        self.reader.seek(SeekFrom::Start(0))?;
+
+        let mut buf = [0; STORAGE_ROOT_SIZE];
+        self.reader.read_exact(&mut buf)?;
+        self.root = usize::from_ne_bytes(buf);
+
+        let mut buf = [0; RECLAIM_COUNT_SIZE];
+        self.reader.read_exact(&mut buf)?;
+        let reclaim_keys = usize::from_ne_bytes(buf);
+
+        debug!("reclaim keys len: {}", reclaim_keys);
+        self.reclaim = Vec::new();
+
+        for _ in 0..reclaim_keys {
+            let mut buf = [0; RECLAIM_OFFSET_SIZE];
+            self.reader.read_exact(&mut buf)?;
+            let offset = usize::from_ne_bytes(buf);
+            self.reclaim.push(offset);
+        }
+        debug!("reclaim keys: {:?}", self.reclaim);
+        Ok(())
+    }
+
+    pub(crate) fn write_header(&mut self) -> Result<(), StorageError> {
+        let mut buf = [0; PAGE_SIZE];
+
+        buf[STORAGE_ROOT..RECLAIM_COUNT].clone_from_slice(self.root.to_ne_bytes().as_ref());
+        buf[RECLAIM_COUNT..STORAGE_HEADER]
+            .clone_from_slice(self.reclaim.len().to_ne_bytes().as_ref());
+        let mut offset = STORAGE_HEADER;
+
+        for key in self.reclaim.iter() {
+            buf[offset..offset + RECLAIM_OFFSET_SIZE].clone_from_slice(key.to_ne_bytes().as_ref());
+            offset += STORAGE_HEADER;
+        }
+
+        self.writer.seek(SeekFrom::Start(0))?;
+        self.writer.write_all(&buf)?;
+        self.writer.flush()?;
+        Ok(())
     }
 
     /// Walks the BTree and prints all the nodes
@@ -177,8 +229,7 @@ impl BTreeStorage {
     ) -> Result<String, StorageError> {
         let mut out = String::default();
         let page = self.page(self.current)?;
-        let id = page.borrow().id;
-        let parent = self.page(page.borrow().parent)?.borrow().id;
+        let id = page.borrow().offset;
 
         if visited.contains(&id) {
             return Ok(out);
@@ -186,16 +237,21 @@ impl BTreeStorage {
         visited.push(id);
 
         if !page.borrow().leaf() {
-            out += format!("  I{parent} -> I{id}\n").as_str();
             let node = page.borrow_mut().select()?;
             for pointer in node {
+                out += format!("  {id} -> {};\n", pointer.id()?).as_str();
+
                 self.current = pointer.left()?;
+                out += format!("  {} -> {}[color=green];\n", pointer.id()?, self.current).as_str();
                 out += self.walk_tree(width + 2, visited)?.as_ref();
+
                 self.current = pointer.right()?;
+                out += format!("  {} -> {}[color=blue];\n", pointer.id()?, self.current).as_str();
                 out += self.walk_tree(width + 2, visited)?.as_ref();
             }
         } else if self.pages <= LEAF_PRINT_CUTOFF {
-            out += format!("  I{parent} -> L{id};\n").as_str();
+            let parent = self.page(page.borrow().parent)?.borrow().offset;
+            out += format!("  {} -> {}[color=red]", id, parent).as_str();
         }
 
         Ok(out)
@@ -204,6 +260,8 @@ impl BTreeStorage {
     /// Flushes pager cache to disk
     pub fn close(&mut self) -> Result<(), StorageError> {
         debug!("closing database; emptying cache");
+        self.write_header()?;
+
         while !self.cached.is_empty() {
             self.free()?;
         }
@@ -214,89 +272,6 @@ impl BTreeStorage {
     /// Inserts a new Row into the BTree storage
     pub(crate) fn insert(&mut self, row: Row) -> Result<(), StorageError> {
         self.current = self.root;
-        self.insert_row(row)
-    }
-
-    /// Selects all leaf cells
-    pub(crate) fn select(&mut self) -> Result<Vec<Row>, StorageError> {
-        self.current = self.root;
-        let mut visited = Vec::new();
-        self.select_traverse(&mut visited)
-    }
-
-    /// Prints out the current structure of the BTree
-    pub(crate) fn structure(&mut self) -> Result<String, StorageError> {
-        self.current = self.root;
-        self.walk(None)
-    }
-
-    /// Creates a new page and returns the offset to the page
-    fn create(
-        &mut self,
-        kind: PageKind,
-        cells: usize,
-        parent: usize,
-    ) -> Result<usize, StorageError> {
-        let offset = self.pages * PAGE_SIZE;
-        debug!(
-            "creating page\noffset: {}\ncells: {}\nparent: {}",
-            offset, cells, parent
-        );
-
-        let page = Page::new(offset, self.pages, kind, cells, parent);
-        self.write_to_disk(page)?;
-        self.pages += 1;
-        Ok(offset)
-    }
-
-    /// Recursively traverses and selects all leaf cells in the entire tree
-    fn select_traverse(&mut self, visited: &mut Vec<usize>) -> Result<Vec<Row>, StorageError> {
-        let page = self.page(self.current)?;
-        let mut out = Vec::new();
-
-        if visited.contains(&page.borrow().id) {
-            return Ok(out);
-        }
-        visited.push(page.borrow().id);
-
-        if page.borrow().leaf() {
-            return page.borrow_mut().select();
-        }
-
-        let pointers = page.borrow_mut().select()?;
-        for pointer in pointers {
-            self.current = pointer.left()?;
-            out.extend_from_slice(self.select_traverse(visited)?.as_slice());
-            self.current = pointer.right()?;
-            out.extend_from_slice(self.select_traverse(visited)?.as_slice());
-        }
-
-        Ok(out)
-    }
-
-    fn update(&mut self, row: Row) -> Result<Row, StorageError> {
-        loop {
-            let page = self.page(self.current)?;
-            debug!("attempt to update record at {}", self.current);
-            if !page.borrow().leaf() {
-                debug!("page {} is internal, searching for leaf", page.borrow().id);
-                self.search_internal(&row)?;
-                continue;
-            }
-
-            drop(page);
-            let mut page = match self.uncache(self.current)? {
-                Some(page) => page,
-                None => self.read_from_disk(self.current)?,
-            };
-            debug!("page {} is a leaf; updating value", page.id);
-            trace!("record: {} {}", row.id()?, row.offset()?);
-            break page.update(row);
-        }
-    }
-
-    /// Inserts a new row into storage
-    fn insert_row(&mut self, row: Row) -> Result<(), StorageError> {
         loop {
             let page = self.page(self.current)?;
             debug!("attempt to insert record at {}", self.current);
@@ -335,6 +310,289 @@ impl BTreeStorage {
                 }
             };
         }
+    }
+
+    pub(crate) fn delete(&mut self, row: Row) -> Result<(), StorageError> {
+        self.current = self.root;
+        loop {
+            let page = self.page(self.current)?;
+            debug!("attempt to delete record at {}", self.current);
+            if !page.borrow().leaf() {
+                debug!("page {} is internal, searching for leaf", page.borrow().id);
+                self.search_internal(&row)?;
+                continue;
+            }
+
+            drop(page);
+            let mut page = match self.uncache(self.current)? {
+                Some(page) => page,
+                None => self.read_from_disk(self.current)?,
+            };
+            debug!("page {} is a leaf; deleting value", page.id);
+            trace!("record: {} {}", row.id()?, row.offset()?);
+            page.delete(row)?;
+
+            if self.root == page.offset {
+                trace!("page is root; deleting entry");
+                break self.write_to_disk(page);
+            }
+
+            // Merge nodes
+            break if let Some((parent, key)) = self.breadcrumbs.pop() {
+                trace!("checking {parent} pointer {key} for opportunity to merge");
+                let pointers = self.page(parent)?.borrow_mut().select()?;
+                let sibling = if pointers[key].right()? == page.offset {
+                    pointers[key].left()?
+                } else {
+                    pointers[key].right()?
+                };
+                trace!("sibling pointer: {sibling}");
+
+                let sibling_cells = self.page(sibling)?.borrow().cells;
+                debug!(
+                    "attempt merge: {} < {CELLS_PER_LEAF}?",
+                    page.cells + sibling_cells
+                );
+
+                if page.cells + sibling_cells < CELLS_PER_LEAF {
+                    let sibling = match self.uncache(sibling)? {
+                        Some(page) => page,
+                        None => self.read_from_disk(sibling)?,
+                    };
+                    self.merge(page, sibling, key)
+                } else {
+                    self.write_to_disk(page)
+                }
+            } else {
+                Err(StorageError::Storage {
+                    action: StorageAction::Delete,
+                    cause: StorageErrorCause::Unknown,
+                })
+            };
+        }
+    }
+
+    fn merge(&mut self, target: Page, other: Page, pointer_pos: usize) -> Result<(), StorageError> {
+        debug!("merging {} & {}", target.offset, other.offset);
+        let mut parent = match self.uncache(target.parent)? {
+            Some(page) => page,
+            None => self.read_from_disk(target.parent)?,
+        };
+        let pointers = parent.select()?;
+
+        let (mut successor, mut ancestor) = if pointers[pointer_pos].left()? == target.offset {
+            (target, other)
+        } else {
+            (other, target)
+        };
+        trace!(
+            "merge successor {} <- {}",
+            successor.offset, ancestor.offset
+        );
+
+        let mut rows = ancestor.select()?;
+        while let Some(row) = rows.pop() {
+            successor.insert(row.clone())?;
+            ancestor.delete(row)?;
+        }
+
+        parent.delete(pointers[pointer_pos].clone())?;
+        if pointer_pos > 0 {
+            let mut left_pointer = Row::new();
+            left_pointer.set_id(pointers[pointer_pos - 1].id()?);
+            left_pointer.set_left(pointers[pointer_pos - 1].left()?);
+            left_pointer.set_right(successor.offset);
+            debug!(
+                "updating left pointer {} to {}",
+                left_pointer.id()?,
+                left_pointer.right()?
+            );
+            parent.update(left_pointer)?;
+        }
+
+        if pointer_pos + 1 < pointers.len() {
+            let mut right_pointer = Row::new();
+            right_pointer.set_id(pointers[pointer_pos + 1].id()?);
+            right_pointer.set_right(pointers[pointer_pos + 1].right()?);
+            right_pointer.set_left(successor.offset);
+            debug!(
+                "updating right pointer {} to {}",
+                right_pointer.id()?,
+                right_pointer.right()?
+            );
+            parent.update(right_pointer)?;
+        }
+
+        let pointers = parent.select()?;
+        if pointers.is_empty() {
+            if parent.offset == self.root {
+                debug!("parent is root and empty; child succeeding as parent");
+                self.root = successor.offset;
+                successor.parent = successor.offset;
+                self.breadcrumbs.clear();
+            } else if let Some((parent_offset, key)) = self.breadcrumbs.pop() {
+                let mut row = Row::new();
+                let max_key = successor
+                    .select()?
+                    .iter()
+                    .max()
+                    .ok_or(StorageError::Storage {
+                        action: StorageAction::Delete,
+                        cause: StorageErrorCause::Unknown,
+                    })?
+                    .id()?
+                    + 1;
+                row.set_id(max_key);
+                row.set_left(successor.offset);
+                row.set_right(ancestor.offset);
+
+                parent.insert(row)?;
+                debug!(
+                    "triger merge for parent {} on {parent_offset} key {key}",
+                    parent.offset
+                );
+
+                self.write_to_disk(successor)?;
+                self.write_to_disk(ancestor)?;
+
+                let target = parent;
+                let pointers = self.page(parent_offset)?.borrow_mut().select()?;
+                let other = if pointers[key].left()? == target.offset {
+                    pointers[key].right()?
+                } else {
+                    pointers[key].left()?
+                };
+                let other = self.uncache(other)?.unwrap_or(self.read_from_disk(other)?);
+                return self.merge(target, other, key);
+            }
+        }
+
+        self.write_to_disk(parent)?;
+        self.write_to_disk(successor)?;
+        self.reclaim.push(ancestor.offset);
+        if self.reclaim.len() >= MAX_RECLAIM_KEYS {
+            // TODO: Add storage defragmentation
+            warn!("too many pages to reclaim... storage defragmentation necessary");
+        }
+        self.write_to_disk(ancestor)?;
+
+        if let Some((parent_offset, key)) = self.breadcrumbs.pop() {
+            debug!("checking if parent requires merge");
+            let mut parent = self
+                .uncache(parent_offset)?
+                .unwrap_or(self.read_from_disk(parent_offset)?);
+            let pointers = parent.select()?;
+
+            if parent.offset == self.root {
+                debug!("parent is root; merge complete");
+                return Ok(());
+            }
+
+            let other_offset = if pointers[key].left()? == parent.offset {
+                pointers[key].right()?
+            } else {
+                pointers[key].left()?
+            };
+
+            let other = self.page(other_offset)?;
+            if parent.cells + other.borrow().cells < CELLS_PER_INTERNAL {
+                debug!("parent requires merge; requesting merge of parent");
+                drop(other);
+                let other = self
+                    .uncache(other_offset)?
+                    .unwrap_or(self.read_from_disk(other_offset)?);
+                return self.merge(parent, other, key);
+            }
+        }
+
+        Ok(())
+    }
+
+    pub(crate) fn update(&mut self, row: Row) -> Result<Row, StorageError> {
+        self.current = self.root;
+        loop {
+            let page = self.page(self.current)?;
+            debug!("attempt to update record at {}", self.current);
+            if !page.borrow().leaf() {
+                debug!("page {} is internal, searching for leaf", page.borrow().id);
+                self.search_internal(&row)?;
+                continue;
+            }
+
+            drop(page);
+            let mut page = match self.uncache(self.current)? {
+                Some(page) => page,
+                None => self.read_from_disk(self.current)?,
+            };
+            debug!("page {} is a leaf; updating value", page.id);
+            trace!("record: {} {}", row.id()?, row.offset()?);
+            let out = page.update(row);
+            self.write_to_disk(page)?;
+            break out;
+        }
+    }
+
+    /// Selects all leaf cells
+    pub(crate) fn select(&mut self) -> Result<Vec<Row>, StorageError> {
+        self.current = self.root;
+        let mut visited = Vec::new();
+        self.select_traverse(&mut visited)
+    }
+
+    /// Prints out the current structure of the BTree
+    pub(crate) fn structure(&mut self) -> Result<String, StorageError> {
+        self.current = self.root;
+        self.walk(None)
+    }
+
+    /// Creates a new page and returns the offset to the page
+    fn create(
+        &mut self,
+        kind: PageKind,
+        cells: usize,
+        parent: usize,
+    ) -> Result<usize, StorageError> {
+        let offset = (self.pages * PAGE_SIZE) + PAGE_SIZE;
+        debug!(
+            "creating page\noffset: {}\ncells: {}\nparent: {}",
+            offset, cells, parent
+        );
+
+        let offset = if let Some(reclaim_offset) = self.reclaim.pop() {
+            reclaim_offset
+        } else {
+            offset
+        };
+        let page = Page::new(offset, self.pages, kind, cells, parent);
+
+        self.write_to_disk(page)?;
+        self.pages += 1;
+        Ok(offset)
+    }
+
+    /// Recursively traverses and selects all leaf cells in the entire tree
+    fn select_traverse(&mut self, visited: &mut Vec<usize>) -> Result<Vec<Row>, StorageError> {
+        let page = self.page(self.current)?;
+        let mut out = Vec::new();
+
+        if visited.contains(&page.borrow().id) {
+            return Ok(out);
+        }
+        visited.push(page.borrow().id);
+
+        if page.borrow().leaf() {
+            return page.borrow_mut().select();
+        }
+
+        let pointers = page.borrow_mut().select()?;
+        for pointer in pointers {
+            self.current = pointer.left()?;
+            out.extend_from_slice(self.select_traverse(visited)?.as_slice());
+            self.current = pointer.right()?;
+            out.extend_from_slice(self.select_traverse(visited)?.as_slice());
+        }
+
+        Ok(out)
     }
 
     /// Splits node to accommodate the new row.
@@ -503,11 +761,16 @@ impl BTreeStorage {
         trace!("candidates: {:?}", pointers);
 
         let pos = match pointers.binary_search(row) {
-            Ok(pos) => pointers[pos].right()?,
+            Ok(pos) => {
+                self.breadcrumbs.push((self.current, pos));
+                pointers[pos].right()?
+            }
             Err(pos) => {
                 let pointer = if pos == pointers.len() {
+                    self.breadcrumbs.push((self.current, pos - 1));
                     &pointers[pos - 1]
                 } else {
+                    self.breadcrumbs.push((self.current, pos));
                     &pointers[pos]
                 };
                 trace!("candidate {} row {}", pointer.id()?, row.id()?);
@@ -533,10 +796,10 @@ impl BTreeStorage {
     /// - If IO error occurs
     /// - If failed to load page from disk
     fn page(&mut self, offset: usize) -> Result<Rc<RefCell<Page>>, StorageError> {
-        if offset >= self.pages * PAGE_SIZE {
+        if offset >= (self.pages * PAGE_SIZE) + PAGE_SIZE {
             debug!(
                 "offset {offset} is out of bounds; current pages {1} maximum {0}",
-                self.pages * PAGE_SIZE,
+                (self.pages * PAGE_SIZE) + PAGE_SIZE,
                 self.pages
             );
             return Err(StorageError::Storage {
@@ -684,7 +947,7 @@ mod tests {
         let page = storage.page(0).unwrap();
         let page = page.borrow();
         assert_eq!(page.offset, 0);
-        assert_eq!(page.id, 0);
+        assert_eq!(page.id, 4096);
     }
 
     #[test]
@@ -698,7 +961,7 @@ mod tests {
         let page = storage.page(0).unwrap();
         let page = page.borrow();
         assert_eq!(page.offset, 0);
-        assert_eq!(page.id, 0);
+        assert_eq!(page.id, 4096);
     }
 
     #[test]
@@ -766,8 +1029,21 @@ mod tests {
 
         assert_eq!(
             storage.query(cmd).unwrap(),
-            Some("digraph {\n  I0 -> L0;\n}".into())
+            Some("digraph {\n  4096 -> 4096[color=red]}".into())
         );
+    }
+
+    #[test]
+    fn storage_header() {
+        let dir = TempDir::new("InsertInternalMulti").unwrap();
+        let path = dir.into_path();
+        let mut storage = BTreeStorage::new(path.clone()).unwrap();
+
+        storage.root = 99999;
+        storage.close().unwrap();
+
+        let storage = BTreeStorage::new(path.clone()).unwrap();
+        assert_eq!(storage.root, 99999);
     }
 
     #[test]
@@ -792,12 +1068,45 @@ mod tests {
         storage.query(cmd).unwrap();
 
         assert_eq!(
-            "1 dave dave",
+            "1 sam sam",
             storage
                 .query(Command::Statement("select".into()))
                 .unwrap()
                 .unwrap()
                 .replace("\0", "")
+        )
+    }
+
+    #[test]
+    fn storage_delete_multi() {
+        let dir = TempDir::new("StorageDeleteMulti").unwrap();
+        let path = dir.into_path();
+        let mut storage = BTreeStorage::new(path).unwrap();
+        let cmd = Command::Populate(100);
+        storage.query(cmd).unwrap();
+
+        for i in 1..=100 {
+            let cmd = Command::Statement(format!("delete {}", i));
+            storage.query(cmd).unwrap();
+
+            assert_eq!(100 - i, storage.select().unwrap().len())
+        }
+    }
+
+    #[test]
+    fn storage_delete() {
+        let dir = TempDir::new("StorageDelete").unwrap();
+        let path = dir.into_path();
+        let mut storage = BTreeStorage::new(path).unwrap();
+        let cmd = Command::Statement("insert 1 dave dave".into());
+        storage.query(cmd).unwrap();
+
+        let cmd = Command::Statement("delete 1".into());
+        storage.query(cmd).unwrap();
+
+        assert_eq!(
+            Some("".into()),
+            storage.query(Command::Statement("select".into())).unwrap()
         )
     }
 }

@@ -51,6 +51,15 @@ pub mod header {
 
         pub(crate) const LEAF_SPLITAT: usize = (CELLS_PER_LEAF / 2) + 1;
         pub(crate) const INTERNAL_SPLITAT: usize = CELLS_PER_INTERNAL / 2;
+
+        pub(crate) const STORAGE_ROOT_SIZE: usize = size_of::<usize>();
+        pub(crate) const RECLAIM_COUNT_SIZE: usize = size_of::<usize>();
+        pub(crate) const RECLAIM_OFFSET_SIZE: usize = size_of::<usize>();
+        pub(crate) const STORAGE_HEADER: usize = STORAGE_ROOT_SIZE + RECLAIM_OFFSET_SIZE;
+
+        pub(crate) const STORAGE_ROOT: usize = 0;
+        pub(crate) const RECLAIM_COUNT: usize = STORAGE_ROOT + STORAGE_ROOT_SIZE;
+        pub(crate) const MAX_RECLAIM_KEYS: usize = PAGE_SIZE / RECLAIM_OFFSET_SIZE;
     }
 }
 
@@ -73,6 +82,8 @@ pub mod error {
         Update,
         #[error("PageRetrieve")]
         Retrieve,
+        #[error("PageDelete")]
+        Delete,
     }
 
     #[derive(Debug, Error)]
@@ -107,6 +118,8 @@ pub mod error {
         Query,
         #[error("Search")]
         Search,
+        #[error("Delete")]
+        Delete,
     }
 
     #[derive(Debug, Error)]
