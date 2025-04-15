@@ -12,14 +12,18 @@ use log::{debug, info, trace};
 use crate::storage::{
     Command,
     error::{PageAction, StorageAction, StorageErrorCause},
-    header::page::{CELLS_PER_LEAF, INTERNAL_SPLITAT, PAGE_SIZE},
+    header::page::{
+        CELLS_PER_LEAF, INTERNAL_SPLITAT, PAGE_SIZE, RECLAIM_COUNT_SIZE, RECLAIM_OFFSET_SIZE,
+    },
 };
 use crate::{Statement, storage::header::page::LEAF_SPLITAT};
 
 use super::{
     StorageBackend,
     error::{PageErrorCause, StorageError},
-    header::page::CELLS_PER_INTERNAL,
+    header::page::{
+        CELLS_PER_INTERNAL, RECLAIM_COUNT, STORAGE_HEADER, STORAGE_ROOT, STORAGE_ROOT_SIZE,
+    },
     page::{Page, PageKind},
     row::Row,
 };
@@ -37,6 +41,7 @@ pub struct BTreeStorage {
     reader: BufReader<File>,
     writer: BufWriter<File>,
     breadcrumbs: Vec<(usize, usize)>,
+    reclaim: Vec<usize>,
 }
 
 impl StorageBackend for BTreeStorage {
@@ -147,28 +152,62 @@ impl BTreeStorage {
             current: root,
             pages,
             reader,
+            reclaim: Vec::new(),
             root,
             writer,
         };
 
         if pages == 0 {
             trace!("no pages detected; creating starting leaf node.");
-            storage.create(PageKind::Leaf { rows: vec![] }, 0, 0)?;
+            storage.write_header()?;
+            storage.root = storage.create(PageKind::Leaf { rows: vec![] }, 0, 0)?;
+            storage.write_header()?;
         } else {
-            trace!("locating root node");
-            let page = storage.page(0)?;
-            let mut pos = page.borrow().offset;
-            let mut parent = page.borrow().parent;
-
-            while pos != parent {
-                trace!("traversing {} to parent {}", pos, parent);
-                pos = parent;
-                parent = storage.page(parent)?.borrow().parent;
-            }
-            storage.root = parent;
-            trace!("root located at: {pos}");
+            storage.read_header()?;
         }
         Ok(storage)
+    }
+
+    pub(crate) fn read_header(&mut self) -> Result<(), StorageError> {
+        self.reader.seek(SeekFrom::Start(0))?;
+
+        let mut buf = [0; STORAGE_ROOT_SIZE];
+        self.reader.read_exact(&mut buf)?;
+        self.root = usize::from_ne_bytes(buf);
+
+        let mut buf = [0; RECLAIM_COUNT_SIZE];
+        self.reader.read_exact(&mut buf)?;
+        let reclaim_keys = usize::from_ne_bytes(buf);
+
+        eprintln!("keys: {}", reclaim_keys);
+        self.reclaim = Vec::new();
+
+        for _ in 0..reclaim_keys {
+            let mut buf = [0; RECLAIM_OFFSET_SIZE];
+            self.reader.read_exact(&mut buf)?;
+            let offset = usize::from_be_bytes(buf);
+            self.reclaim.push(offset);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn write_header(&mut self) -> Result<(), StorageError> {
+        let mut buf = [0; PAGE_SIZE];
+
+        buf[STORAGE_ROOT..RECLAIM_COUNT].clone_from_slice(self.root.to_ne_bytes().as_ref());
+        buf[RECLAIM_COUNT..STORAGE_HEADER]
+            .clone_from_slice(self.reclaim.len().to_ne_bytes().as_ref());
+        let mut offset = STORAGE_HEADER;
+
+        for key in self.reclaim.iter() {
+            buf[offset..offset + RECLAIM_OFFSET_SIZE].clone_from_slice(key.to_ne_bytes().as_ref());
+            offset += STORAGE_HEADER;
+        }
+
+        self.writer.seek(SeekFrom::Start(0))?;
+        self.writer.write_all(&buf)?;
+        self.writer.flush()?;
+        Ok(())
     }
 
     /// Walks the BTree and prints all the nodes
@@ -218,6 +257,8 @@ impl BTreeStorage {
     /// Flushes pager cache to disk
     pub fn close(&mut self) -> Result<(), StorageError> {
         debug!("closing database; emptying cache");
+        self.write_header()?;
+
         while !self.cached.is_empty() {
             self.free()?;
         }
@@ -503,7 +544,7 @@ impl BTreeStorage {
         cells: usize,
         parent: usize,
     ) -> Result<usize, StorageError> {
-        let offset = self.pages * PAGE_SIZE;
+        let offset = (self.pages * PAGE_SIZE) + PAGE_SIZE;
         debug!(
             "creating page\noffset: {}\ncells: {}\nparent: {}",
             offset, cells, parent
@@ -741,10 +782,10 @@ impl BTreeStorage {
     /// - If IO error occurs
     /// - If failed to load page from disk
     fn page(&mut self, offset: usize) -> Result<Rc<RefCell<Page>>, StorageError> {
-        if offset >= self.pages * PAGE_SIZE {
+        if offset >= (self.pages * PAGE_SIZE) + PAGE_SIZE {
             debug!(
                 "offset {offset} is out of bounds; current pages {1} maximum {0}",
-                self.pages * PAGE_SIZE,
+                (self.pages * PAGE_SIZE) + PAGE_SIZE,
                 self.pages
             );
             return Err(StorageError::Storage {
@@ -892,7 +933,7 @@ mod tests {
         let page = storage.page(0).unwrap();
         let page = page.borrow();
         assert_eq!(page.offset, 0);
-        assert_eq!(page.id, 0);
+        assert_eq!(page.id, 4096);
     }
 
     #[test]
@@ -906,7 +947,7 @@ mod tests {
         let page = storage.page(0).unwrap();
         let page = page.borrow();
         assert_eq!(page.offset, 0);
-        assert_eq!(page.id, 0);
+        assert_eq!(page.id, 4096);
     }
 
     #[test]
@@ -972,7 +1013,23 @@ mod tests {
         let mut storage = BTreeStorage::new(path.clone()).unwrap();
         let cmd = Command::Structure;
 
-        assert_eq!(storage.query(cmd).unwrap(), Some("digraph {\n}".into()));
+        assert_eq!(
+            storage.query(cmd).unwrap(),
+            Some("digraph {\n  4096 -> 4096[color=red]}".into())
+        );
+    }
+
+    #[test]
+    fn storage_header() {
+        let dir = TempDir::new("InsertInternalMulti").unwrap();
+        let path = dir.into_path();
+        let mut storage = BTreeStorage::new(path.clone()).unwrap();
+
+        storage.root = 99999;
+        storage.close().unwrap();
+
+        let storage = BTreeStorage::new(path.clone()).unwrap();
+        assert_eq!(storage.root, 99999);
     }
 
     #[test]
