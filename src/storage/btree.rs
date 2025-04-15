@@ -7,13 +7,14 @@ use std::{
     rc::Rc,
 };
 
-use log::{debug, info, trace};
+use log::{debug, info, trace, warn};
 
 use crate::storage::{
     Command,
     error::{PageAction, StorageAction, StorageErrorCause},
     header::page::{
-        CELLS_PER_LEAF, INTERNAL_SPLITAT, PAGE_SIZE, RECLAIM_COUNT_SIZE, RECLAIM_OFFSET_SIZE,
+        CELLS_PER_LEAF, INTERNAL_SPLITAT, MAX_RECLAIM_KEYS, PAGE_SIZE, RECLAIM_COUNT_SIZE,
+        RECLAIM_OFFSET_SIZE,
     },
 };
 use crate::{Statement, storage::header::page::LEAF_SPLITAT};
@@ -467,6 +468,10 @@ impl BTreeStorage {
         self.write_to_disk(parent)?;
         self.write_to_disk(successor)?;
         self.reclaim.push(ancestor.offset);
+        if self.reclaim.len() >= MAX_RECLAIM_KEYS {
+            // TODO: Add storage defragmentation
+            warn!("too many pages to reclaim... storage defragmentation necessary");
+        }
         self.write_to_disk(ancestor)?;
 
         if let Some((parent_offset, key)) = self.breadcrumbs.pop() {
