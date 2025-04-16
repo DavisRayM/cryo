@@ -1,5 +1,6 @@
 pub mod command;
 pub mod statement;
+pub mod storage;
 
 pub use command::Command;
 pub use statement::Statement;
