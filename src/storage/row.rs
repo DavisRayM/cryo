@@ -38,6 +38,8 @@
 
 use crate::utilities::{EMAIL_MAX_LENGTH, USERNAME_MAX_LENGTH};
 
+use super::StorageError;
+
 pub const ROW_ID_SIZE: usize = size_of::<usize>();
 pub const ROW_TYPE_SIZE: usize = size_of::<u8>();
 pub const ROW_OFFSET_SIZE: usize = size_of::<usize>();
@@ -224,6 +226,26 @@ impl Row {
     }
 }
 
+impl PartialEq for Row {
+    fn eq(&self, other: &Self) -> bool {
+        self._type == other._type && self.id().eq(&other.id())
+    }
+}
+
+impl Eq for Row {}
+
+impl PartialOrd for Row {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for Row {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.id().cmp(&other.id())
+    }
+}
+
 impl From<u8> for RowType {
     fn from(value: u8) -> Self {
         match value {
@@ -240,6 +262,51 @@ impl From<RowType> for u8 {
             RowType::Leaf => 0x1,
             RowType::Internal => 0x0,
         }
+    }
+}
+
+impl TryFrom<&[u8]> for Row {
+    type Error = StorageError;
+
+    fn try_from(value: &[u8]) -> Result<Self, Self::Error> {
+        let id = usize::from_ne_bytes(
+            value[ROW_ID..ROW_ID + ROW_ID_SIZE]
+                .try_into()
+                .expect("should be expected size"),
+        );
+        let _type: RowType = value[ROW_TYPE].into();
+        let mut row = Row::new(id, _type);
+
+        match _type {
+            RowType::Internal => {
+                let left = usize::from_ne_bytes(
+                    value[ROW_LEFT..ROW_LEFT + ROW_OFFSET_SIZE]
+                        .try_into()
+                        .expect("should be expected size"),
+                );
+                let right = usize::from_ne_bytes(
+                    value[ROW_RIGHT..ROW_RIGHT + ROW_OFFSET_SIZE]
+                        .try_into()
+                        .expect("should be expected size"),
+                );
+                row.set_left_offset(left);
+                row.set_right_offset(right);
+            }
+            RowType::Leaf => {
+                row.set_username(
+                    value[ROW_USERNAME..ROW_USERNAME + ROW_USERNAME_SIZE]
+                        .try_into()
+                        .expect("should be same size"),
+                );
+                row.set_email(
+                    value[ROW_EMAIL..ROW_EMAIL + ROW_EMAIL_SIZE]
+                        .try_into()
+                        .expect("should be same size"),
+                );
+            }
+        }
+
+        Ok(row)
     }
 }
 

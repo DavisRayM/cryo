@@ -26,6 +26,7 @@
 //!
 //! # See Also
 //! - [`statement`](crate::statement): Frontend statements that are evaluated by a storage engine.
+pub mod page;
 pub mod row;
 
 use thiserror::Error;
@@ -35,7 +36,20 @@ pub use row::Row;
 
 /// List of possible errors that can be thrown by the Storage module
 #[derive(Debug, Clone, Error)]
-pub enum StorageError {}
+pub enum StorageError {
+    #[error("page error: {cause}")]
+    Page { cause: PageError },
+}
+
+#[derive(Debug, Clone, Error)]
+pub enum PageError {
+    #[error("out of space")]
+    Full,
+    #[error("key does not exist")]
+    MissingKey,
+    #[error("duplicate row")]
+    Duplicate,
+}
 
 /// `StorageEngine` defines the interface through which higher-level components
 /// (such as DSL statements or CLI commands) interact with the storage layer.
