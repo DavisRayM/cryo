@@ -27,7 +27,10 @@
 //! # See Also
 //! - [`statement`](crate::statement): Frontend statements that are evaluated by a storage engine.
 pub mod page;
+pub mod pager;
 pub mod row;
+
+use std::io;
 
 use thiserror::Error;
 
@@ -35,13 +38,16 @@ use crate::Statement;
 pub use row::Row;
 
 /// List of possible errors that can be thrown by the Storage module
-#[derive(Debug, Clone, Error)]
+#[derive(Debug, Error)]
 pub enum StorageError {
     #[error("page error: {cause}")]
     Page { cause: PageError },
+
+    #[error("paging error: {cause}")]
+    Pager { cause: PagerError },
 }
 
-#[derive(Debug, Clone, Error)]
+#[derive(Debug, Error)]
 pub enum PageError {
     #[error("out of space")]
     Full,
@@ -49,6 +55,12 @@ pub enum PageError {
     MissingKey,
     #[error("duplicate row")]
     Duplicate,
+}
+
+#[derive(Debug, Error)]
+pub enum PagerError {
+    #[error("io error; {0}")]
+    Io(#[from] io::Error),
 }
 
 /// `StorageEngine` defines the interface through which higher-level components

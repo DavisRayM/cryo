@@ -52,7 +52,7 @@ pub const HAS_PARENT: u8 = 0x3;
 pub const IS_ROOT: u8 = 0x4;
 
 /// List of support page types
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PageType {
     Internal,
     Leaf,
@@ -72,16 +72,10 @@ pub struct Page {
 
 impl Page {
     /// Create new page instance
-    pub fn new(
-        _type: PageType,
-        offset: usize,
-        parent: Option<usize>,
-        rows: Vec<Row>,
-        size: usize,
-    ) -> Self {
+    pub fn new(_type: PageType, parent: Option<usize>, rows: Vec<Row>, size: usize) -> Self {
         Self {
             _type,
-            offset,
+            offset: 0,
             parent,
             rows,
             size,
@@ -174,6 +168,35 @@ impl Page {
         Ok(())
     }
 
+    /// Returns the byte representation of the page.
+    pub fn as_bytes(&self) -> [u8; PAGE_SIZE] {
+        let mut buf = [0; PAGE_SIZE];
+
+        buf[PAGE_TYPE] = self._type.into();
+        if self.parent.is_some() {
+            buf[PAGE_HAS_PARENT] = HAS_PARENT;
+            buf[PAGE_PARENT..PAGE_ROWS].clone_from_slice(
+                self.parent
+                    .expect("checked in if condition")
+                    .to_ne_bytes()
+                    .as_ref(),
+            );
+        } else {
+            buf[PAGE_HAS_PARENT] = IS_ROOT;
+        }
+
+        buf[PAGE_ROWS..PAGE_HEADER_SIZE].clone_from_slice(self.rows.len().to_ne_bytes().as_ref());
+
+        let mut offset = PAGE_HEADER_SIZE;
+        for row in &self.rows {
+            let bytes = row.as_bytes();
+            buf[offset..offset + bytes.len()].clone_from_slice(&bytes);
+            offset += bytes.len();
+        }
+
+        buf
+    }
+
     fn row_task(
         &mut self,
         row: Row,
@@ -229,37 +252,6 @@ impl From<u8> for PageType {
     }
 }
 
-impl From<Page> for [u8; PAGE_SIZE] {
-    fn from(value: Page) -> Self {
-        let mut buf = [0; PAGE_SIZE];
-
-        buf[PAGE_TYPE] = value._type.into();
-        if value.parent.is_some() {
-            buf[PAGE_HAS_PARENT] = HAS_PARENT;
-            buf[PAGE_PARENT..PAGE_ROWS].clone_from_slice(
-                value
-                    .parent
-                    .expect("checked in if condition")
-                    .to_ne_bytes()
-                    .as_ref(),
-            );
-        } else {
-            buf[PAGE_HAS_PARENT] = IS_ROOT;
-        }
-
-        buf[PAGE_ROWS..PAGE_HEADER_SIZE].clone_from_slice(value.rows.len().to_ne_bytes().as_ref());
-
-        let mut offset = PAGE_HEADER_SIZE;
-        for row in value.rows {
-            let bytes = row.as_bytes();
-            buf[offset..offset + bytes.len()].clone_from_slice(&bytes);
-            offset += bytes.len();
-        }
-
-        buf
-    }
-}
-
 impl TryFrom<[u8; PAGE_SIZE]> for Page {
     type Error = StorageError;
 
@@ -289,7 +281,7 @@ impl TryFrom<[u8; PAGE_SIZE]> for Page {
             rows.push(row);
         }
 
-        Ok(Page::new(_type, 0, parent, rows, offset - PAGE_HEADER_SIZE))
+        Ok(Page::new(_type, parent, rows, offset - PAGE_HEADER_SIZE))
     }
 }
 
@@ -304,8 +296,8 @@ mod tests {
 
     #[test]
     fn leaf_to_bytes() {
-        let page = Page::new(PageType::Leaf, 0, None, vec![], 0);
-        let bytes: [u8; PAGE_SIZE] = page.into();
+        let page = Page::new(PageType::Leaf, None, vec![], 0);
+        let bytes: [u8; PAGE_SIZE] = page.as_bytes();
 
         let page: Page = bytes.try_into().unwrap();
         assert_eq!(page.offset, 0);
@@ -317,8 +309,8 @@ mod tests {
 
     #[test]
     fn internal_to_bytes() {
-        let page = Page::new(PageType::Internal, 0, None, vec![], 0);
-        let bytes: [u8; PAGE_SIZE] = page.into();
+        let page = Page::new(PageType::Internal, None, vec![], 0);
+        let bytes: [u8; PAGE_SIZE] = page.as_bytes();
 
         let page: Page = bytes.try_into().unwrap();
         assert_eq!(page.offset, 0);
@@ -330,7 +322,7 @@ mod tests {
 
     #[test]
     fn leaf_insert_row() {
-        let mut page = Page::new(PageType::Leaf, 0, None, vec![], 0);
+        let mut page = Page::new(PageType::Leaf, None, vec![], 0);
         let row = Row::new(1, RowType::Leaf);
         page.insert(row.clone()).unwrap();
         assert_eq!(page.size, LEAF_ROW_SIZE);
@@ -339,7 +331,7 @@ mod tests {
 
     #[test]
     fn leaf_update_row() {
-        let mut page = Page::new(PageType::Leaf, 0, None, vec![], 0);
+        let mut page = Page::new(PageType::Leaf, None, vec![], 0);
         let mut row = Row::new(1, RowType::Leaf);
         let initial = vec!['t', 'e', 's', 't'];
         row.set_username(
@@ -369,7 +361,7 @@ mod tests {
 
     #[test]
     fn leaf_delete_row() {
-        let mut page = Page::new(PageType::Leaf, 0, None, vec![], 0);
+        let mut page = Page::new(PageType::Leaf, None, vec![], 0);
         let mut row = Row::new(1, RowType::Leaf);
         let initial = vec!['t', 'e', 's', 't'];
         row.set_username(
@@ -392,7 +384,7 @@ mod tests {
 
     #[test]
     fn internal_insert_cell() {
-        let mut page = Page::new(PageType::Internal, 0, None, vec![], 0);
+        let mut page = Page::new(PageType::Internal, None, vec![], 0);
         let row = Row::new(1, RowType::Internal);
         page.insert(row).unwrap();
         assert_eq!(page.size, INTERNAL_ROW_SIZE);
@@ -400,7 +392,7 @@ mod tests {
 
     #[test]
     fn leaf_select() {
-        let mut page = Page::new(PageType::Leaf, 0, None, vec![], 0);
+        let mut page = Page::new(PageType::Leaf, None, vec![], 0);
         let row = Row::new(1, RowType::Leaf);
         page.insert(row.clone()).unwrap();
         assert_eq!(page.select(), vec![row]);
@@ -409,7 +401,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "Duplicate")]
     fn insert_duplicate() {
-        let mut page = Page::new(PageType::Leaf, 0, None, vec![], 0);
+        let mut page = Page::new(PageType::Leaf, None, vec![], 0);
         let row = Row::new(1, RowType::Leaf);
         page.insert(row.clone()).unwrap();
         page.insert(row).unwrap();
@@ -418,7 +410,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "MissingKey")]
     fn delete_non_existent() {
-        let mut page = Page::new(PageType::Leaf, 0, None, vec![], 0);
+        let mut page = Page::new(PageType::Leaf, None, vec![], 0);
         let row = Row::new(1, RowType::Leaf);
         page.delete(row).unwrap();
     }
@@ -426,7 +418,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "MissingKey")]
     fn update_non_existent() {
-        let mut page = Page::new(PageType::Leaf, 0, None, vec![], 0);
+        let mut page = Page::new(PageType::Leaf, None, vec![], 0);
         let row = Row::new(1, RowType::Leaf);
         page.update(row).unwrap();
     }
