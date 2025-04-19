@@ -53,8 +53,9 @@ use super::{
     page::{PAGE_SIZE, Page},
 };
 
+#[derive(Debug)]
 pub struct Pager {
-    pages: usize,
+    pub pages: usize,
     reader: BufReader<File>,
     writer: BufWriter<File>,
 }

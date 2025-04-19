@@ -26,11 +26,12 @@
 //!
 //! # See Also
 //! - [`statement`](crate::statement): Frontend statements that are evaluated by a storage engine.
+pub mod btree;
 pub mod page;
 pub mod pager;
 pub mod row;
 
-use std::io;
+use std::{error::Error, io};
 
 use thiserror::Error;
 
@@ -45,6 +46,12 @@ pub enum StorageError {
 
     #[error("paging error: {cause}")]
     Pager { cause: PagerError },
+
+    #[error("engine error during {action}: {cause}")]
+    Engine {
+        action: EngineAction,
+        cause: Box<dyn Error>,
+    },
 }
 
 #[derive(Debug, Error)]
@@ -61,6 +68,14 @@ pub enum PageError {
 pub enum PagerError {
     #[error("io error; {0}")]
     Io(#[from] io::Error),
+}
+
+#[derive(Debug, Error)]
+pub enum EngineAction {
+    #[error("insert")]
+    Insert,
+    #[error("split")]
+    Split,
 }
 
 /// `StorageEngine` defines the interface through which higher-level components
