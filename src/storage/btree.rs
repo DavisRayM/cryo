@@ -38,6 +38,8 @@
 //! - [`Pager`]: Manages disk I/O and caching for pages
 //! - [`StorageEngine`]: Exposes a high-level interface backed by the B-Tree
 
+use std::collections::VecDeque;
+
 use log::{debug, error, trace};
 
 use crate::storage::{EngineAction, PageError, row::RowType};
@@ -82,6 +84,35 @@ impl BTree {
             pager,
             root,
         })
+    }
+
+    /// Selects all leaf rows present in the BTree.
+    pub fn select(&mut self) -> Result<Vec<Row>, StorageError> {
+        let mut stack = VecDeque::from([self.root]);
+        let mut out = Vec::new();
+        let mut visited = Vec::new();
+
+        #[allow(clippy::manual_while_let_some)]
+        while !stack.is_empty() {
+            let id = stack.pop_back().expect("stack is not empty");
+            if visited.contains(&id) {
+                continue;
+            }
+
+            let target = self.pager.read(id)?;
+            visited.push(id);
+
+            if target._type == PageType::Leaf {
+                out.extend_from_slice(&target.select()[..]);
+            } else {
+                target.select().iter().for_each(|r| {
+                    stack.push_front(r.left_offset());
+                    stack.push_front(r.right_offset());
+                });
+            }
+        }
+
+        Ok(out)
     }
 
     /// Adds a new row entry into the BTree structure.
@@ -141,7 +172,7 @@ impl BTree {
     ///
     /// This functions panics if called while `self.current` points to a leaf node
     fn search_internal(&mut self, row: &Row) -> Result<(), StorageError> {
-        let mut page = self.pager.read(self.current)?;
+        let page = self.pager.read(self.current)?;
         if page._type == PageType::Leaf {
             error!("attempted to search leaf node {}", self.current);
             panic!("search operation not supported");
@@ -440,5 +471,40 @@ mod tests {
 
         let row = Row::new(0, RowType::Leaf);
         tree.insert(row).unwrap();
+    }
+
+    #[test]
+    fn btree_select() {
+        let temp = TempDir::new("BTreeInsert").unwrap();
+        let pager = Pager::open(temp.into_path().join("cryo.db")).unwrap();
+        let mut tree = BTree::new(pager).unwrap();
+        let mut expected = Vec::new();
+
+        for i in 1..10 {
+            let row = Row::new(i, RowType::Leaf);
+            expected.push(row.clone());
+            tree.insert(row).unwrap();
+        }
+
+        assert_eq!(tree.select().unwrap(), expected);
+    }
+
+    #[test]
+    fn btree_ordering() {
+        let temp = TempDir::new("BTreeInsert").unwrap();
+        let pager = Pager::open(temp.into_path().join("cryo.db")).unwrap();
+        let mut tree = BTree::new(pager).unwrap();
+        let mut expected = VecDeque::new();
+
+        for i in 10..0 {
+            let row = Row::new(i, RowType::Leaf);
+            expected.push_front(row.clone());
+            tree.insert(row).unwrap();
+        }
+
+        assert_eq!(
+            tree.select().unwrap(),
+            expected.into_iter().collect::<Vec<Row>>()
+        );
     }
 }

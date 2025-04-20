@@ -36,6 +36,8 @@
 //! # See Also
 //! - [`StorageEngine`](crate::storage::StorageEngine): Uses rows to implement low-level get/insert/delete operations.
 
+use std::fmt;
+
 use crate::utilities::{EMAIL_MAX_LENGTH, USERNAME_MAX_LENGTH};
 
 use super::StorageError;
@@ -69,7 +71,7 @@ pub enum RowType {
 }
 
 /// In-memory representation of a page record.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Row {
     inner: Vec<u8>,
     pub _type: RowType,
@@ -223,6 +225,12 @@ impl Row {
 
     fn read_bytes(&self, pos: usize, len: usize) -> Vec<u8> {
         self.inner[pos..pos + len].to_vec()
+    }
+}
+
+impl fmt::Debug for Row {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "(ID: {}, Type: {:?})", self.id(), self._type)
     }
 }
 
