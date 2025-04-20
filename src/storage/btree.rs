@@ -190,9 +190,9 @@ impl BTree {
             match target._type {
                 PageType::Internal => {
                     target.select().iter().for_each(|p| {
-                        out += format!("    {id} -> {};\n", p.id()).as_str();
-                        out += format!("    {} -> {};\n", p.id(), p.left_offset()).as_str();
-                        out += format!("    {} -> {};\n", p.id(), p.right_offset()).as_str();
+                        out += format!("    {id} -> P{};\n", p.id()).as_str();
+                        out += format!("    P{} -> {};\n", p.id(), p.left_offset()).as_str();
+                        out += format!("    P{} -> {};\n", p.id(), p.right_offset()).as_str();
                         queue.push_front(p.left_offset());
                         queue.push_front(p.right_offset());
                     });
@@ -906,7 +906,7 @@ mod tests {
         assert_eq!(
             tree.structure().unwrap(),
             String::from(
-                "digraph {\n    2 -> 4;\n    4 -> 0;\n    4 -> 1;\n    edge [style=\"dashed\"]\n   0 -> 2\n    edge [style=\"dashed\"]\n   1 -> 2\n}"
+                "digraph {\n    2 -> P4;\n    P4 -> 0;\n    P4 -> 1;\n    edge [style=\"dashed\"]\n   0 -> 2\n    edge [style=\"dashed\"]\n   1 -> 2\n}"
             )
         );
     }
