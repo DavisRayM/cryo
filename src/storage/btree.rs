@@ -129,23 +129,7 @@ impl BTree {
 
         // Only merge child nodes
         if self.current != self.root {
-            let (parent_id, pointer_pos) = self
-                .breadcrumbs
-                .pop()
-                .expect("breadcrumbs should track traversal path");
-            let pointers = self.pager.read(parent_id)?.select();
-            let pointer = &pointers[pointer_pos];
-
-            let sibling_id = if pointer.left_offset() == self.current {
-                pointer.right_offset()
-            } else {
-                pointer.left_offset()
-            };
-            let sibling = self.pager.read(sibling_id)?;
-
-            if page.size + sibling.size <= ROW_SPACE {
-                todo!("merge siblings")
-            }
+            self.attempt_merge()?;
         }
 
         Ok(())
@@ -271,6 +255,125 @@ impl BTree {
         debug!("possible row position in page {page_id}");
         self.current = page_id;
         Ok(())
+    }
+
+    /// Attemps to merge the current node; checks if the combined
+    /// size of the node and sibling are enough to fit into one node and merges
+    /// them.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `self.breadcrumbs is empty`
+    fn attempt_merge(&mut self) -> Result<(), StorageError> {
+        debug!("checking if page {} can be merged", self.current);
+        let page = self.pager.read(self.current)?;
+        let (parent_id, pointer_pos) = self
+            .breadcrumbs
+            .pop()
+            .expect("breadcrumbs should track traversal path");
+        let pointers = self.pager.read(parent_id)?.select();
+        let pointer = &pointers[pointer_pos];
+
+        let (sucessor, ancestor, sibling) = if pointer.left_offset() == self.current {
+            (
+                self.current,
+                pointer.right_offset(),
+                self.pager.read(pointer.right_offset()),
+            )
+        } else {
+            (
+                pointer.left_offset(),
+                self.current,
+                self.pager.read(pointer.left_offset()),
+            )
+        };
+
+        if page.size + sibling?.size <= ROW_SPACE {
+            self.merge(sucessor, ancestor, pointer_pos)?;
+        }
+
+        Ok(())
+    }
+
+    /// Merges the sibling node into the target node and updates
+    /// the pointer on the parent node.
+    fn merge(
+        &mut self,
+        successor_id: usize,
+        ancestor_id: usize,
+        parent_pointer: usize,
+    ) -> Result<(), StorageError> {
+        debug!("merging page {} into {}", ancestor_id, successor_id);
+        let mut successor = self.pager.read(successor_id)?;
+        let ancestor = self.pager.read(ancestor_id)?;
+        let parent_id = successor.parent.expect("merge called on root node");
+        let mut parent = self.pager.read(parent_id)?;
+        let mut moved_rows = ancestor.select();
+        let mut pointers = parent.select();
+
+        while let Some(row) = moved_rows.pop() {
+            successor.insert(row)?;
+        }
+        self.pager.write(successor_id, &mut successor)?;
+        // TODO: Free the ancestor page
+
+        let (left_pointer, delete_pointer, right_pointer) =
+            if parent_pointer > 0 && parent_pointer + 1 < pointers.len() {
+                let remove_pos = parent_pointer - 1;
+                (
+                    Some(pointers.remove(remove_pos)),
+                    pointers.remove(remove_pos),
+                    Some(pointers.remove(remove_pos)),
+                )
+            } else if parent_pointer > 0 {
+                let remove_pos = parent_pointer - 1;
+                (
+                    Some(pointers.remove(remove_pos)),
+                    pointers.remove(remove_pos),
+                    None,
+                )
+            } else if parent_pointer + 1 < pointers.len() {
+                (
+                    None,
+                    pointers.remove(parent_pointer),
+                    Some(pointers.remove(parent_pointer)),
+                )
+            } else {
+                (None, pointers.remove(parent_pointer), None)
+            };
+
+        parent.delete(delete_pointer)?;
+        // Update pointers in parent node
+        if let Some(mut left) = left_pointer {
+            debug!(
+                "updating (left) pointer {} in page {}",
+                left.id(),
+                parent_id
+            );
+            left.set_right_offset(successor_id);
+            parent.update(left)?;
+        }
+
+        if let Some(mut right) = right_pointer {
+            debug!(
+                "updating (right) pointer {} in page {}",
+                right.id(),
+                parent_id
+            );
+            right.set_left_offset(successor_id);
+            parent.update(right)?;
+        }
+        self.pager.write(parent_id, &mut parent)?;
+
+        // Propagate merge upwards
+        if parent.size == 0 && parent_id == self.root {
+            self.root = successor_id;
+            self.current = successor_id;
+            Ok(())
+        } else {
+            self.current = parent_id;
+            self.attempt_merge()
+        }
     }
 
     /// Splits the BTree node at `self.current` and inserts a row
