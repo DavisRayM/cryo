@@ -204,7 +204,7 @@ impl Page {
         row: Row,
         task: impl Fn(&mut Vec<Row>, Row) -> Result<(usize, Option<Row>), StorageError>,
     ) -> Result<Option<Row>, StorageError> {
-        if self.size + row.as_bytes().len() >= ROW_SPACE {
+        if self.size + row.as_bytes().len() > ROW_SPACE {
             return Err(StorageError::Page {
                 cause: PageError::Full,
             });

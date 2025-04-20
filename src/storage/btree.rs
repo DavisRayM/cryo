@@ -180,7 +180,7 @@ impl BTree {
             let page = self.pager.read(self.current)?;
 
             if page._type != PageType::Leaf {
-                self.search_internal(&row)?;
+                self.search_internal(row)?;
                 continue;
             }
 
