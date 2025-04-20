@@ -46,7 +46,7 @@ use crate::storage::{EngineAction, PageError, row::RowType};
 
 use super::{
     Row, StorageError,
-    page::{Page, PageType},
+    page::{Page, PageType, ROW_SPACE},
     pager::Pager,
 };
 
@@ -113,6 +113,42 @@ impl BTree {
         }
 
         Ok(out)
+    }
+
+    /// Deletes a row if present in the BTree structure
+    ///
+    /// # Errors
+    ///
+    /// Errors out if the row does not exist in the structure.
+    pub fn delete(&mut self, row: Row) -> Result<(), StorageError> {
+        self.locate_row(&row)?;
+
+        let mut page = self.pager.read(self.current)?;
+        page.delete(row)?;
+        self.pager.write(self.current, &mut page)?;
+
+        // Only merge child nodes
+        if self.current != self.root {
+            let (parent_id, pointer_pos) = self
+                .breadcrumbs
+                .pop()
+                .expect("breadcrumbs should track traversal path");
+            let pointers = self.pager.read(parent_id)?.select();
+            let pointer = &pointers[pointer_pos];
+
+            let sibling_id = if pointer.left_offset() == self.current {
+                pointer.right_offset()
+            } else {
+                pointer.left_offset()
+            };
+            let sibling = self.pager.read(sibling_id)?;
+
+            if page.size + sibling.size <= ROW_SPACE {
+                todo!("merge siblings")
+            }
+        }
+
+        Ok(())
     }
 
     /// Updates a row if present in the BTree structure
@@ -557,6 +593,55 @@ mod tests {
         let old = tree.update(row.clone()).unwrap();
 
         assert_eq!(tree.select().unwrap(), vec![row]);
-        assert_eq!(old.username(), vec![0; ROW_USERNAME_SIZE])
+        assert_eq!(old.username(), vec![0; ROW_USERNAME_SIZE]);
+    }
+
+    #[test]
+    fn btree_select_empty() {
+        let temp = TempDir::new("BTreeInsert").unwrap();
+        let pager = Pager::open(temp.into_path().join("cryo.db")).unwrap();
+        let mut tree = BTree::new(pager).unwrap();
+
+        assert_eq!(tree.select().unwrap(), vec![]);
+    }
+
+    #[test]
+    fn btree_delete() {
+        let temp = TempDir::new("BTreeInsert").unwrap();
+        let pager = Pager::open(temp.into_path().join("cryo.db")).unwrap();
+        let mut tree = BTree::new(pager).unwrap();
+        let row = Row::new(1, RowType::Leaf);
+        tree.insert(row.clone()).unwrap();
+        tree.delete(row).unwrap();
+
+        assert_eq!(tree.select().unwrap(), vec![])
+    }
+
+    #[test]
+    fn btree_delete_merge() {
+        let temp = TempDir::new("BTreeInsert").unwrap();
+        let mut pager = Pager::open(temp.into_path().join("cryo.db")).unwrap();
+        let left = pager.allocate().unwrap();
+        let right = pager.allocate().unwrap();
+        let root = pager.allocate().unwrap();
+
+        let mut page = Page::new(PageType::Leaf, Some(root), vec![], 0);
+        pager.write(left, &mut page).unwrap();
+        page = Page::new(PageType::Leaf, Some(root), vec![], 0);
+        pager.write(right, &mut page).unwrap();
+
+        let mut row = Row::new(4, RowType::Internal);
+        row.set_left_offset(left);
+        row.set_right_offset(right);
+        page = Page::new(PageType::Internal, None, vec![row], 0);
+        pager.write(root, &mut page).unwrap();
+
+        let mut tree = BTree::new(pager).unwrap();
+        let insert = Row::new(1, RowType::Leaf);
+        tree.insert(insert).unwrap();
+        let insert = Row::new(2, RowType::Leaf);
+        tree.insert(insert.clone()).unwrap();
+
+        tree.delete(insert).unwrap();
     }
 }
