@@ -86,15 +86,49 @@ impl BTree {
         })
     }
 
+    /// Returns the structure of the BTree in Graphviz DOT language
+    pub fn structure(&mut self) -> Result<String, StorageError> {
+        let mut queue = VecDeque::from([self.root]);
+        let mut out = "digraph {\n".to_string();
+        let mut visited = Vec::new();
+
+        while let Some(id) = queue.pop_back() {
+            if visited.contains(&id) {
+                continue;
+            }
+            let target = self.pager.read(id)?;
+            visited.push(id);
+
+            match target._type {
+                PageType::Internal => {
+                    target.select().iter().for_each(|p| {
+                        out += format!("    {id} -> {};\n", p.id()).as_str();
+                        out += format!("    {} -> {};\n", p.id(), p.left_offset()).as_str();
+                        out += format!("    {} -> {};\n", p.id(), p.right_offset()).as_str();
+                        queue.push_front(p.left_offset());
+                        queue.push_front(p.right_offset());
+                    });
+                }
+                PageType::Leaf => {
+                    let parent = target.parent.unwrap_or(id);
+                    out +=
+                        format!("    edge [style=\"dashed\"]\n   {} -> {}\n", id, parent).as_str()
+                }
+            }
+        }
+
+        out += "}";
+
+        Ok(out)
+    }
+
     /// Selects all leaf rows present in the BTree.
     pub fn select(&mut self) -> Result<Vec<Row>, StorageError> {
-        let mut stack = VecDeque::from([self.root]);
+        let mut queue = VecDeque::from([self.root]);
         let mut out = Vec::new();
         let mut visited = Vec::new();
 
-        #[allow(clippy::manual_while_let_some)]
-        while !stack.is_empty() {
-            let id = stack.pop_back().expect("stack is not empty");
+        while let Some(id) = queue.pop_back() {
             if visited.contains(&id) {
                 continue;
             }
@@ -106,8 +140,8 @@ impl BTree {
                 out.extend_from_slice(&target.select()[..]);
             } else {
                 target.select().iter().for_each(|r| {
-                    stack.push_front(r.left_offset());
-                    stack.push_front(r.right_offset());
+                    queue.push_front(r.left_offset());
+                    queue.push_front(r.right_offset());
                 });
             }
         }
@@ -746,5 +780,46 @@ mod tests {
         tree.insert(insert.clone()).unwrap();
 
         tree.delete(insert).unwrap();
+    }
+
+    #[test]
+    fn btree_structure_single_node() {
+        let temp = TempDir::new("BTreeInsert").unwrap();
+        let pager = Pager::open(temp.into_path().join("cryo.db")).unwrap();
+        let mut tree = BTree::new(pager).unwrap();
+
+        assert_eq!(
+            tree.structure().unwrap(),
+            String::from("digraph {\n    edge [style=\"dashed\"]\n   0 -> 0\n}")
+        );
+    }
+
+    #[test]
+    fn btree_structure_multi_nodes() {
+        let temp = TempDir::new("BTreeInsert").unwrap();
+        let mut pager = Pager::open(temp.into_path().join("cryo.db")).unwrap();
+        let left = pager.allocate().unwrap();
+        let right = pager.allocate().unwrap();
+        let root = pager.allocate().unwrap();
+
+        let mut page = Page::new(PageType::Leaf, Some(root), vec![], 0);
+        pager.write(left, &mut page).unwrap();
+        page = Page::new(PageType::Leaf, Some(root), vec![], 0);
+        pager.write(right, &mut page).unwrap();
+
+        let mut row = Row::new(4, RowType::Internal);
+        row.set_left_offset(left);
+        row.set_right_offset(right);
+        page = Page::new(PageType::Internal, None, vec![row], 0);
+        pager.write(root, &mut page).unwrap();
+
+        let mut tree = BTree::new(pager).unwrap();
+
+        assert_eq!(
+            tree.structure().unwrap(),
+            String::from(
+                "digraph {\n    2 -> 4;\n    4 -> 0;\n    4 -> 1;\n    edge [style=\"dashed\"]\n   0 -> 2\n    edge [style=\"dashed\"]\n   1 -> 2\n}"
+            )
+        );
     }
 }
