@@ -47,6 +47,8 @@ pub const PAGE_HAS_PARENT: usize = PAGE_TYPE + PAGE_KIND_SIZE;
 pub const PAGE_PARENT: usize = PAGE_HAS_PARENT + PAGE_HAS_PARENT_SIZE;
 pub const PAGE_ROWS: usize = PAGE_PARENT + PAGE_PARENT_SIZE;
 
+pub const ROW_SPACE: usize = PAGE_SIZE - PAGE_HEADER_SIZE;
+
 /// Flags to denote whether a page has a parent or not
 pub const HAS_PARENT: u8 = 0x3;
 pub const IS_ROOT: u8 = 0x4;
@@ -67,7 +69,7 @@ pub struct Page {
     pub offset: usize,
     pub parent: Option<usize>,
     pub size: usize,
-    rows: Vec<Row>,
+    pub rows: Vec<Row>,
 }
 
 impl Page {
@@ -202,7 +204,7 @@ impl Page {
         row: Row,
         task: impl Fn(&mut Vec<Row>, Row) -> Result<(usize, Option<Row>), StorageError>,
     ) -> Result<Option<Row>, StorageError> {
-        if self.size + row.as_bytes().len() >= PAGE_SIZE {
+        if self.size + row.as_bytes().len() >= ROW_SPACE {
             return Err(StorageError::Page {
                 cause: PageError::Full,
             });

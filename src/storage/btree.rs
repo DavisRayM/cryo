@@ -40,7 +40,7 @@
 
 use log::{debug, error, trace};
 
-use crate::storage::{EngineAction, PageError};
+use crate::storage::{EngineAction, PageError, row::RowType};
 
 use super::{
     Row, StorageError,
@@ -107,17 +107,21 @@ impl BTree {
                 self.current
             );
 
-            break match page.insert(row) {
+            break match page.insert(row.clone()) {
                 Ok(_) => {
                     self.pager.write(self.current, &mut page)?;
-                    debug!("row successfully inserted in page {}", self.current);
+                    debug!(
+                        "row {} successfully inserted in page {}",
+                        row.id(),
+                        self.current
+                    );
                     Ok(())
                 }
                 Err(StorageError::Page {
                     cause: PageError::Full,
                 }) => {
                     debug!("current page is at maximum capacity");
-                    todo!()
+                    self.split(row)
                 }
                 Err(e) => {
                     debug!("error during insert: {}", e);
@@ -178,6 +182,119 @@ impl BTree {
         self.current = page_id;
         Ok(())
     }
+
+    /// Splits the BTree node at `self.current` and inserts a row
+    /// into the appropriate node after split.
+    fn split(&mut self, row: Row) -> Result<(), StorageError> {
+        if self.current == self.root {
+            // Create new root internal node page
+            let parent_id = self.pager.allocate()?;
+            let mut current = self.pager.read(self.current)?;
+            current.parent = Some(parent_id);
+            self.pager.write(self.current, &mut current)?;
+
+            // Split child and retrieve internal row pointer to new children
+            let pointer = self.split_node(self.current, row)?;
+            let mut parent = Page::new(PageType::Internal, None, vec![pointer], 0);
+
+            self.pager.write(parent_id, &mut parent)?;
+
+            self.root = parent_id;
+            self.current = parent_id;
+            Ok(())
+        } else if let Some(parent_id) = self.pager.read(self.current)?.parent {
+            // Split child and retrieve internal row pointer to new children
+            let pointer = self.split_node(self.current, row)?;
+            self.current = parent_id;
+
+            let mut parent = self.pager.read(parent_id)?;
+            match parent.insert(pointer.clone()) {
+                Ok(()) => {
+                    self.pager.write(parent_id, &mut parent)?;
+                    Ok(())
+                }
+                Err(StorageError::Page {
+                    cause: PageError::Full,
+                }) => {
+                    self.split(pointer)?;
+                    Ok(())
+                }
+                Err(e) => Err(StorageError::Engine {
+                    action: EngineAction::Split,
+                    cause: Box::new(e),
+                }),
+            }
+        } else {
+            panic!("split called on a node that's not root and does not have a parent")
+        }
+    }
+
+    /// Splits a target node into two, inserting a row into one of the newly split nodes.
+    /// Returns the pointer to the split nodes.
+    ///
+    /// # Panics
+    ///
+    /// This function panics if the target has no parent pointer
+    fn split_node(&mut self, id: usize, insert_row: Row) -> Result<Row, StorageError> {
+        let mut target = self.pager.read(id)?;
+        let is_leaf = target._type == PageType::Leaf;
+
+        let parent_id = target.parent.expect("missing parent pointer");
+        let right_id = self.pager.allocate()?;
+        let mut parent = self.pager.read(parent_id)?;
+
+        let mut left_candidates = target.select();
+        let splitat = left_candidates.len() / 2;
+        let right_candidates = left_candidates.split_off(splitat);
+
+        let mut pointer = Row::new(right_candidates[0].id(), RowType::Internal);
+        pointer.set_left_offset(id);
+        pointer.set_right_offset(right_id);
+
+        if !is_leaf {
+            for pointer in right_candidates.iter() {
+                let page_id = pointer.left_offset();
+                let mut page = self.pager.read(page_id)?;
+                page.parent = Some(right_id);
+                self.pager.write(page_id, &mut page)?;
+
+                let page_id = pointer.right_offset();
+                let mut page = self.pager.read(page_id)?;
+                page.parent = Some(right_id);
+                self.pager.write(page_id, &mut page)?;
+            }
+        }
+
+        let right_size: usize = right_candidates.iter().map(|r| r.as_bytes().len()).sum();
+        let left_size: usize = left_candidates.iter().map(|r| r.as_bytes().len()).sum();
+        let mut right = Page::new(target._type, target.parent, right_candidates, right_size);
+        target.size = left_size;
+        target.rows = left_candidates;
+
+        if insert_row.id() >= pointer.id() {
+            if !is_leaf {
+                // Update the links target page to point to the correct parent
+                let mut page_id = insert_row.left_offset();
+                let mut page = self.pager.read(page_id)?;
+                page.parent = Some(right_id);
+                self.pager.write(page_id, &mut page)?;
+
+                page_id = insert_row.right_offset();
+                page = self.pager.read(page_id)?;
+                page.parent = Some(right_id);
+                self.pager.write(page_id, &mut page)?;
+            }
+            right.insert(insert_row)?;
+        } else {
+            target.insert(insert_row)?;
+        }
+
+        self.pager.write(parent_id, &mut parent)?;
+        self.pager.write(id, &mut target)?;
+        self.pager.write(right_id, &mut right)?;
+
+        Ok(pointer)
+    }
 }
 
 #[cfg(test)]
@@ -190,7 +307,7 @@ mod tests {
 
     #[test]
     fn btree_new_empty() {
-        let temp = TempDir::new("PagerConstruction").unwrap();
+        let temp = TempDir::new("BTreeConstruction").unwrap();
         let pager = Pager::open(temp.into_path().join("cryo.db")).unwrap();
         let tree = BTree::new(pager).unwrap();
 
@@ -199,7 +316,7 @@ mod tests {
 
     #[test]
     fn btree_new_existing_tree() {
-        let temp = TempDir::new("PagerConstruction").unwrap();
+        let temp = TempDir::new("BTreeConstruction").unwrap();
         let mut pager = Pager::open(temp.into_path().join("cryo.db")).unwrap();
 
         let left = pager.allocate().unwrap();
@@ -219,7 +336,7 @@ mod tests {
 
     #[test]
     fn btree_insert_empty() {
-        let temp = TempDir::new("PagerConstruction").unwrap();
+        let temp = TempDir::new("BTreeInsert").unwrap();
         let pager = Pager::open(temp.into_path().join("cryo.db")).unwrap();
         let mut tree = BTree::new(pager).unwrap();
 
@@ -229,7 +346,7 @@ mod tests {
 
     #[test]
     fn btree_insert_multilevel() {
-        let temp = TempDir::new("PagerConstruction").unwrap();
+        let temp = TempDir::new("BTreeInsert").unwrap();
         let mut pager = Pager::open(temp.into_path().join("cryo.db")).unwrap();
 
         let left = pager.allocate().unwrap();
@@ -250,5 +367,78 @@ mod tests {
         let mut tree = BTree::new(pager).unwrap();
         let insert = Row::new(1, RowType::Leaf);
         tree.insert(insert).unwrap();
+    }
+
+    #[test]
+    fn btree_insert_split() {
+        let temp = TempDir::new("BTreeInsert").unwrap();
+        let mut pager = Pager::open(temp.into_path().join("cryo.db")).unwrap();
+
+        let mut page = Page::new(PageType::Leaf, None, vec![], 0);
+        for i in 1..1000 {
+            let row = Row::new(i, RowType::Leaf);
+            if let Err(StorageError::Page {
+                cause: PageError::Full,
+            }) = page.insert(row)
+            {
+                break;
+            }
+        }
+        let root = pager.allocate().unwrap();
+        pager.write(root, &mut page).unwrap();
+
+        let mut tree = BTree::new(pager).unwrap();
+        let row = Row::new(1001, RowType::Leaf);
+        tree.insert(row).unwrap();
+
+        let row = Row::new(0, RowType::Leaf);
+        tree.insert(row).unwrap();
+    }
+
+    #[test]
+    fn btree_insert_split_child() {
+        let temp = TempDir::new("BTreeInsert").unwrap();
+        let mut pager = Pager::open(temp.into_path().join("cryo.db")).unwrap();
+        let root = pager.allocate().unwrap();
+
+        let mut page = Page::new(PageType::Leaf, Some(root), vec![], 0);
+        for i in 1..1000 {
+            let row = Row::new(i, RowType::Leaf);
+            if let Err(StorageError::Page {
+                cause: PageError::Full,
+            }) = page.insert(row)
+            {
+                break;
+            }
+        }
+        let left = pager.allocate().unwrap();
+        pager.write(left, &mut page).unwrap();
+
+        page = Page::new(PageType::Leaf, Some(root), vec![], 0);
+        for i in 1000..2000 {
+            let row = Row::new(i, RowType::Leaf);
+            if let Err(StorageError::Page {
+                cause: PageError::Full,
+            }) = page.insert(row)
+            {
+                break;
+            }
+        }
+        let right = pager.allocate().unwrap();
+        pager.write(right, &mut page).unwrap();
+
+        let mut pointer = Row::new(1000, RowType::Internal);
+        pointer.set_left_offset(left);
+        pointer.set_right_offset(right);
+        let size = pointer.as_bytes().len();
+        page = Page::new(PageType::Internal, None, vec![pointer], size);
+        pager.write(root, &mut page).unwrap();
+
+        let mut tree = BTree::new(pager).unwrap();
+        let row = Row::new(2001, RowType::Leaf);
+        tree.insert(row).unwrap();
+
+        let row = Row::new(0, RowType::Leaf);
+        tree.insert(row).unwrap();
     }
 }
