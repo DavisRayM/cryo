@@ -115,58 +115,81 @@ impl BTree {
         Ok(out)
     }
 
+    /// Updates a row if present in the BTree structure
+    ///
+    /// # Errors
+    ///
+    /// Errors out if the row does not exist in the structure.
+    pub fn update(&mut self, row: Row) -> Result<Row, StorageError> {
+        self.locate_row(&row)?;
+        debug!("updating row {} in page {}", row.id(), self.current);
+
+        let mut page = self.pager.read(self.current)?;
+        let out = page.update(row)?;
+
+        self.pager.write(self.current, &mut page)?;
+        Ok(out)
+    }
+
     /// Adds a new row entry into the BTree structure.
     ///
     /// # Errors
     ///
     /// Errors out if row already exists in the structure.
     pub fn insert(&mut self, row: Row) -> Result<(), StorageError> {
-        self.current = self.root;
+        self.locate_row(&row)?;
+        let mut page = self.pager.read(self.current)?;
+        debug!("inserting row {} in page {}", row.id(), self.current);
 
+        match page.insert(row.clone()) {
+            Ok(_) => {
+                self.pager.write(self.current, &mut page)?;
+                debug!(
+                    "row {} successfully inserted in page {}",
+                    row.id(),
+                    self.current
+                );
+                Ok(())
+            }
+            Err(StorageError::Page {
+                cause: PageError::Full,
+            }) => {
+                debug!("current page is at maximum capacity");
+                self.split(row)
+            }
+            Err(e) => {
+                debug!("error during insert: {}", e);
+                Err(StorageError::Engine {
+                    action: EngineAction::Insert,
+                    cause: Box::new(e),
+                })
+            }
+        }
+    }
+
+    /// Locates the most likely position of a row in the BTree structure. Modifies
+    /// `self.current` to point to the likely location.
+    ///
+    /// NOTE: Path taken by the BTree can be tracked using `self.breadcrumbs`
+    fn locate_row(&mut self, row: &Row) -> Result<(), StorageError> {
+        self.current = self.root;
+        self.breadcrumbs.clear();
+
+        debug!("searching for position of row {}", row.id(),);
         loop {
-            let mut page = self.pager.read(self.current)?;
-            debug!("attempting to insert row in page {}", self.current);
+            let page = self.pager.read(self.current)?;
 
             if page._type != PageType::Leaf {
-                debug!("page {} is an internal node", self.current);
                 self.search_internal(&row)?;
                 continue;
             }
 
-            debug!(
-                "target insert page located; inserting row in page {}",
-                self.current
-            );
-
-            break match page.insert(row.clone()) {
-                Ok(_) => {
-                    self.pager.write(self.current, &mut page)?;
-                    debug!(
-                        "row {} successfully inserted in page {}",
-                        row.id(),
-                        self.current
-                    );
-                    Ok(())
-                }
-                Err(StorageError::Page {
-                    cause: PageError::Full,
-                }) => {
-                    debug!("current page is at maximum capacity");
-                    self.split(row)
-                }
-                Err(e) => {
-                    debug!("error during insert: {}", e);
-                    Err(StorageError::Engine {
-                        action: EngineAction::Insert,
-                        cause: Box::new(e),
-                    })
-                }
-            };
+            break Ok(());
         }
     }
 
-    /// Searches the BTree structure for the most likely location of a row. Modifies
-    /// `self.current_page` to point to the likely location.
+    /// Searches the BTree internal node for the most likely location of a row. Modifies
+    /// `self.current` to point to the likely location.
     ///
     /// # Panics
     ///
@@ -332,7 +355,10 @@ impl BTree {
 mod tests {
     use tempdir::TempDir;
 
-    use crate::storage::row::RowType;
+    use crate::{
+        storage::row::{ROW_USERNAME_SIZE, RowType},
+        utilities::{USERNAME_MAX_LENGTH, char_to_byte, extend_char_array},
+    };
 
     use super::*;
 
@@ -506,5 +532,31 @@ mod tests {
             tree.select().unwrap(),
             expected.into_iter().collect::<Vec<Row>>()
         );
+    }
+
+    #[test]
+    fn btree_update() {
+        let temp = TempDir::new("BTreeInsert").unwrap();
+        let pager = Pager::open(temp.into_path().join("cryo.db")).unwrap();
+        let mut tree = BTree::new(pager).unwrap();
+
+        let mut row = Row::new(1, RowType::Leaf);
+        tree.insert(row.clone()).unwrap();
+
+        let username = vec!['t', 'e', 's', 't'];
+        row.set_username(
+            char_to_byte(
+                extend_char_array::<USERNAME_MAX_LENGTH>(username, '\0')
+                    .unwrap()
+                    .as_ref(),
+            )
+            .as_slice()
+            .try_into()
+            .unwrap(),
+        );
+        let old = tree.update(row.clone()).unwrap();
+
+        assert_eq!(tree.select().unwrap(), vec![row]);
+        assert_eq!(old.username(), vec![0; ROW_USERNAME_SIZE])
     }
 }
