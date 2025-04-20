@@ -35,7 +35,7 @@ use std::{error::Error, io};
 
 use thiserror::Error;
 
-use crate::Statement;
+use crate::{Command, Statement};
 pub use row::Row;
 
 /// List of possible errors that can be thrown by the Storage module
@@ -90,5 +90,6 @@ pub enum EngineAction {
 /// - [`Statement`]: DSL-level abstraction that uses this trait to perform operations.
 /// - [`Row`]: Represents the atomic unit of data managed by a storage engine.
 pub trait StorageEngine {
-    fn evaluate(&mut self, statement: Statement) -> Result<Option<Row>, StorageError>;
+    fn execute(&mut self, command: Command) -> Result<(), StorageError>;
+    fn evaluate_statement(&mut self, statement: Statement) -> Result<Option<String>, StorageError>;
 }

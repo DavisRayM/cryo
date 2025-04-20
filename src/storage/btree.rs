@@ -9,7 +9,7 @@
 //!
 //! # Design Overview
 //! - **Internal pages** contain keys and child page IDs
-//! - **Leaf pages** store actual [`Row`](crate::storage::row::Row) entries
+//! - **Leaf pages** store actual [`Row`] entries
 //! - Pages are loaded and persisted via the pager
 //! - Insertions may cause **page splits**, which propagate up the tree
 //!
@@ -34,7 +34,7 @@
 //!
 //! # See Also
 //! - [`Page`]: Core unit of storage used to build B-Tree nodes
-//! - [`Row`]: Key-value data stored in leaf pages
+//! - [`Row`]: Record data stored in leaf pages
 //! - [`Pager`]: Manages disk I/O and caching for pages
 //! - [`StorageEngine`]: Exposes a high-level interface backed by the B-Tree
 
@@ -42,10 +42,14 @@ use std::collections::VecDeque;
 
 use log::{debug, error, trace};
 
-use crate::storage::{EngineAction, PageError, row::RowType};
+use crate::{
+    Command, Statement,
+    storage::{EngineAction, PageError, row::RowType},
+    utilities::{byte_to_char, char_to_byte},
+};
 
 use super::{
-    Row, StorageError,
+    Row, StorageEngine, StorageError,
     page::{Page, PageType, ROW_SPACE},
     pager::Pager,
 };
@@ -61,6 +65,90 @@ pub struct BTree {
     pager: Pager,
     /// ID of the current root page.
     root: usize,
+}
+
+pub fn print_row(row: &Row) -> String {
+    let username = byte_to_char(&row.username())
+        .expect("failed to read row bytes")
+        .iter()
+        .filter(|c| **c != '\0')
+        .collect::<String>();
+    let email = byte_to_char(&row.email())
+        .expect("failed to read row bytes")
+        .iter()
+        .filter(|c| **c != '\0')
+        .collect::<String>();
+
+    format!("{},{username},{email}", row.id())
+}
+
+impl StorageEngine for BTree {
+    fn execute(&mut self, command: Command) -> Result<(), StorageError> {
+        match command {
+            Command::Statement(s) => {
+                if let Some(out) = self.evaluate_statement(s)? {
+                    println!("{out}")
+                }
+            }
+            Command::Structure => {
+                println!("{}", self.structure()?)
+            }
+            Command::Populate(quantity) => {
+                for i in 1..quantity + 1 {
+                    let row = Row::new(i, RowType::Leaf);
+                    self.insert(row)?;
+                }
+            }
+            Command::Exit => {}
+        }
+
+        Ok(())
+    }
+
+    fn evaluate_statement(&mut self, statement: Statement) -> Result<Option<String>, StorageError> {
+        match statement {
+            Statement::Insert {
+                id,
+                username,
+                email,
+            } => {
+                let mut row = Row::new(id, RowType::Leaf);
+                let username = char_to_byte(&username);
+                let email = char_to_byte(email.as_ref());
+                row.set_username(username[..].try_into().expect("should be expected size"));
+                row.set_email(email[..].try_into().expect("should be expected size"));
+                self.insert(row)?;
+                Ok(None)
+            }
+            Statement::Update {
+                id,
+                username,
+                email,
+            } => {
+                let mut row = Row::new(id, RowType::Leaf);
+                let username = char_to_byte(&username);
+                let email = char_to_byte(email.as_ref());
+                row.set_username(username[..].try_into().expect("should be expected size"));
+                row.set_email(email[..].try_into().expect("should be expected size"));
+                let row = self.update(row)?;
+                Ok(Some(print_row(&row)))
+            }
+            Statement::Delete { id } => {
+                let row = Row::new(id, RowType::Leaf);
+                self.delete(row)?;
+                Ok(None)
+            }
+            Statement::Select => {
+                let out = self
+                    .select()?
+                    .iter()
+                    .map(print_row)
+                    .collect::<Vec<String>>()
+                    .join("\n");
+                Ok(Some(out))
+            }
+        }
+    }
 }
 
 impl BTree {
