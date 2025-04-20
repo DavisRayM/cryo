@@ -85,7 +85,7 @@ impl Page {
     }
 
     /// Select all rows present in the page.
-    pub fn select(&mut self) -> Vec<Row> {
+    pub fn select(&self) -> Vec<Row> {
         self.rows.clone()
     }
 
