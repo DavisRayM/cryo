@@ -47,19 +47,19 @@ pub const ROW_TYPE_SIZE: usize = size_of::<u8>();
 pub const ROW_OFFSET_SIZE: usize = size_of::<usize>();
 pub const ROW_USERNAME_SIZE: usize = size_of::<char>() * USERNAME_MAX_LENGTH;
 pub const ROW_EMAIL_SIZE: usize = size_of::<char>() * EMAIL_MAX_LENGTH;
-
-pub const ROW_ID: usize = 0;
-pub const ROW_TYPE: usize = ROW_ID + ROW_ID_SIZE;
-
-pub const ROW_LEFT: usize = ROW_TYPE + ROW_TYPE_SIZE;
-pub const ROW_RIGHT: usize = ROW_LEFT + ROW_OFFSET_SIZE;
-
-pub const ROW_USERNAME: usize = ROW_TYPE + ROW_TYPE_SIZE;
-pub const ROW_EMAIL: usize = ROW_USERNAME + ROW_USERNAME_SIZE;
-
+pub const ROW_VALUE_LEN_SIZE: usize = size_of::<usize>();
 pub const ROW_HEADER_SIZE: usize = ROW_ID_SIZE + ROW_TYPE_SIZE;
 pub const INTERNAL_ROW_SIZE: usize = ROW_HEADER_SIZE + ROW_OFFSET_SIZE + ROW_OFFSET_SIZE;
-pub const LEAF_ROW_SIZE: usize = ROW_HEADER_SIZE + ROW_USERNAME_SIZE + ROW_EMAIL_SIZE;
+pub const BASE_LEAF_ROW_SIZE: usize = ROW_HEADER_SIZE + ROW_VALUE_LEN_SIZE;
+// Common Offsets
+pub const ROW_ID: usize = 0;
+pub const ROW_TYPE: usize = ROW_ID + ROW_ID_SIZE;
+// Internal Row Offsets
+pub const ROW_LEFT: usize = ROW_TYPE + ROW_TYPE_SIZE;
+pub const ROW_RIGHT: usize = ROW_LEFT + ROW_OFFSET_SIZE;
+// Leaf Row Offsets
+pub const ROW_VALUE_LEN: usize = ROW_TYPE + ROW_TYPE_SIZE;
+pub const ROW_VALUE: usize = ROW_VALUE_LEN + ROW_VALUE_LEN_SIZE;
 
 /// Supported [`Row`] types
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -75,25 +75,35 @@ pub enum RowType {
 pub struct Row {
     inner: Vec<u8>,
     pub _type: RowType,
+    value_len: Option<usize>,
 }
 
 impl Row {
     /// Create a new row
     pub fn new(id: usize, _type: RowType) -> Self {
         let mut inner = Vec::new();
+        let value_len;
         match _type {
             RowType::Internal => {
                 inner.resize(INTERNAL_ROW_SIZE, 0);
                 inner[ROW_ID..ROW_ID + ROW_ID_SIZE].clone_from_slice(id.to_ne_bytes().as_ref());
                 inner[ROW_TYPE] = _type.into();
+                value_len = None;
             }
             RowType::Leaf => {
-                inner.resize(LEAF_ROW_SIZE, 0);
+                inner.resize(BASE_LEAF_ROW_SIZE, 0);
                 inner[ROW_ID..ROW_ID + ROW_ID_SIZE].clone_from_slice(id.to_ne_bytes().as_ref());
                 inner[ROW_TYPE] = _type.into();
+                value_len = Some(0);
+                inner[ROW_VALUE_LEN..ROW_VALUE_LEN + ROW_VALUE_LEN_SIZE]
+                    .clone_from_slice(0_usize.to_ne_bytes().as_ref());
             }
         }
-        Self { inner, _type }
+        Self {
+            inner,
+            _type,
+            value_len,
+        }
     }
 
     /// Retrieve row ID
@@ -101,28 +111,16 @@ impl Row {
         self.read_usize(ROW_ID)
     }
 
-    /// Retrieve row username
+    /// Retrieve row value
     ///
     /// # Panics
     ///
     /// This function panics if called by a non-leaf row
-    pub fn username(&self) -> Vec<u8> {
+    pub fn value(&self) -> Vec<u8> {
         if self._type != RowType::Leaf {
             panic!("username() called on a non-leaf row")
         }
-        self.read_bytes(ROW_USERNAME, ROW_USERNAME_SIZE)
-    }
-
-    /// Retrieve row email
-    ///
-    /// # Panics
-    ///
-    /// This function panics if called by a non-leaf row
-    pub fn email(&self) -> Vec<u8> {
-        if self._type != RowType::Leaf {
-            panic!("email() called on a non-leaf row")
-        }
-        self.read_bytes(ROW_EMAIL, ROW_EMAIL_SIZE)
+        self.read_bytes(ROW_VALUE, self.value_len.unwrap_or(0))
     }
 
     /// Retrieve row left offset
@@ -154,28 +152,20 @@ impl Row {
         self.write_usize(ROW_ID, id);
     }
 
-    /// Set row username value
+    /// Set row value
     ///
     /// # Panics
     ///
     /// This function panics if called by a non-leaf row
-    pub fn set_username(&mut self, username: &[u8; ROW_USERNAME_SIZE]) {
-        if self._type != RowType::Leaf {
-            panic!("set_username() called on a non-leaf row")
-        }
-        self.write_bytes(username, ROW_USERNAME, ROW_USERNAME_SIZE);
-    }
-
-    /// Set row email value
-    ///
-    /// # Panics
-    ///
-    /// This function panics if called by a non-leaf row
-    pub fn set_email(&mut self, email: &[u8; ROW_EMAIL_SIZE]) {
+    pub fn set_value(&mut self, value: &[u8]) {
         if self._type != RowType::Leaf {
             panic!("set_email() called on a non-leaf row")
         }
-        self.write_bytes(email, ROW_EMAIL, ROW_EMAIL_SIZE);
+        let len = value.len();
+        self.inner.resize(BASE_LEAF_ROW_SIZE + len, 0);
+        self.value_len = Some(len);
+        self.write_usize(ROW_VALUE_LEN, len);
+        self.write_bytes(value, ROW_VALUE, value.len());
     }
 
     /// Set row left offset value
@@ -224,6 +214,9 @@ impl Row {
     }
 
     fn read_bytes(&self, pos: usize, len: usize) -> Vec<u8> {
+        if len == 0 {
+            return vec![];
+        }
         self.inner[pos..pos + len].to_vec()
     }
 }
@@ -301,16 +294,12 @@ impl TryFrom<&[u8]> for Row {
                 row.set_right_offset(right);
             }
             RowType::Leaf => {
-                row.set_username(
-                    value[ROW_USERNAME..ROW_USERNAME + ROW_USERNAME_SIZE]
+                let len = usize::from_ne_bytes(
+                    value[ROW_VALUE_LEN..ROW_VALUE_LEN + ROW_VALUE_LEN_SIZE]
                         .try_into()
-                        .expect("should be same size"),
+                        .expect("should be expected size"),
                 );
-                row.set_email(
-                    value[ROW_EMAIL..ROW_EMAIL + ROW_EMAIL_SIZE]
-                        .try_into()
-                        .expect("should be same size"),
-                );
+                row.set_value(&value[ROW_VALUE..ROW_VALUE + len]);
             }
         }
 
@@ -320,8 +309,6 @@ impl TryFrom<&[u8]> for Row {
 
 #[cfg(test)]
 mod tests {
-    use crate::utilities::{char_to_byte, extend_char_array};
-
     use super::*;
 
     #[test]
@@ -337,7 +324,7 @@ mod tests {
         let row = Row::new(0, RowType::Leaf);
         let bytes = row.as_bytes();
 
-        assert_eq!(bytes.len(), LEAF_ROW_SIZE);
+        assert_eq!(bytes.len(), BASE_LEAF_ROW_SIZE);
     }
 
     #[test]
@@ -362,26 +349,10 @@ mod tests {
     }
 
     #[test]
-    fn set_username() {
+    fn set_value() {
         let mut row = Row::new(0, RowType::Leaf);
-        let expected = char_to_byte(
-            extend_char_array::<USERNAME_MAX_LENGTH>(vec!['a'], '\0')
-                .unwrap()
-                .as_ref(),
-        );
-        row.set_username(expected[..].try_into().unwrap());
-        assert_eq!(row.username(), expected)
-    }
-
-    #[test]
-    fn set_email() {
-        let mut row = Row::new(0, RowType::Leaf);
-        let expected = char_to_byte(
-            extend_char_array::<EMAIL_MAX_LENGTH>(vec!['a'], '\0')
-                .unwrap()
-                .as_ref(),
-        );
-        row.set_email(expected[..].try_into().unwrap());
-        assert_eq!(row.email(), expected)
+        let expected: Vec<u8> = vec![0, 1, 1, 0, 0, 1, 2, 9];
+        row.set_value(expected.as_slice());
+        assert_eq!(row.value(), expected)
     }
 }

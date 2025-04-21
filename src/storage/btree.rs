@@ -44,8 +44,8 @@ use log::{debug, error, trace};
 
 use crate::{
     Command, Statement,
+    statement::print_row,
     storage::{EngineAction, PageError, row::RowType},
-    utilities::{byte_to_char, char_to_byte},
 };
 
 use super::{
@@ -65,21 +65,6 @@ pub struct BTree {
     pager: Pager,
     /// ID of the current root page.
     root: usize,
-}
-
-pub fn print_row(row: &Row) -> String {
-    let username = byte_to_char(&row.username())
-        .expect("failed to read row bytes")
-        .iter()
-        .filter(|c| **c != '\0')
-        .collect::<String>();
-    let email = byte_to_char(&row.email())
-        .expect("failed to read row bytes")
-        .iter()
-        .filter(|c| **c != '\0')
-        .collect::<String>();
-
-    format!("{},{username},{email}", row.id())
 }
 
 impl StorageEngine for BTree {
@@ -107,34 +92,18 @@ impl StorageEngine for BTree {
 
     fn evaluate_statement(&mut self, statement: Statement) -> Result<Option<String>, StorageError> {
         match statement {
-            Statement::Insert {
-                id,
-                username,
-                email,
-            } => {
-                let mut row = Row::new(id, RowType::Leaf);
-                let username = char_to_byte(&username);
-                let email = char_to_byte(email.as_ref());
-                row.set_username(username[..].try_into().expect("should be expected size"));
-                row.set_email(email[..].try_into().expect("should be expected size"));
+            Statement::Insert { .. } => {
+                let row: Row = statement.into();
                 self.insert(row)?;
                 Ok(None)
             }
-            Statement::Update {
-                id,
-                username,
-                email,
-            } => {
-                let mut row = Row::new(id, RowType::Leaf);
-                let username = char_to_byte(&username);
-                let email = char_to_byte(email.as_ref());
-                row.set_username(username[..].try_into().expect("should be expected size"));
-                row.set_email(email[..].try_into().expect("should be expected size"));
-                let row = self.update(row)?;
+            Statement::Update { .. } => {
+                let mut row: Row = statement.into();
+                row = self.update(row)?;
                 Ok(Some(print_row(&row)))
             }
-            Statement::Delete { id } => {
-                let row = Row::new(id, RowType::Leaf);
+            Statement::Delete { .. } => {
+                let row = statement.into();
                 self.delete(row)?;
                 Ok(None)
             }
@@ -616,10 +585,7 @@ impl BTree {
 mod tests {
     use tempdir::TempDir;
 
-    use crate::{
-        storage::row::{ROW_USERNAME_SIZE, RowType},
-        utilities::{USERNAME_MAX_LENGTH, char_to_byte, extend_char_array},
-    };
+    use crate::{storage::row::RowType, utilities::char_to_byte};
 
     use super::*;
 
@@ -804,21 +770,12 @@ mod tests {
         let mut row = Row::new(1, RowType::Leaf);
         tree.insert(row.clone()).unwrap();
 
-        let username = vec!['t', 'e', 's', 't'];
-        row.set_username(
-            char_to_byte(
-                extend_char_array::<USERNAME_MAX_LENGTH>(username, '\0')
-                    .unwrap()
-                    .as_ref(),
-            )
-            .as_slice()
-            .try_into()
-            .unwrap(),
-        );
+        let username = char_to_byte(vec!['t', 'e', 's', 't'].as_ref());
+        row.set_value(&username);
         let old = tree.update(row.clone()).unwrap();
 
         assert_eq!(tree.select().unwrap(), vec![row]);
-        assert_eq!(old.username(), vec![0; ROW_USERNAME_SIZE]);
+        assert_eq!(old.value(), vec![]);
     }
 
     #[test]

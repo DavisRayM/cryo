@@ -41,18 +41,4 @@ pub(crate) mod utilities {
 
         out
     }
-
-    /// Extends a character array filling till desired length is met.
-    ///
-    pub fn extend_char_array<const N: usize>(
-        mut src: Vec<char>,
-        fill: char,
-    ) -> Result<[char; N], Box<dyn Error>> {
-        if src.len() > N {
-            return Err("source character array is larger than size".into());
-        }
-
-        src.resize(N, fill);
-        Ok(src.try_into().expect("should be correct length"))
-    }
 }
