@@ -19,8 +19,8 @@
 //! - A **right** offset: usize
 //!
 //! And, leaf rows consists of:
-//! - A **username**: [char; USERNAME_MAX_LENGTH]
-//! - An **email**: [char; EMAIL_MAX_LENGTH]
+//! - A **value_len**: usize
+//! - A **value**: [u8]
 //!
 //! On disk, internal rows are written as:
 //!
@@ -30,7 +30,7 @@
 //!
 //! While leaf nodes are written as:
 //! ```text
-//! [id: u64][username_bytes][email_bytes]
+//! [id: u64][value_len: u64][value: [u8]]
 //! ```
 //!
 //! # See Also
