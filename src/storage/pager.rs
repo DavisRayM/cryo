@@ -50,13 +50,31 @@ use std::{
 
 use super::{
     PagerError, StorageError,
-    page::{PAGE_SIZE, Page},
+    page::{PAGE_SIZE, Page, PageType},
 };
+
+const ROOT_PAGE_SIZE: usize = size_of::<usize>();
+const NUM_PAGES_SIZE: usize = size_of::<usize>();
+const FREE_PAGES_LEN_SIZE: usize = size_of::<usize>();
+const METADATA_HEADER_SIZE: usize = ROOT_PAGE_SIZE + NUM_PAGES_SIZE + FREE_PAGES_LEN_SIZE;
+const FREE_PAGE_SIZE: usize = size_of::<usize>();
+
+const ROOT_PAGE: usize = 0;
+const FREE_PAGES_LEN: usize = ROOT_PAGE + ROOT_PAGE_SIZE;
+const NUM_PAGES: usize = FREE_PAGES_LEN + FREE_PAGES_LEN_SIZE;
+
+const METADATA_PAGE_ID: usize = 0;
+
+#[derive(Debug, Default)]
+pub struct PagerMetadata {
+    pub free_pages: Vec<usize>,
+    pub pages: usize,
+    pub root: usize,
+}
 
 #[derive(Debug)]
 pub struct Pager {
-    free_pages: Vec<usize>,
-    pub pages: usize,
+    metadata: PagerMetadata,
     reader: BufReader<File>,
     writer: BufWriter<File>,
 }
@@ -73,33 +91,68 @@ impl Pager {
             .map_err(|e| StorageError::Pager {
                 cause: PagerError::Io(e),
             })?;
+
         let metadata = f.metadata().map_err(|e| StorageError::Pager {
             cause: PagerError::Io(e),
         })?;
-
         let reader = BufReader::new(f.try_clone().map_err(|e| StorageError::Pager {
             cause: PagerError::Io(e),
         })?);
         let writer = BufWriter::new(f);
-        let pages = metadata.len() as usize / PAGE_SIZE;
 
-        Ok(Self {
-            free_pages: vec![],
-            pages,
+        let mut pager = Self {
+            metadata: PagerMetadata::default(),
             reader,
             writer,
-        })
+        };
+
+        if metadata.len() > 0 {
+            pager.read_metadata()?;
+        } else {
+            pager.write_metadata()?;
+        }
+
+        Ok(pager)
+    }
+
+    fn read_metadata(&mut self) -> Result<(), StorageError> {
+        let mut buf: [u8; PAGE_SIZE] = [0; PAGE_SIZE];
+        self.read_bytes(METADATA_PAGE_ID * PAGE_SIZE, &mut buf)?;
+        self.metadata = buf.into();
+        Ok(())
+    }
+
+    fn write_metadata(&mut self) -> Result<(), StorageError> {
+        if self.metadata.pages == 0 {
+            self.allocate()?;
+            self.metadata.root = self.allocate()?;
+            let mut page = Page::new(PageType::Leaf, None, vec![], 0);
+            self.write(self.metadata.root, &mut page)?;
+        }
+        let buf: [u8; PAGE_SIZE] = (&self.metadata).into();
+        self.write_bytes(METADATA_PAGE_ID * PAGE_SIZE, &buf)?;
+        Ok(())
+    }
+
+    /// Returns the root page
+    pub fn root(&self) -> usize {
+        self.metadata.root
+    }
+
+    pub fn set_root(&mut self, root: usize) -> Result<(), StorageError> {
+        self.metadata.root = root;
+        self.write_metadata()
     }
 
     /// Allocates space for a new page on disk. Returns the page id
     /// for the allocated page.
     ///
     pub fn allocate(&mut self) -> Result<usize, StorageError> {
-        if let Some(id) = self.free_pages.pop() {
+        if let Some(id) = self.metadata.free_pages.pop() {
             return Ok(id);
         }
 
-        let id = self.pages;
+        let id = self.metadata.pages;
         let offset = id * PAGE_SIZE;
 
         let buf = [0; PAGE_SIZE];
@@ -117,7 +170,7 @@ impl Pager {
         self.writer.flush().map_err(|e| StorageError::Pager {
             cause: PagerError::Io(e),
         })?;
-        self.pages += 1;
+        self.metadata.pages += 1;
 
         Ok(id)
     }
@@ -126,13 +179,13 @@ impl Pager {
     /// space back to the allocation pool.
     ///
     pub fn free(&mut self, id: usize) -> Result<(), StorageError> {
-        if id >= self.pages {
+        if id >= self.metadata.pages {
             panic!("out of bounds");
         }
 
         let offset = id * PAGE_SIZE;
         let buf: [u8; PAGE_SIZE] = [0; PAGE_SIZE];
-        self.free_pages.push(id);
+        self.metadata.free_pages.push(id);
         self.write_bytes(offset, &buf)
     }
 
@@ -142,23 +195,13 @@ impl Pager {
     ///
     /// This function panics if `id` is greater than or equal to `self.pages`.
     pub fn read(&mut self, id: usize) -> Result<Page, StorageError> {
-        if id >= self.pages {
+        if id >= self.metadata.pages {
             panic!("out of bounds");
         }
 
         let offset = id * PAGE_SIZE;
         let mut buf = [0; PAGE_SIZE];
-        self.reader
-            .seek(SeekFrom::Start(offset as u64))
-            .map_err(|e| StorageError::Pager {
-                cause: PagerError::Io(e),
-            })?;
-        self.reader
-            .read_exact(&mut buf)
-            .map_err(|e| StorageError::Pager {
-                cause: PagerError::Io(e),
-            })?;
-
+        self.read_bytes(offset, &mut buf)?;
         let mut page: Page = buf.try_into()?;
         page.offset = offset;
         Ok(page)
@@ -171,7 +214,7 @@ impl Pager {
     ///
     /// This function errors if the `page` value is greater than or equal to `self.pages`
     pub fn write(&mut self, id: usize, page: &mut Page) -> Result<(), StorageError> {
-        if id >= self.pages {
+        if id >= self.metadata.pages {
             panic!("out of bounds");
         }
 
@@ -179,6 +222,21 @@ impl Pager {
         page.offset = offset;
         let buf: [u8; PAGE_SIZE] = page.as_bytes();
         self.write_bytes(offset, &buf)
+    }
+
+    fn read_bytes(&mut self, offset: usize, buf: &mut [u8]) -> Result<(), StorageError> {
+        self.reader
+            .seek(SeekFrom::Start(offset as u64))
+            .map_err(|e| StorageError::Pager {
+                cause: PagerError::Io(e),
+            })?;
+        self.reader
+            .read_exact(buf)
+            .map_err(|e| StorageError::Pager {
+                cause: PagerError::Io(e),
+            })?;
+
+        Ok(())
     }
 
     fn write_bytes(&mut self, offset: usize, bytes: &[u8; PAGE_SIZE]) -> Result<(), StorageError> {
@@ -200,6 +258,66 @@ impl Pager {
     }
 }
 
+impl From<&PagerMetadata> for [u8; PAGE_SIZE] {
+    fn from(value: &PagerMetadata) -> Self {
+        let mut out = [0; PAGE_SIZE];
+
+        out[ROOT_PAGE..ROOT_PAGE + ROOT_PAGE_SIZE]
+            .clone_from_slice(value.root.to_ne_bytes().as_ref());
+        out[FREE_PAGES_LEN..FREE_PAGES_LEN + FREE_PAGES_LEN_SIZE]
+            .clone_from_slice(value.free_pages.len().to_ne_bytes().as_ref());
+        out[NUM_PAGES..NUM_PAGES + NUM_PAGES_SIZE]
+            .clone_from_slice(value.pages.to_ne_bytes().as_ref());
+
+        let mut offset = METADATA_HEADER_SIZE;
+        for free_page in value.free_pages.iter() {
+            out[offset..offset + FREE_PAGE_SIZE].clone_from_slice(free_page.to_ne_bytes().as_ref());
+            offset += FREE_PAGE_SIZE;
+        }
+
+        out
+    }
+}
+
+impl From<[u8; PAGE_SIZE]> for PagerMetadata {
+    fn from(value: [u8; PAGE_SIZE]) -> Self {
+        let root = usize::from_ne_bytes(
+            value[ROOT_PAGE..ROOT_PAGE + ROOT_PAGE_SIZE]
+                .try_into()
+                .expect("should be expected size"),
+        );
+        let free_pages_len = usize::from_ne_bytes(
+            value[FREE_PAGES_LEN..FREE_PAGES_LEN + FREE_PAGES_LEN_SIZE]
+                .try_into()
+                .expect("should be expected size"),
+        );
+        let pages = usize::from_ne_bytes(
+            value[NUM_PAGES..NUM_PAGES + NUM_PAGES_SIZE]
+                .try_into()
+                .expect("should be expected size"),
+        );
+
+        let mut free_pages = Vec::with_capacity(free_pages_len);
+        let mut offset = METADATA_HEADER_SIZE;
+
+        for _ in 0..free_pages_len {
+            let page_id = usize::from_ne_bytes(
+                value[offset..offset + FREE_PAGE_SIZE]
+                    .try_into()
+                    .expect("should be expected size"),
+            );
+            offset += FREE_PAGE_SIZE;
+            free_pages.push(page_id);
+        }
+
+        Self {
+            root,
+            pages,
+            free_pages,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use tempdir::TempDir;
@@ -214,8 +332,8 @@ mod tests {
         let mut pager = Pager::open(temp.into_path().join("cryo.db")).unwrap();
 
         let page_id = pager.allocate().unwrap();
-        assert_eq!(page_id, 0);
-        assert_eq!(pager.pages, 1);
+        assert_eq!(page_id, 2);
+        assert_eq!(pager.metadata.pages, 3);
     }
 
     #[test]

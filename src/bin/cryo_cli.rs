@@ -29,8 +29,8 @@ fn main() -> Result<(), Box<dyn Error>> {
         panic!("'{:?}' is not a directory", cli.path);
     }
     let store = cli.path.join("cryo.db");
-    let pager = Pager::open(store)?;
-    let mut btree = BTree::new(pager)?;
+    let mut pager = Pager::open(store)?;
+    let mut btree = BTree::new(&mut pager);
 
     loop {
         let mut s = String::default();

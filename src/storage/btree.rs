@@ -23,9 +23,14 @@
 //! ```rust
 //! use cryo::storage::btree::BTree;
 //! use cryo::storage::pager::Pager;
+//! use cryo::storage::StorageEngine;
+//! use cryo::{ Command, Statement };
 //!
 //! let mut pager = Pager::open("btree.db".into()).unwrap();
-//! let mut tree = BTree::new(pager);
+//! let mut tree = BTree::new(&mut pager);
+//! let command = Command::Statement(Statement::Select);
+//!
+//! tree.execute(command).unwrap();
 //! ```
 //!
 //! # Future Features
@@ -56,18 +61,16 @@ use super::{
 
 /// Disk-based BTree Implementation
 #[derive(Debug)]
-pub struct BTree {
+pub struct BTree<'a> {
     /// Strores (page_id, pointer_idx) of previously traversed nodes.
     breadcrumbs: Vec<(usize, usize)>,
     /// Tracks the current position of the cursor in the BTree.
     current: usize,
     /// Pager instance used for page management.
-    pager: Pager,
-    /// ID of the current root page.
-    root: usize,
+    pager: &'a mut Pager,
 }
 
-impl StorageEngine for BTree {
+impl StorageEngine for BTree<'_> {
     fn execute(&mut self, command: Command) -> Result<(), StorageError> {
         match command {
             Command::Statement(s) => {
@@ -120,32 +123,19 @@ impl StorageEngine for BTree {
     }
 }
 
-impl BTree {
+impl<'a> BTree<'a> {
     /// Creates a new BTree instance
-    pub fn new(mut pager: Pager) -> Result<Self, StorageError> {
-        let mut root;
-        if pager.pages == 0 {
-            root = pager.allocate()?;
-            let mut page = Page::new(PageType::Leaf, None, vec![], 0);
-            pager.write(root, &mut page)?;
-        } else {
-            root = 0;
-            while let Some(parent) = pager.read(root)?.parent {
-                root = parent;
-            }
-        }
-
-        Ok(Self {
+    pub fn new(pager: &'a mut Pager) -> Self {
+        Self {
             breadcrumbs: vec![],
-            current: root,
+            current: pager.root(),
             pager,
-            root,
-        })
+        }
     }
 
     /// Returns the structure of the BTree in Graphviz DOT language
     pub fn structure(&mut self) -> Result<String, StorageError> {
-        let mut queue = VecDeque::from([self.root]);
+        let mut queue = VecDeque::from([self.pager.root()]);
         let mut out = "digraph {\n".to_string();
         let mut visited = Vec::new();
 
@@ -181,7 +171,7 @@ impl BTree {
 
     /// Selects all leaf rows present in the BTree.
     pub fn select(&mut self) -> Result<Vec<Row>, StorageError> {
-        let mut queue = VecDeque::from([self.root]);
+        let mut queue = VecDeque::from([self.pager.root()]);
         let mut out = Vec::new();
         let mut visited = Vec::new();
 
@@ -219,7 +209,7 @@ impl BTree {
         self.pager.write(self.current, &mut page)?;
 
         // Only merge child nodes
-        if self.current != self.root {
+        if self.current != self.pager.root() {
             self.attempt_merge()?;
         }
 
@@ -283,7 +273,7 @@ impl BTree {
     ///
     /// NOTE: Path taken by the BTree can be tracked using `self.breadcrumbs`
     fn locate_row(&mut self, row: &Row) -> Result<(), StorageError> {
-        self.current = self.root;
+        self.current = self.pager.root();
         self.breadcrumbs.clear();
 
         debug!("searching for position of row {}", row.id(),);
@@ -457,8 +447,8 @@ impl BTree {
         self.pager.write(parent_id, &mut parent)?;
 
         // Propagate merge upwards
-        if parent.size == 0 && parent_id == self.root {
-            self.root = successor_id;
+        if parent.size == 0 && parent_id == self.pager.root() {
+            self.pager.set_root(successor_id)?;
             self.current = successor_id;
             Ok(())
         } else {
@@ -470,7 +460,7 @@ impl BTree {
     /// Splits the BTree node at `self.current` and inserts a row
     /// into the appropriate node after split.
     fn split(&mut self, row: Row) -> Result<(), StorageError> {
-        if self.current == self.root {
+        if self.current == self.pager.root() {
             // Create new root internal node page
             let parent_id = self.pager.allocate()?;
             let mut current = self.pager.read(self.current)?;
@@ -483,7 +473,7 @@ impl BTree {
 
             self.pager.write(parent_id, &mut parent)?;
 
-            self.root = parent_id;
+            self.pager.set_root(parent_id)?;
             self.current = parent_id;
             Ok(())
         } else if let Some(parent_id) = self.pager.read(self.current)?.parent {
@@ -592,10 +582,10 @@ mod tests {
     #[test]
     fn btree_new_empty() {
         let temp = TempDir::new("BTreeConstruction").unwrap();
-        let pager = Pager::open(temp.into_path().join("cryo.db")).unwrap();
-        let tree = BTree::new(pager).unwrap();
+        let mut pager = Pager::open(temp.into_path().join("cryo.db")).unwrap();
+        let tree = BTree::new(&mut pager);
 
-        assert_eq!(tree.root, 0);
+        assert_eq!(tree.current, 1);
     }
 
     #[test]
@@ -613,16 +603,17 @@ mod tests {
         pager.write(right, &mut page).unwrap();
         page = Page::new(PageType::Internal, None, vec![], 0);
         pager.write(root, &mut page).unwrap();
+        pager.set_root(root).unwrap();
 
-        let tree = BTree::new(pager).unwrap();
-        assert_eq!(tree.root, root);
+        let tree = BTree::new(&mut pager);
+        assert_eq!(tree.current, root);
     }
 
     #[test]
     fn btree_insert_empty() {
         let temp = TempDir::new("BTreeInsert").unwrap();
-        let pager = Pager::open(temp.into_path().join("cryo.db")).unwrap();
-        let mut tree = BTree::new(pager).unwrap();
+        let mut pager = Pager::open(temp.into_path().join("cryo.db")).unwrap();
+        let mut tree = BTree::new(&mut pager);
 
         let row = Row::new(1, RowType::Leaf);
         tree.insert(row).unwrap();
@@ -648,7 +639,7 @@ mod tests {
         page = Page::new(PageType::Internal, None, vec![row], 0);
         pager.write(root, &mut page).unwrap();
 
-        let mut tree = BTree::new(pager).unwrap();
+        let mut tree = BTree::new(&mut pager);
         let insert = Row::new(1, RowType::Leaf);
         tree.insert(insert).unwrap();
     }
@@ -671,7 +662,7 @@ mod tests {
         let root = pager.allocate().unwrap();
         pager.write(root, &mut page).unwrap();
 
-        let mut tree = BTree::new(pager).unwrap();
+        let mut tree = BTree::new(&mut pager);
         let row = Row::new(1001, RowType::Leaf);
         tree.insert(row).unwrap();
 
@@ -718,7 +709,7 @@ mod tests {
         page = Page::new(PageType::Internal, None, vec![pointer], size);
         pager.write(root, &mut page).unwrap();
 
-        let mut tree = BTree::new(pager).unwrap();
+        let mut tree = BTree::new(&mut pager);
         let row = Row::new(2001, RowType::Leaf);
         tree.insert(row).unwrap();
 
@@ -729,8 +720,8 @@ mod tests {
     #[test]
     fn btree_select() {
         let temp = TempDir::new("BTreeInsert").unwrap();
-        let pager = Pager::open(temp.into_path().join("cryo.db")).unwrap();
-        let mut tree = BTree::new(pager).unwrap();
+        let mut pager = Pager::open(temp.into_path().join("cryo.db")).unwrap();
+        let mut tree = BTree::new(&mut pager);
         let mut expected = Vec::new();
 
         for i in 1..10 {
@@ -745,8 +736,8 @@ mod tests {
     #[test]
     fn btree_ordering() {
         let temp = TempDir::new("BTreeInsert").unwrap();
-        let pager = Pager::open(temp.into_path().join("cryo.db")).unwrap();
-        let mut tree = BTree::new(pager).unwrap();
+        let mut pager = Pager::open(temp.into_path().join("cryo.db")).unwrap();
+        let mut tree = BTree::new(&mut pager);
         let mut expected = VecDeque::new();
 
         for i in 10..0 {
@@ -764,8 +755,8 @@ mod tests {
     #[test]
     fn btree_update() {
         let temp = TempDir::new("BTreeInsert").unwrap();
-        let pager = Pager::open(temp.into_path().join("cryo.db")).unwrap();
-        let mut tree = BTree::new(pager).unwrap();
+        let mut pager = Pager::open(temp.into_path().join("cryo.db")).unwrap();
+        let mut tree = BTree::new(&mut pager);
 
         let mut row = Row::new(1, RowType::Leaf);
         tree.insert(row.clone()).unwrap();
@@ -781,8 +772,8 @@ mod tests {
     #[test]
     fn btree_select_empty() {
         let temp = TempDir::new("BTreeInsert").unwrap();
-        let pager = Pager::open(temp.into_path().join("cryo.db")).unwrap();
-        let mut tree = BTree::new(pager).unwrap();
+        let mut pager = Pager::open(temp.into_path().join("cryo.db")).unwrap();
+        let mut tree = BTree::new(&mut pager);
 
         assert_eq!(tree.select().unwrap(), vec![]);
     }
@@ -790,8 +781,8 @@ mod tests {
     #[test]
     fn btree_delete() {
         let temp = TempDir::new("BTreeInsert").unwrap();
-        let pager = Pager::open(temp.into_path().join("cryo.db")).unwrap();
-        let mut tree = BTree::new(pager).unwrap();
+        let mut pager = Pager::open(temp.into_path().join("cryo.db")).unwrap();
+        let mut tree = BTree::new(&mut pager);
         let row = Row::new(1, RowType::Leaf);
         tree.insert(row.clone()).unwrap();
         tree.delete(row).unwrap();
@@ -818,7 +809,7 @@ mod tests {
         page = Page::new(PageType::Internal, None, vec![row], 0);
         pager.write(root, &mut page).unwrap();
 
-        let mut tree = BTree::new(pager).unwrap();
+        let mut tree = BTree::new(&mut pager);
         let insert = Row::new(1, RowType::Leaf);
         tree.insert(insert).unwrap();
         let insert = Row::new(2, RowType::Leaf);
@@ -830,12 +821,12 @@ mod tests {
     #[test]
     fn btree_structure_single_node() {
         let temp = TempDir::new("BTreeInsert").unwrap();
-        let pager = Pager::open(temp.into_path().join("cryo.db")).unwrap();
-        let mut tree = BTree::new(pager).unwrap();
+        let mut pager = Pager::open(temp.into_path().join("cryo.db")).unwrap();
+        let mut tree = BTree::new(&mut pager);
 
         assert_eq!(
             tree.structure().unwrap(),
-            String::from("digraph {\n    edge [style=\"dashed\"]\n   0 -> 0\n}")
+            String::from("digraph {\n    edge [style=\"dashed\"]\n   1 -> 1\n}")
         );
     }
 
@@ -846,6 +837,7 @@ mod tests {
         let left = pager.allocate().unwrap();
         let right = pager.allocate().unwrap();
         let root = pager.allocate().unwrap();
+        pager.set_root(root).unwrap();
 
         let mut page = Page::new(PageType::Leaf, Some(root), vec![], 0);
         pager.write(left, &mut page).unwrap();
@@ -858,12 +850,12 @@ mod tests {
         page = Page::new(PageType::Internal, None, vec![row], 0);
         pager.write(root, &mut page).unwrap();
 
-        let mut tree = BTree::new(pager).unwrap();
+        let mut tree = BTree::new(&mut pager);
 
         assert_eq!(
             tree.structure().unwrap(),
             String::from(
-                "digraph {\n    2 -> P4;\n    P4 -> 0;\n    P4 -> 1;\n    edge [style=\"dashed\"]\n   0 -> 2\n    edge [style=\"dashed\"]\n   1 -> 2\n}"
+                "digraph {\n    4 -> P4;\n    P4 -> 2;\n    P4 -> 3;\n    edge [style=\"dashed\"]\n   2 -> 4\n    edge [style=\"dashed\"]\n   3 -> 4\n}"
             )
         );
     }
