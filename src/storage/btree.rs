@@ -406,7 +406,7 @@ impl BTree {
             successor.insert(row)?;
         }
         self.pager.write(successor_id, &mut successor)?;
-        // TODO: Free the ancestor page
+        self.pager.free(ancestor_id)?;
 
         let (left_pointer, delete_pointer, right_pointer) =
             if parent_pointer > 0 && parent_pointer + 1 < pointers.len() {
