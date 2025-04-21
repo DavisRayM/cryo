@@ -55,6 +55,7 @@ use super::{
 
 #[derive(Debug)]
 pub struct Pager {
+    free_pages: Vec<usize>,
     pub pages: usize,
     reader: BufReader<File>,
     writer: BufWriter<File>,
@@ -83,6 +84,7 @@ impl Pager {
         let pages = metadata.len() as usize / PAGE_SIZE;
 
         Ok(Self {
+            free_pages: vec![],
             pages,
             reader,
             writer,
@@ -93,6 +95,10 @@ impl Pager {
     /// for the allocated page.
     ///
     pub fn allocate(&mut self) -> Result<usize, StorageError> {
+        if let Some(id) = self.free_pages.pop() {
+            return Ok(id);
+        }
+
         let id = self.pages;
         let offset = id * PAGE_SIZE;
 
@@ -114,6 +120,20 @@ impl Pager {
         self.pages += 1;
 
         Ok(id)
+    }
+
+    /// Frees the space utilized by a page; Returning the used
+    /// space back to the allocation pool.
+    ///
+    pub fn free(&mut self, id: usize) -> Result<(), StorageError> {
+        if id >= self.pages {
+            panic!("out of bounds");
+        }
+
+        let offset = id * PAGE_SIZE;
+        let buf: [u8; PAGE_SIZE] = [0; PAGE_SIZE];
+        self.free_pages.push(id);
+        self.write_bytes(offset, &buf)
     }
 
     /// Read a page present in the configured file.
@@ -158,14 +178,17 @@ impl Pager {
         let offset = id * PAGE_SIZE;
         page.offset = offset;
         let buf: [u8; PAGE_SIZE] = page.as_bytes();
+        self.write_bytes(offset, &buf)
+    }
 
+    fn write_bytes(&mut self, offset: usize, bytes: &[u8; PAGE_SIZE]) -> Result<(), StorageError> {
         self.writer
             .seek(SeekFrom::Start(offset as u64))
             .map_err(|e| StorageError::Pager {
                 cause: PagerError::Io(e),
             })?;
         self.writer
-            .write_all(&buf)
+            .write_all(bytes)
             .map_err(|e| StorageError::Pager {
                 cause: PagerError::Io(e),
             })?;
@@ -223,5 +246,18 @@ mod tests {
         assert_eq!(returned.offset, page.offset);
         assert_eq!(returned._type, page._type);
         assert_eq!(returned.parent, page.parent);
+    }
+
+    #[test]
+    fn pager_free() {
+        let temp = TempDir::new("allocate").unwrap();
+        let mut pager = Pager::open(temp.into_path().join("cryo.db")).unwrap();
+
+        let _ = pager.allocate().unwrap();
+        let free = pager.allocate().unwrap();
+        let _ = pager.allocate().unwrap();
+
+        pager.free(free).unwrap();
+        assert_eq!(free, pager.allocate().unwrap());
     }
 }
