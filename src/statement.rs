@@ -29,6 +29,7 @@
 //!
 //! # See Also
 //! - [`Command`](crate::Command): Higher-level command abstraction used in the CLI layer.
+
 use crate::{
     storage::row::{Row, RowType},
     utilities::*,
@@ -40,14 +41,14 @@ pub enum Statement {
     /// Insert a new row
     Insert {
         id: usize,
-        username: [char; USERNAME_MAX_LENGTH],
-        email: Box<[char; EMAIL_MAX_LENGTH]>,
+        username: Vec<char>,
+        email: Vec<char>,
     },
     /// Update an existing row
     Update {
         id: usize,
-        username: [char; USERNAME_MAX_LENGTH],
-        email: Box<[char; EMAIL_MAX_LENGTH]>,
+        username: Vec<char>,
+        email: Vec<char>,
     },
     /// Select row from storage
     Select,
@@ -55,34 +56,39 @@ pub enum Statement {
     Delete { id: usize },
 }
 
+pub fn print_row(row: &Row) -> String {
+    let value = byte_to_char(row.value().as_ref()).expect("failed to convert bytes to characters");
+    let mut parts = value.split(|c| *c == '\0');
+    let username = parts
+        .next()
+        .map(|v| v.iter().copied().collect::<String>())
+        .unwrap_or(String::default());
+    let email = parts
+        .next()
+        .map(|v| v.iter().copied().collect::<String>())
+        .unwrap_or(String::default());
+
+    format!("{},{username},{email}", row.id())
+}
+
 impl From<Statement> for Row {
     fn from(value: Statement) -> Self {
         match value {
             Statement::Insert {
                 id,
-                username,
+                mut username,
                 email,
             }
             | Statement::Update {
                 id,
-                username,
+                mut username,
                 email,
             } => {
                 let mut row = Row::new(id, RowType::Leaf);
-                let username = char_to_byte(&username);
-                let email = char_to_byte(email.as_ref());
-
-                row.set_username(
-                    username[..]
-                        .try_into()
-                        .expect("statement <-> row username size discrepancy"),
-                );
-                row.set_email(
-                    email[..]
-                        .try_into()
-                        .expect("statement <-> row email size discrepancy"),
-                );
-
+                username.push('\0');
+                let mut value = char_to_byte(&username);
+                value.extend_from_slice(char_to_byte(&email).as_ref());
+                row.set_value(value.as_ref());
                 row
             }
             Statement::Select => Row::new(0, RowType::Leaf),
@@ -97,34 +103,64 @@ mod tests {
 
     #[test]
     fn insert_statement_to_row() {
-        let username = extend_char_array::<USERNAME_MAX_LENGTH>(vec!['a'], '\0').unwrap();
-        let email = extend_char_array::<EMAIL_MAX_LENGTH>(vec!['b'], '\0').unwrap();
+        let username = vec!['a'];
+        let email = vec!['b'];
         let stmt = Statement::Insert {
             id: 1,
-            username,
-            email: Box::new(email),
+            username: username.clone(),
+            email: email.clone(),
         };
 
         let row: Row = stmt.into();
+        let value = row.value();
+        let characters = byte_to_char(value.as_ref()).unwrap();
+        let mut value = characters.split(|c| *c == '\0');
+        let returned_username = value
+            .next()
+            .unwrap()
+            .iter()
+            .map(|c| *c)
+            .collect::<Vec<char>>();
+        let returned_email = value
+            .next()
+            .unwrap()
+            .iter()
+            .map(|c| *c)
+            .collect::<Vec<char>>();
         assert_eq!(row.id(), 1);
-        assert_eq!(row.username(), char_to_byte(&username));
-        assert_eq!(row.email(), char_to_byte(&email));
+        assert_eq!(returned_username, username);
+        assert_eq!(returned_email, email);
     }
 
     #[test]
     fn update_statement_to_row() {
-        let username = extend_char_array::<USERNAME_MAX_LENGTH>(vec!['a'], '\0').unwrap();
-        let email = extend_char_array::<EMAIL_MAX_LENGTH>(vec!['b'], '\0').unwrap();
+        let username = vec!['a'];
+        let email = vec!['b'];
         let stmt = Statement::Update {
             id: 1,
-            username,
-            email: Box::new(email),
+            username: username.clone(),
+            email: email.clone(),
         };
 
         let row: Row = stmt.into();
+        let value = row.value();
+        let characters = byte_to_char(value.as_ref()).unwrap();
+        let mut value = characters.split(|c| *c == '\0');
+        let returned_username = value
+            .next()
+            .unwrap()
+            .iter()
+            .map(|c| *c)
+            .collect::<Vec<char>>();
+        let returned_email = value
+            .next()
+            .unwrap()
+            .iter()
+            .map(|c| *c)
+            .collect::<Vec<char>>();
         assert_eq!(row.id(), 1);
-        assert_eq!(row.username(), char_to_byte(&username));
-        assert_eq!(row.email(), char_to_byte(&email));
+        assert_eq!(returned_username, username);
+        assert_eq!(returned_email, email);
     }
 
     #[test]

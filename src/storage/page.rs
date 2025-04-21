@@ -29,7 +29,7 @@
 
 use super::{
     PageError, Row, StorageError,
-    row::{INTERNAL_ROW_SIZE, LEAF_ROW_SIZE},
+    row::{BASE_LEAF_ROW_SIZE, INTERNAL_ROW_SIZE},
 };
 
 /// Standard page size; 4KB
@@ -110,7 +110,7 @@ impl Page {
 
         self.row_task(row, insert)?;
         self.size += if self._type == PageType::Leaf {
-            LEAF_ROW_SIZE
+            BASE_LEAF_ROW_SIZE
         } else {
             INTERNAL_ROW_SIZE
         };
@@ -162,7 +162,7 @@ impl Page {
 
         self.row_task(row, delete)?;
         self.size -= if self._type == PageType::Leaf {
-            LEAF_ROW_SIZE
+            BASE_LEAF_ROW_SIZE
         } else {
             INTERNAL_ROW_SIZE
         };
@@ -291,7 +291,7 @@ impl TryFrom<[u8; PAGE_SIZE]> for Page {
 mod tests {
     use crate::{
         storage::row::{Row, RowType},
-        utilities::{USERNAME_MAX_LENGTH, char_to_byte, extend_char_array},
+        utilities::char_to_byte,
     };
 
     use super::*;
@@ -327,7 +327,7 @@ mod tests {
         let mut page = Page::new(PageType::Leaf, None, vec![], 0);
         let row = Row::new(1, RowType::Leaf);
         page.insert(row.clone()).unwrap();
-        assert_eq!(page.size, LEAF_ROW_SIZE);
+        assert_eq!(page.size, BASE_LEAF_ROW_SIZE);
         assert_eq!(page.rows, vec![row])
     }
 
@@ -335,28 +335,13 @@ mod tests {
     fn leaf_update_row() {
         let mut page = Page::new(PageType::Leaf, None, vec![], 0);
         let mut row = Row::new(1, RowType::Leaf);
-        let initial = vec!['t', 'e', 's', 't'];
-        row.set_username(
-            char_to_byte(
-                extend_char_array::<USERNAME_MAX_LENGTH>(initial, '\0')
-                    .unwrap()
-                    .as_ref(),
-            )
-            .as_slice()
-            .try_into()
-            .unwrap(),
-        );
+        let initial = char_to_byte(vec!['t', 'e', 's', 't'].as_ref());
+        row.set_value(&initial);
         page.insert(row).unwrap();
 
         let mut row = Row::new(1, RowType::Leaf);
-        let expected = vec!['c', 'h', 'a', 'n', 'g', 'e', 'd'];
-        let expected = char_to_byte(
-            extend_char_array::<USERNAME_MAX_LENGTH>(expected, '\0')
-                .unwrap()
-                .as_ref(),
-        );
-
-        row.set_username(expected.as_slice().try_into().unwrap());
+        let expected = char_to_byte(vec!['c', 'h', 'a', 'n', 'g', 'e', 'd'].as_ref());
+        row.set_value(&expected);
         page.update(row.clone()).unwrap();
         assert_eq!(page.rows, vec![row]);
     }
@@ -364,18 +349,7 @@ mod tests {
     #[test]
     fn leaf_delete_row() {
         let mut page = Page::new(PageType::Leaf, None, vec![], 0);
-        let mut row = Row::new(1, RowType::Leaf);
-        let initial = vec!['t', 'e', 's', 't'];
-        row.set_username(
-            char_to_byte(
-                extend_char_array::<USERNAME_MAX_LENGTH>(initial, '\0')
-                    .unwrap()
-                    .as_ref(),
-            )
-            .as_slice()
-            .try_into()
-            .unwrap(),
-        );
+        let row = Row::new(1, RowType::Leaf);
         page.insert(row).unwrap();
 
         let row = Row::new(1, RowType::Leaf);

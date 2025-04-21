@@ -32,7 +32,7 @@ use thiserror::Error;
 
 use crate::{
     Statement,
-    utilities::{EMAIL_MAX_LENGTH, USERNAME_MAX_LENGTH, extend_char_array},
+    utilities::{EMAIL_MAX_LENGTH, USERNAME_MAX_LENGTH},
 };
 
 /// List of possible error that a command can throw.
@@ -142,29 +142,34 @@ impl TryInto<Command> for &str {
                         ),
                     })?;
 
-                let username =
-                    extend_char_array::<USERNAME_MAX_LENGTH>(parts[2].chars().collect(), '\0')
-                        .map_err(|_| CommandError::InvalidStatement {
-                            reason: format!(
-                                "username should be less than {USERNAME_MAX_LENGTH} characters"
-                            ),
-                        })?;
-                let email = extend_char_array::<EMAIL_MAX_LENGTH>(parts[3].chars().collect(), '\0')
-                    .map_err(|_| CommandError::InvalidStatement {
-                        reason: format!("email should be less than {EMAIL_MAX_LENGTH} characters"),
-                    })?;
+                let username: Vec<char> = parts[2].chars().collect();
+                if username.len() > USERNAME_MAX_LENGTH {
+                    return Err(CommandError::InvalidStatement {
+                        reason: format!(
+                            "username should be less than or equal to {USERNAME_MAX_LENGTH}."
+                        ),
+                    });
+                }
+                let email: Vec<char> = parts[3].chars().collect();
+                if email.len() > EMAIL_MAX_LENGTH {
+                    return Err(CommandError::InvalidStatement {
+                        reason: format!(
+                            "email should be less than or equal to {EMAIL_MAX_LENGTH}."
+                        ),
+                    });
+                }
 
                 let stmt = if parts[0] == "insert" {
                     Statement::Insert {
                         id,
                         username,
-                        email: Box::new(email),
+                        email,
                     }
                 } else {
                     Statement::Update {
                         id,
                         username,
-                        email: Box::new(email),
+                        email,
                     }
                 };
 
