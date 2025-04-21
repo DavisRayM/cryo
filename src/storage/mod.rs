@@ -78,6 +78,8 @@ pub enum EngineAction {
     Split,
     #[error("read")]
     Read,
+    #[error("command execution")]
+    Execute,
 }
 
 /// `StorageEngine` defines the interface through which higher-level components

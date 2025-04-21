@@ -28,6 +28,8 @@
 //!
 //! # See Also
 //! - [`StorageEngine`](crate::storage): Trait that defines the storage engine interface.
+use std::path::PathBuf;
+
 use thiserror::Error;
 
 use crate::{
@@ -67,7 +69,7 @@ pub enum Command {
     Populate(usize),
     /// Requests the storage engine to write out a representation
     /// of it's storage structure.
-    Structure,
+    Structure(Option<PathBuf>),
 }
 
 impl TryInto<Command> for &str {
@@ -76,7 +78,16 @@ impl TryInto<Command> for &str {
     fn try_into(self) -> Result<Command, Self::Error> {
         match self.trim() {
             ".exit" => Ok(Command::Exit),
-            ".structure" => Ok(Command::Structure),
+            s if s.starts_with(".structure") => {
+                let parts = s.split(' ').collect::<Vec<&str>>();
+
+                let path = if parts.len() == 2 {
+                    Some(PathBuf::from(parts[1]))
+                } else {
+                    None
+                };
+                Ok(Command::Structure(path))
+            }
             s if s.starts_with(".populate") => {
                 let parts = s.split(' ').collect::<Vec<&str>>();
                 if parts.len() < 2 {
@@ -188,7 +199,7 @@ mod tests {
     fn command_from_string() {
         let inputs = vec![
             (".exit", Command::Exit),
-            (".structure", Command::Structure),
+            (".structure", Command::Structure(None)),
             (".populate 10", Command::Populate(10)),
             ("select", Command::Statement(Statement::Select)),
         ];

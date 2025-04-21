@@ -43,7 +43,7 @@
 //! - [`Pager`]: Manages disk I/O and caching for pages
 //! - [`StorageEngine`]: Exposes a high-level interface backed by the B-Tree
 
-use std::collections::VecDeque;
+use std::{collections::VecDeque, fs::OpenOptions, io::Write};
 
 use log::{debug, error, trace};
 
@@ -78,8 +78,26 @@ impl StorageEngine for BTree<'_> {
                     println!("{out}")
                 }
             }
-            Command::Structure => {
-                println!("{}", self.structure()?)
+            Command::Structure(path) => {
+                let out = self.structure()?;
+                if let Some(path) = path {
+                    let mut f = OpenOptions::new()
+                        .create(true)
+                        .truncate(true)
+                        .write(true)
+                        .open(path)
+                        .map_err(|e| StorageError::Engine {
+                            action: EngineAction::Execute,
+                            cause: Box::new(e),
+                        })?;
+                    f.write_all(out.as_bytes())
+                        .map_err(|e| StorageError::Engine {
+                            action: EngineAction::Execute,
+                            cause: Box::new(e),
+                        })?;
+                } else {
+                    println!("{out}")
+                }
             }
             Command::Populate(quantity) => {
                 for i in 1..quantity + 1 {
