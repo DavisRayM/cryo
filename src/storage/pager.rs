@@ -48,6 +48,8 @@ use std::{
     path::PathBuf,
 };
 
+use log::trace;
+
 use super::{
     PagerError, StorageError,
     page::{PAGE_SIZE, Page, PageType},
@@ -119,6 +121,7 @@ impl Pager {
         let mut buf: [u8; PAGE_SIZE] = [0; PAGE_SIZE];
         self.read_bytes(METADATA_PAGE_ID * PAGE_SIZE, &mut buf)?;
         self.metadata = buf.into();
+        trace!("pager metadata: {:?}", self.metadata);
         Ok(())
     }
 
@@ -171,6 +174,7 @@ impl Pager {
             cause: PagerError::Io(e),
         })?;
         self.metadata.pages += 1;
+        self.write_metadata()?;
 
         Ok(id)
     }
