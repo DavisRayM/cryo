@@ -13,7 +13,7 @@ use crate::{
     storage::{Row, StorageEngine, btree::BTree, pager::Pager},
 };
 
-use super::{thread::ThreadPool, transport::TransportError};
+use super::{ThreadPool, transport::TransportError};
 
 #[derive(Debug)]
 pub struct StorageServer {
