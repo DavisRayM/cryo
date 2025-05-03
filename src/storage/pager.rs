@@ -30,7 +30,9 @@
 //!
 //! pager.write(page_id, &mut page).unwrap();
 //!
-//! let loaded_page = pager.read(page_id).unwrap();
+//! let handle = pager.read(page_id).unwrap();
+//! let loaded_page = handle.as_ref().lock().unwrap();
+//!
 //! assert_eq!(loaded_page._type, PageType::Leaf);
 //! assert_eq!(loaded_page.offset, page.offset);
 //! ```
@@ -43,9 +45,11 @@
 //! # See Also
 //! - [`Page`]: The fixed-size unit of storage.
 use std::{
+    collections::VecDeque,
     fs::{File, OpenOptions},
     io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write},
     path::PathBuf,
+    sync::{Arc, Mutex},
 };
 
 use log::trace;
@@ -67,6 +71,8 @@ const NUM_PAGES: usize = FREE_PAGES_LEN + FREE_PAGES_LEN_SIZE;
 
 const METADATA_PAGE_ID: usize = 0;
 
+const CACHED_PAGES: usize = 20;
+
 #[derive(Debug, Default)]
 pub struct PagerMetadata {
     pub free_pages: Vec<usize>,
@@ -76,6 +82,7 @@ pub struct PagerMetadata {
 
 #[derive(Debug)]
 pub struct Pager {
+    cache: VecDeque<(usize, Arc<Mutex<Page>>)>,
     metadata: PagerMetadata,
     reader: BufReader<File>,
     writer: BufWriter<File>,
@@ -103,6 +110,7 @@ impl Pager {
         let writer = BufWriter::new(f);
 
         let mut pager = Self {
+            cache: VecDeque::with_capacity(20),
             metadata: PagerMetadata::default(),
             reader,
             writer,
@@ -115,26 +123,6 @@ impl Pager {
         }
 
         Ok(pager)
-    }
-
-    fn read_metadata(&mut self) -> Result<(), StorageError> {
-        let mut buf: [u8; PAGE_SIZE] = [0; PAGE_SIZE];
-        self.read_bytes(METADATA_PAGE_ID * PAGE_SIZE, &mut buf)?;
-        self.metadata = buf.into();
-        trace!("pager metadata: {:?}", self.metadata);
-        Ok(())
-    }
-
-    fn write_metadata(&mut self) -> Result<(), StorageError> {
-        if self.metadata.pages == 0 {
-            self.allocate()?;
-            self.metadata.root = self.allocate()?;
-            let mut page = Page::new(PageType::Leaf, None, vec![], 0);
-            self.write(self.metadata.root, &mut page)?;
-        }
-        let buf: [u8; PAGE_SIZE] = (&self.metadata).into();
-        self.write_bytes(METADATA_PAGE_ID * PAGE_SIZE, &buf)?;
-        Ok(())
     }
 
     /// Returns the root page
@@ -152,27 +140,12 @@ impl Pager {
     ///
     pub fn allocate(&mut self) -> Result<usize, StorageError> {
         if let Some(id) = self.metadata.free_pages.pop() {
+            self.cached_page(id, Some([0_u8; PAGE_SIZE].try_into()?))?;
             return Ok(id);
         }
 
+        self.cached_page(self.metadata.pages, Some([0_u8; PAGE_SIZE].try_into()?))?;
         let id = self.metadata.pages;
-        let offset = id * PAGE_SIZE;
-
-        let buf = [0; PAGE_SIZE];
-
-        self.writer
-            .seek(SeekFrom::Start(offset as u64))
-            .map_err(|e| StorageError::Pager {
-                cause: PagerError::Io(e),
-            })?;
-        self.writer
-            .write_all(&buf)
-            .map_err(|e| StorageError::Pager {
-                cause: PagerError::Io(e),
-            })?;
-        self.writer.flush().map_err(|e| StorageError::Pager {
-            cause: PagerError::Io(e),
-        })?;
         self.metadata.pages += 1;
         self.write_metadata()?;
 
@@ -198,20 +171,19 @@ impl Pager {
     /// # Errors
     ///
     /// This function panics if `id` is greater than or equal to `self.pages`.
-    pub fn read(&mut self, id: usize) -> Result<Page, StorageError> {
+    pub fn read(&mut self, id: usize) -> Result<Arc<Mutex<Page>>, StorageError> {
         if id >= self.metadata.pages {
             panic!("out of bounds");
         }
 
-        let offset = id * PAGE_SIZE;
-        let mut buf = [0; PAGE_SIZE];
-        self.read_bytes(offset, &mut buf)?;
-        let mut page: Page = buf.try_into()?;
-        page.offset = offset;
-        Ok(page)
+        if let Ok(Some(page)) = self.cached_page(id, None) {
+            Ok(page)
+        } else {
+            panic!("page is unreadable")
+        }
     }
 
-    /// Writes a page to the on-disk storage file. Modifies the `page` offset setting
+    /// Writes a page to the on-memory cache. Modifies the `page` offset setting
     /// the correct offset for the page on-disk.
     ///
     /// # Errors
@@ -222,10 +194,38 @@ impl Pager {
             panic!("out of bounds");
         }
 
-        let offset = id * PAGE_SIZE;
-        page.offset = offset;
+        page.offset = id * PAGE_SIZE;
+        self.cached_page(id, Some(page.clone()))?;
+
+        Ok(())
+    }
+
+    /// Attempts to flush the pagers cache buffer
+    ///
+    /// # Panics
+    ///
+    /// If it fails to flush a page to the on disk structure this function panics.
+    pub fn flush(&mut self) {
+        while let Some((id, handle)) = self.cache.pop_back() {
+            eprintln!("flushing page {id} to disk");
+            let inner = Arc::try_unwrap(handle).unwrap().into_inner().unwrap();
+            self.write_page(inner).unwrap();
+        }
+        self.write_metadata().unwrap();
+    }
+
+    fn write_page(&mut self, page: Page) -> Result<(), StorageError> {
         let buf: [u8; PAGE_SIZE] = page.as_bytes();
-        self.write_bytes(offset, &buf)
+        self.write_bytes(page.offset, &buf)
+    }
+
+    fn read_page(&mut self, id: usize) -> Result<Page, StorageError> {
+        let offset = id * PAGE_SIZE;
+        let mut buf = [0; PAGE_SIZE];
+        self.read_bytes(offset, &mut buf)?;
+        let mut page: Page = buf.try_into()?;
+        page.offset = offset;
+        Ok(page)
     }
 
     fn read_bytes(&mut self, offset: usize, buf: &mut [u8]) -> Result<(), StorageError> {
@@ -259,6 +259,59 @@ impl Pager {
         })?;
 
         Ok(())
+    }
+
+    fn read_metadata(&mut self) -> Result<(), StorageError> {
+        let mut buf: [u8; PAGE_SIZE] = [0; PAGE_SIZE];
+        self.read_bytes(METADATA_PAGE_ID * PAGE_SIZE, &mut buf)?;
+        self.metadata = buf.into();
+        trace!("pager metadata: {:?}", self.metadata);
+        Ok(())
+    }
+
+    fn write_metadata(&mut self) -> Result<(), StorageError> {
+        if self.metadata.pages == 0 {
+            self.allocate()?;
+            self.metadata.root = self.allocate()?;
+            let mut page = Page::new(PageType::Leaf, None, vec![], 0);
+            self.write(self.metadata.root, &mut page)?;
+        }
+
+        let buf: [u8; PAGE_SIZE] = (&self.metadata).into();
+        self.write_bytes(METADATA_PAGE_ID * PAGE_SIZE, &buf)?;
+        Ok(())
+    }
+
+    fn cached_page(
+        &mut self,
+        id: usize,
+        page: Option<Page>,
+    ) -> Result<Option<Arc<Mutex<Page>>>, StorageError> {
+        if let Some(pos) = self.cache.iter().position(|(page_id, _)| *page_id == id) {
+            if let Some(page) = page {
+                self.cache[pos] = (id, Arc::new(Mutex::new(page)))
+            }
+            Ok(Some(Arc::clone(&(self.cache[pos].1))))
+        } else {
+            if self.cache.len() >= CACHED_PAGES {
+                self.flush();
+            }
+
+            if let Some(page) = page {
+                self.cache.push_front((id, Arc::new(Mutex::new(page))));
+            } else {
+                let page = self.read_page(id)?;
+                self.cache.push_front((id, Arc::new(Mutex::new(page))));
+            }
+
+            self.cached_page(id, None)
+        }
+    }
+}
+
+impl Drop for Pager {
+    fn drop(&mut self) {
+        self.flush();
     }
 }
 
@@ -341,6 +394,21 @@ mod tests {
     }
 
     #[test]
+    fn pager_flush() {
+        let temp = TempDir::new("allocate").unwrap();
+        let mut pager = Pager::open(temp.path().join("cryo.db")).unwrap();
+
+        pager.allocate().unwrap();
+        let pages = pager.metadata.pages;
+        let root = pager.metadata.root;
+        pager.flush();
+
+        let pager = Pager::open(temp.into_path().join("cryo.db")).unwrap();
+        assert_eq!(pager.metadata.pages, pages);
+        assert_eq!(pager.metadata.root, root);
+    }
+
+    #[test]
     fn pager_write() {
         let temp = TempDir::new("allocate").unwrap();
         let mut pager = Pager::open(temp.into_path().join("cryo.db")).unwrap();
@@ -364,6 +432,7 @@ mod tests {
         pager.write(page_id, &mut page).unwrap();
 
         let returned = pager.read(page_id).unwrap();
+        let returned = returned.as_ref().lock().unwrap();
 
         assert_eq!(returned.offset, page.offset);
         assert_eq!(returned._type, page._type);

@@ -4,6 +4,7 @@ use bincode::{Decode, Encode};
 pub enum Response {
     Ok,
     Pong,
+    StateChanged,
     Query {
         rows: Vec<u8>,
     },

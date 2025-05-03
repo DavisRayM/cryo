@@ -5,6 +5,7 @@ use std::{
     io::{self, BufRead, Write},
     net::{SocketAddr, TcpStream},
     path::PathBuf,
+    process::exit,
     str::FromStr,
 };
 
@@ -36,6 +37,19 @@ fn main() -> Result<(), Box<dyn Error>> {
     let stream = TcpStream::connect(address)?;
     let mut transport = ProtocolTransport::new(stream);
 
+    match transport.write_command(Command::Ping) {
+        Ok(_) => {
+            if transport.read_response()? != Response::Pong {
+                eprintln!("unexpected response from server.");
+                exit(1)
+            }
+        }
+        _ => {
+            eprintln!("failed to establish connection.");
+            exit(1)
+        }
+    }
+
     loop {
         let mut s = String::default();
 
@@ -50,13 +64,13 @@ fn main() -> Result<(), Box<dyn Error>> {
                 if let Command::Structure(out) = cmd.clone() {
                     path = out;
                 }
-                if let Err(e) = transport.write_command(cmd) {
-                    eprintln!("failed to write request: {e}");
-                    continue;
+                if let Err(_) = transport.write_command(cmd) {
+                    eprintln!("broken connection");
+                    break Ok(());
                 }
 
                 match transport.read_response()? {
-                    Response::Ok => {}
+                    Response::Ok | Response::StateChanged => {}
                     Response::Pong => println!("PONG"),
                     Response::Query { mut rows } => {
                         while !rows.is_empty() {

@@ -89,6 +89,22 @@ impl Page {
         self.rows.clone()
     }
 
+    /// Returns the one selected row
+    pub fn select_one(&mut self, row: Row) -> Result<Row, StorageError> {
+        let select_one =
+            |items: &mut Vec<Row>, row: Row| -> Result<(usize, Option<Row>), StorageError> {
+                match items.binary_search(&row) {
+                    Ok(pos) => Ok((pos, Some(items[pos].clone()))),
+                    Err(_) => Err(StorageError::Page {
+                        cause: PageError::MissingKey,
+                    }),
+                }
+            };
+        Ok(self
+            .row_task(row, select_one)?
+            .expect("row should be returned"))
+    }
+
     /// Inserts a new row into the page.
     ///
     /// # Errors
@@ -364,6 +380,14 @@ mod tests {
         let row = Row::new(1, RowType::Internal);
         page.insert(row).unwrap();
         assert_eq!(page.size, INTERNAL_ROW_SIZE);
+    }
+
+    #[test]
+    fn leaf_cell_select_one() {
+        let mut page = Page::new(PageType::Leaf, None, vec![], 0);
+        let row = Row::new(1, RowType::Leaf);
+        page.insert(row.clone()).unwrap();
+        assert_eq!(page.select_one(row.clone()).unwrap(), row);
     }
 
     #[test]

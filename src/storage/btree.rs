@@ -161,7 +161,8 @@ impl<'a> BTree<'a> {
             if visited.contains(&id) {
                 continue;
             }
-            let target = self.pager.read(id)?;
+            let handle = self.pager.read(id)?;
+            let target = handle.as_ref().lock().unwrap();
             visited.push(id);
 
             match target._type {
@@ -198,7 +199,8 @@ impl<'a> BTree<'a> {
                 continue;
             }
 
-            let target = self.pager.read(id)?;
+            let handle = self.pager.read(id)?;
+            let target = handle.as_ref().lock().unwrap();
             visited.push(id);
 
             if target._type == PageType::Leaf {
@@ -222,7 +224,8 @@ impl<'a> BTree<'a> {
     pub fn delete(&mut self, row: Row) -> Result<(), StorageError> {
         self.locate_row(&row)?;
 
-        let mut page = self.pager.read(self.current)?;
+        let handle = self.pager.read(self.current)?;
+        let mut page = handle.as_ref().lock().unwrap();
         page.delete(row)?;
         self.pager.write(self.current, &mut page)?;
 
@@ -243,8 +246,26 @@ impl<'a> BTree<'a> {
         self.locate_row(&row)?;
         debug!("updating row {} in page {}", row.id(), self.current);
 
-        let mut page = self.pager.read(self.current)?;
+        let handle = self.pager.read(self.current)?;
+        let mut page = handle.as_ref().lock().unwrap();
         let out = page.update(row)?;
+
+        self.pager.write(self.current, &mut page)?;
+        Ok(out)
+    }
+
+    /// Get a single row
+    ///
+    /// # Errors
+    ///
+    /// Errors out if the row does not exist in the structure.
+    pub fn select_one(&mut self, row: Row) -> Result<Row, StorageError> {
+        self.locate_row(&row)?;
+        debug!("selecting row {} in page {}", row.id(), self.current);
+
+        let handle = self.pager.read(self.current)?;
+        let mut page = handle.as_ref().lock().unwrap();
+        let out = page.select_one(row)?;
 
         self.pager.write(self.current, &mut page)?;
         Ok(out)
@@ -257,7 +278,8 @@ impl<'a> BTree<'a> {
     /// Errors out if row already exists in the structure.
     pub fn insert(&mut self, row: Row) -> Result<(), StorageError> {
         self.locate_row(&row)?;
-        let mut page = self.pager.read(self.current)?;
+        let handle = self.pager.read(self.current)?;
+        let mut page = handle.as_ref().lock().unwrap();
         debug!("inserting row {} in page {}", row.id(), self.current);
 
         match page.insert(row.clone()) {
@@ -296,7 +318,8 @@ impl<'a> BTree<'a> {
 
         debug!("searching for position of row {}", row.id(),);
         loop {
-            let page = self.pager.read(self.current)?;
+            let handle = self.pager.read(self.current)?;
+            let page = handle.as_ref().lock().unwrap();
 
             if page._type != PageType::Leaf {
                 self.search_internal(row)?;
@@ -314,7 +337,9 @@ impl<'a> BTree<'a> {
     ///
     /// This functions panics if called while `self.current` points to a leaf node
     fn search_internal(&mut self, row: &Row) -> Result<(), StorageError> {
-        let page = self.pager.read(self.current)?;
+        let handle = self.pager.read(self.current)?;
+        let page = handle.as_ref().lock().unwrap();
+
         if page._type == PageType::Leaf {
             error!("attempted to search leaf node {}", self.current);
             panic!("search operation not supported");
@@ -365,12 +390,13 @@ impl<'a> BTree<'a> {
     /// Panics if `self.breadcrumbs is empty`
     fn attempt_merge(&mut self) -> Result<(), StorageError> {
         debug!("checking if page {} can be merged", self.current);
-        let page = self.pager.read(self.current)?;
+        let page_handle = self.pager.read(self.current)?;
+        let page = page_handle.as_ref().lock().unwrap();
         let (parent_id, pointer_pos) = self
             .breadcrumbs
             .pop()
             .expect("breadcrumbs should track traversal path");
-        let pointers = self.pager.read(parent_id)?.select();
+        let pointers = self.pager.read(parent_id)?.lock().unwrap().select();
         let pointer = &pointers[pointer_pos];
 
         let (sucessor, ancestor, sibling) = if pointer.left_offset() == self.current {
@@ -387,7 +413,7 @@ impl<'a> BTree<'a> {
             )
         };
 
-        if page.size + sibling?.size <= ROW_SPACE {
+        if page.size + sibling?.lock().unwrap().size <= ROW_SPACE {
             self.merge(sucessor, ancestor, pointer_pos)?;
         }
 
@@ -403,10 +429,16 @@ impl<'a> BTree<'a> {
         parent_pointer: usize,
     ) -> Result<(), StorageError> {
         debug!("merging page {} into {}", ancestor_id, successor_id);
-        let mut successor = self.pager.read(successor_id)?;
-        let ancestor = self.pager.read(ancestor_id)?;
+        let successor_handle = self.pager.read(successor_id)?;
+        let mut successor = successor_handle.as_ref().lock().unwrap();
+
+        let ancestor_handle = self.pager.read(ancestor_id)?;
+        let ancestor = ancestor_handle.as_ref().lock().unwrap();
+
         let parent_id = successor.parent.expect("merge called on root node");
-        let mut parent = self.pager.read(parent_id)?;
+        let parent_handle = self.pager.read(parent_id)?;
+        let mut parent = parent_handle.as_ref().lock().unwrap();
+
         let mut moved_rows = ancestor.select();
         let mut pointers = parent.select();
 
@@ -481,7 +513,8 @@ impl<'a> BTree<'a> {
         if self.current == self.pager.root() {
             // Create new root internal node page
             let parent_id = self.pager.allocate()?;
-            let mut current = self.pager.read(self.current)?;
+            let current_handle = self.pager.read(self.current)?;
+            let mut current = current_handle.as_ref().lock().unwrap();
             current.parent = Some(parent_id);
             self.pager.write(self.current, &mut current)?;
 
@@ -494,12 +527,14 @@ impl<'a> BTree<'a> {
             self.pager.set_root(parent_id)?;
             self.current = parent_id;
             Ok(())
-        } else if let Some(parent_id) = self.pager.read(self.current)?.parent {
+        } else if let Some(parent_id) = self.pager.read(self.current)?.lock().unwrap().parent {
             // Split child and retrieve internal row pointer to new children
             let pointer = self.split_node(self.current, row)?;
             self.current = parent_id;
 
-            let mut parent = self.pager.read(parent_id)?;
+            let parent_handle = self.pager.read(parent_id)?;
+            let mut parent = parent_handle.as_ref().lock().unwrap();
+
             match parent.insert(pointer.clone()) {
                 Ok(()) => {
                     self.pager.write(parent_id, &mut parent)?;
@@ -528,12 +563,14 @@ impl<'a> BTree<'a> {
     ///
     /// This function panics if the target has no parent pointer
     fn split_node(&mut self, id: usize, insert_row: Row) -> Result<Row, StorageError> {
-        let mut target = self.pager.read(id)?;
+        let target_handle = self.pager.read(id)?;
+        let mut target = target_handle.as_ref().lock().unwrap();
         let is_leaf = target._type == PageType::Leaf;
 
         let parent_id = target.parent.expect("missing parent pointer");
         let right_id = self.pager.allocate()?;
-        let mut parent = self.pager.read(parent_id)?;
+        let parent_handle = self.pager.read(parent_id)?;
+        let mut parent = parent_handle.as_ref().lock().unwrap();
 
         let mut left_candidates = target.select();
         let splitat = left_candidates.len() / 2;
@@ -546,12 +583,14 @@ impl<'a> BTree<'a> {
         if !is_leaf {
             for pointer in right_candidates.iter() {
                 let page_id = pointer.left_offset();
-                let mut page = self.pager.read(page_id)?;
+                let page_handle = self.pager.read(page_id)?;
+                let mut page = page_handle.as_ref().lock().unwrap();
                 page.parent = Some(right_id);
                 self.pager.write(page_id, &mut page)?;
 
                 let page_id = pointer.right_offset();
-                let mut page = self.pager.read(page_id)?;
+                let page_handle = self.pager.read(page_id)?;
+                let mut page = page_handle.as_ref().lock().unwrap();
                 page.parent = Some(right_id);
                 self.pager.write(page_id, &mut page)?;
             }
@@ -567,12 +606,14 @@ impl<'a> BTree<'a> {
             if !is_leaf {
                 // Update the links target page to point to the correct parent
                 let mut page_id = insert_row.left_offset();
-                let mut page = self.pager.read(page_id)?;
+                let page_handle = self.pager.read(page_id)?;
+                let mut page = page_handle.as_ref().lock().unwrap();
                 page.parent = Some(right_id);
                 self.pager.write(page_id, &mut page)?;
 
                 page_id = insert_row.right_offset();
-                page = self.pager.read(page_id)?;
+                let page_handle = self.pager.read(page_id)?;
+                let mut page = page_handle.as_ref().lock().unwrap();
                 page.parent = Some(right_id);
                 self.pager.write(page_id, &mut page)?;
             }
