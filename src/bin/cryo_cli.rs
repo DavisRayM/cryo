@@ -64,13 +64,13 @@ fn main() -> Result<(), Box<dyn Error>> {
                 if let Command::Structure(out) = cmd.clone() {
                     path = out;
                 }
-                if let Err(e) = transport.write_command(cmd) {
+                if let Err(_) = transport.write_command(cmd) {
                     eprintln!("broken connection");
                     break Ok(());
                 }
 
                 match transport.read_response()? {
-                    Response::Ok => {}
+                    Response::Ok | Response::StateChanged => {}
                     Response::Pong => println!("PONG"),
                     Response::Query { mut rows } => {
                         while !rows.is_empty() {

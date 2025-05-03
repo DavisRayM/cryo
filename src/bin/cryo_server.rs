@@ -15,7 +15,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     env_logger::init();
 
     let cli = Cli::parse();
-    let server = StorageServer::new(cli.address, cli.path.join("cryo.db"))?;
+    let server = StorageServer::new(cli.address, cli.path)?;
 
     server.listen()?;
     Ok(())

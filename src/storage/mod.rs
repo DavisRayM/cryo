@@ -27,6 +27,7 @@
 //! # See Also
 //! - [`statement`](crate::statement): Frontend statements that are evaluated by a storage engine.
 pub mod btree;
+pub mod log;
 pub mod page;
 pub mod pager;
 pub mod row;
@@ -41,13 +42,16 @@ pub use row::Row;
 /// List of possible errors that can be thrown by the Storage module
 #[derive(Debug, Error)]
 pub enum StorageError {
-    #[error("page error: {cause}")]
+    #[error("{cause}(page)")]
     Page { cause: PageError },
 
-    #[error("paging error: {cause}")]
+    #[error("{cause}(pager)")]
     Pager { cause: PagerError },
 
-    #[error("engine error during {action}: {cause}")]
+    #[error("{cause}(logger)")]
+    Logger { cause: LoggerError },
+
+    #[error("engine error during {action}:\n    {cause}")]
     Engine {
         action: EngineAction,
         cause: Box<dyn Error>,
@@ -68,6 +72,14 @@ pub enum PageError {
 pub enum PagerError {
     #[error("io error; {0}")]
     Io(#[from] io::Error),
+}
+
+#[derive(Debug, Error)]
+pub enum LoggerError {
+    #[error("io error; {0}")]
+    Io(#[from] io::Error),
+    #[error("serialize error: {0}")]
+    Serialize(#[from] bincode::error::EncodeError),
 }
 
 #[derive(Debug, Error)]

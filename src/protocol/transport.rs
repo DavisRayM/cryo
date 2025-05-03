@@ -6,7 +6,7 @@ use bincode::{
 };
 use thiserror::Error;
 
-use crate::Command;
+use crate::{Command, storage::StorageError};
 
 use super::{Request, Response};
 
@@ -14,10 +14,15 @@ use super::{Request, Response};
 pub enum TransportError {
     #[error("failed to encode message: {0}")]
     Serialize(#[from] bincode::error::EncodeError),
+
     #[error("failed to decode message: {0}")]
     Deserialize(#[from] bincode::error::DecodeError),
+
     #[error("Transport IO Error: {0}")]
     Io(#[from] io::Error),
+
+    #[error("storage operation failed.\n    DETAILS: {0}")]
+    Storage(#[from] StorageError),
 }
 
 pub struct ProtocolTransport<T: Read + Write> {
