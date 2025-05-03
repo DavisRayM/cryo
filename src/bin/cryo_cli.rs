@@ -1,36 +1,40 @@
 use clap::Parser;
 use std::{
     error::Error,
+    fs::OpenOptions,
     io::{self, BufRead, Write},
+    net::{SocketAddr, TcpStream},
     path::PathBuf,
+    str::FromStr,
 };
 
 use cryo::{
     Command,
-    storage::{StorageEngine, btree::BTree, pager::Pager},
+    protocol::{ProtocolTransport, Response},
+    statement::print_row,
+    storage::Row,
 };
 
 #[derive(Parser)]
 #[command(version, about, long_about = None)]
 struct Cli {
-    /// Path to storage directory
-    path: PathBuf,
+    /// Address of the Cryo server.
+    address: Option<SocketAddr>,
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
     // Initialize env_logger; For logging to STDOUT/STDERR
     env_logger::init();
 
-    let cli = Cli::parse();
     let mut stdio = io::stdin().lock();
     let mut stdout = io::stdout().lock();
+    let cli = Cli::parse();
 
-    if !cli.path.is_dir() {
-        panic!("'{:?}' is not a directory", cli.path);
-    }
-    let store = cli.path.join("cryo.db");
-    let mut pager = Pager::open(store)?;
-    let mut btree = BTree::new(&mut pager);
+    let address = cli
+        .address
+        .unwrap_or(SocketAddr::from_str("127.0.0.1:8000")?);
+    let stream = TcpStream::connect(address)?;
+    let mut transport = ProtocolTransport::new(stream);
 
     loop {
         let mut s = String::default();
@@ -41,18 +45,49 @@ fn main() -> Result<(), Box<dyn Error>> {
         stdio.read_line(&mut s)?;
 
         match <&str as TryInto<Command>>::try_into(s.as_str()) {
-            Ok(cmd) => match cmd {
-                c if c == Command::Exit => {
-                    btree.execute(c)?;
-                    break;
+            Ok(cmd) => {
+                let mut path: Option<PathBuf> = None;
+                if let Command::Structure(out) = cmd.clone() {
+                    path = out;
                 }
-                c => {
-                    btree.execute(c)?;
+                if let Err(e) = transport.write_command(cmd) {
+                    eprintln!("failed to write request: {e}");
+                    continue;
                 }
-            },
+
+                match transport.read_response()? {
+                    Response::Ok => {}
+                    Response::Pong => println!("PONG"),
+                    Response::Query { mut rows } => {
+                        while !rows.is_empty() {
+                            let row: Row = rows.as_slice().try_into()?;
+                            rows.drain(0..row.as_bytes().len());
+
+                            println!("{}", print_row(&row))
+                        }
+                    }
+                    Response::Structure { out } => {
+                        if let Some(path) = path {
+                            let mut f = OpenOptions::new()
+                                .create(true)
+                                .truncate(true)
+                                .write(true)
+                                .open(path)?;
+                            f.write_all(out.as_bytes())?;
+                        } else {
+                            println!("Structure:\n{out}");
+                        }
+                    }
+                    Response::Err { code, description } => {
+                        eprintln!("error({code:?}): {description}")
+                    }
+                    Response::ConnectionClosed => {
+                        println!("connection closed");
+                        return Ok(());
+                    }
+                }
+            }
             Err(e) => eprintln!("error: {e}"),
         }
     }
-
-    Ok(())
 }
