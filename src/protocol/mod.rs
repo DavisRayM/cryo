@@ -17,26 +17,9 @@
 //!
 //! # Key Components
 //!
-//! - [`Message`]: Structure representing a message from either a Client or Server.
+//! - [`Request`]: Enum of all possible requests from a Client.
+//! - [`Response`]: Enum of all possible responses from a Server.
 //! - [`ProtocolTransport`]: Abstraction over a bidirectional transport (e.g., TCP, TLS) used to exchange messages.
-//!
-//! # Binary Format
-//!
-//! Protocol messages are serialized with a compact framing format:
-//!
-//! - Each message begins with a fixed-size header, containing the message type and payload length.
-//! - The payload follows, encoded according to message-specific rules (e.g., row sets, error codes).
-//! - All integers are little-endian by default.
-//!
-//! This format allows efficient streaming and multiplexing of messages over a single connection.
-//!
-//! # Extensibility
-//!
-//! The protocol is designed to be versioned and forward-compatible:
-//!
-//! - Message enums are tagged with discriminants for stable wire representation.
-//! - Unknown or unsupported message types can be ignored or handled gracefully.
-//! - Future versions can extend the format while preserving backward compatibility.
 //!
 //! # See Also
 //!
