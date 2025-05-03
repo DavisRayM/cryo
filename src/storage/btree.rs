@@ -105,7 +105,7 @@ impl StorageEngine for BTree<'_> {
                     self.insert(row)?;
                 }
             }
-            Command::Exit => {}
+            Command::Exit | Command::Ping => {}
         }
 
         Ok(())

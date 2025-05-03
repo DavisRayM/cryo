@@ -70,6 +70,8 @@ pub enum Command {
     /// Requests the storage engine to write out a representation
     /// of it's storage structure.
     Structure(Option<PathBuf>),
+    /// Checks if the connect is still open.
+    Ping,
 }
 
 impl TryInto<Command> for &str {
@@ -78,6 +80,7 @@ impl TryInto<Command> for &str {
     fn try_into(self) -> Result<Command, Self::Error> {
         match self.trim() {
             ".exit" => Ok(Command::Exit),
+            ".ping" => Ok(Command::Ping),
             s if s.starts_with(".structure") => {
                 let parts = s.split(' ').collect::<Vec<&str>>();
 

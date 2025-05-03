@@ -1,4 +1,5 @@
 pub mod command;
+pub mod protocol;
 pub mod statement;
 pub mod storage;
 
