@@ -2,7 +2,8 @@ use std::{
     error::Error,
     net::{SocketAddr, TcpListener, TcpStream},
     path::PathBuf,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, mpsc},
+    thread,
 };
 
 use log::{info, warn};
@@ -44,16 +45,42 @@ impl StorageServer {
     pub fn listen(self) -> Result<(), TransportError> {
         info!("listening at {}", self.address);
         let listener = TcpListener::bind(self.address)?;
+        let (sender, receiver) = mpsc::channel();
+        let tx = sender.clone();
 
-        for stream in listener.incoming() {
-            match stream {
-                Ok(stream) => {
-                    let handle = Arc::clone(&self.logger);
+        ctrlc::set_handler(move || {
+            let _ = tx.send(None);
+        })
+        .expect("failed to set Ctrl-C signal handler.");
+
+        let tx = sender.clone();
+        thread::spawn(move || {
+            for stream in listener.incoming() {
+                match stream {
+                    Ok(stream) => {
+                        let _ = tx.send(Some(stream));
+                    }
+                    Err(e) => {
+                        info!("broken listener: {e:?}");
+                        let _ = tx.send(None);
+                        break;
+                    }
+                }
+            }
+        });
+
+        while let Ok(event) = receiver.recv() {
+            match event {
+                Some(stream) => {
+                    let logger = Arc::clone(&self.logger);
                     self.pool.execute(move || {
-                        handle_connection(stream, handle).expect("failed to handle connection")
+                        handle_connection(stream, logger).expect("connection failed")
                     });
                 }
-                Err(e) => warn!("broken connection: {e:?}"),
+                None => {
+                    info!("shutting down server.");
+                    break;
+                }
             }
         }
         Ok(())
