@@ -86,6 +86,7 @@ pub struct Pager {
     metadata: PagerMetadata,
     reader: BufReader<File>,
     writer: BufWriter<File>,
+    cache_size: usize,
 }
 
 impl Pager {
@@ -109,8 +110,10 @@ impl Pager {
         })?);
         let writer = BufWriter::new(f);
 
+        let cache_size = CACHED_PAGES;
         let mut pager = Self {
-            cache: VecDeque::with_capacity(20),
+            cache: VecDeque::with_capacity(cache_size),
+            cache_size,
             metadata: PagerMetadata::default(),
             reader,
             writer,
@@ -123,6 +126,11 @@ impl Pager {
         }
 
         Ok(pager)
+    }
+
+    /// Set how many pages to store in cache.
+    pub fn cache_size(&mut self, size: usize) {
+        self.cache_size = size;
     }
 
     /// Returns the root page
@@ -293,7 +301,7 @@ impl Pager {
             }
             Ok(Some(Arc::clone(&(self.cache[pos].1))))
         } else {
-            if self.cache.len() >= CACHED_PAGES {
+            if self.cache.len() >= self.cache_size {
                 self.flush();
             }
 
