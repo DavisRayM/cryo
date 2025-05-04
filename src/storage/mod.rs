@@ -84,6 +84,8 @@ pub enum LoggerError {
     Io(#[from] io::Error),
     #[error("serialize error: {0}")]
     Serialize(#[from] bincode::error::EncodeError),
+    #[error("deserialize error: {0}")]
+    Deserialize(#[from] bincode::error::DecodeError),
 }
 
 #[derive(Debug, Error)]
