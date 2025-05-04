@@ -33,6 +33,7 @@ impl StorageServer {
     pub fn new(address: SocketAddr, dir: PathBuf) -> Result<Self, Box<dyn Error>> {
         let pager = Pager::open(dir.join(DATABASE_NAME))?;
         let logger = Logger::open(dir.join(WAL_NAME), pager)?;
+
         Ok(Self {
             logger: Arc::new(Mutex::new(logger)),
             address,
@@ -49,8 +50,7 @@ impl StorageServer {
                 Ok(stream) => {
                     let handle = Arc::clone(&self.logger);
                     self.pool.execute(move || {
-                        handle_connection(stream, handle, LogEntry::GlobalCheckpoint)
-                            .expect("failed to handle connection")
+                        handle_connection(stream, handle).expect("failed to handle connection")
                     });
                 }
                 Err(e) => warn!("broken connection: {e:?}"),
@@ -60,18 +60,25 @@ impl StorageServer {
     }
 }
 
-fn handle_connection(
-    stream: TcpStream,
-    logger: Arc<Mutex<Logger>>,
-    checkpoint: LogEntry,
-) -> Result<(), TransportError> {
+impl Drop for StorageServer {
+    fn drop(&mut self) {
+        let logger = Arc::clone(&self.logger);
+        logger
+            .lock()
+            .unwrap()
+            .log(LogEntry::GlobalCheckpoint)
+            .unwrap();
+    }
+}
+
+fn handle_connection(stream: TcpStream, logger: Arc<Mutex<Logger>>) -> Result<(), TransportError> {
     let mut transport = ProtocolTransport::new(stream);
 
     loop {
         let req = transport.read_request()?;
         info!("received request: {req:?}");
 
-        let mut resp = match req {
+        let resp = match req {
             Request::CloseConnection => {
                 transport.write_response(Response::ConnectionClosed)?;
                 return Ok(());
@@ -154,16 +161,6 @@ fn handle_connection(
                 }
             }
         };
-
-        if resp == Response::StateChanged {
-            let mut logger = logger.lock().unwrap();
-            if let Err(err) = logger.log(checkpoint.clone()) {
-                resp = Response::Err {
-                    code: ResponseError::Query,
-                    description: err.to_string(),
-                }
-            }
-        }
 
         transport.write_response(resp)?;
     }
