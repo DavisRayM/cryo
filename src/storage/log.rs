@@ -26,7 +26,6 @@
 //! - [`protocol`](crate::protocol): Client commands that trigger WAL writes.
 
 use std::{
-    collections::VecDeque,
     fs::{File, OpenOptions},
     io::{BufReader, BufWriter, Seek, SeekFrom, Write},
     path::PathBuf,

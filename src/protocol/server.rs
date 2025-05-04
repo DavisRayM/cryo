@@ -6,7 +6,7 @@ use std::{
     thread,
 };
 
-use log::{info, warn};
+use log::info;
 
 use crate::{
     Command,
