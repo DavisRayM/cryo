@@ -30,8 +30,7 @@
 //!
 //! pager.write(page_id, &mut page).unwrap();
 //!
-//! let handle = pager.read(page_id).unwrap();
-//! let loaded_page = handle.as_ref().lock().unwrap();
+//! let loaded_page = pager.read(page_id).unwrap();
 //!
 //! assert_eq!(loaded_page._type, PageType::Leaf);
 //! assert_eq!(loaded_page.offset, page.offset);
@@ -45,7 +44,7 @@
 //! # See Also
 //! - [`Page`]: The fixed-size unit of storage.
 use std::{
-    collections::VecDeque,
+    collections::BTreeMap,
     fs::{File, OpenOptions},
     io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write},
     path::PathBuf,
@@ -71,8 +70,6 @@ const NUM_PAGES: usize = FREE_PAGES_LEN + FREE_PAGES_LEN_SIZE;
 
 const METADATA_PAGE_ID: usize = 0;
 
-const CACHED_PAGES: usize = 20;
-
 #[derive(Debug, Default)]
 pub struct PagerMetadata {
     pub free_pages: Vec<usize>,
@@ -80,272 +77,8 @@ pub struct PagerMetadata {
     pub root: usize,
 }
 
-#[derive(Debug)]
-pub struct Pager {
-    cache: VecDeque<(usize, Arc<Mutex<Page>>)>,
-    metadata: PagerMetadata,
-    reader: BufReader<File>,
-    writer: BufWriter<File>,
-    cache_size: usize,
-}
-
-impl Pager {
-    /// Loads a new pager instance for an on-disk file.
-    pub fn open(path: PathBuf) -> Result<Self, StorageError> {
-        let f = OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .read(true)
-            .write(true)
-            .open(path)
-            .map_err(|e| StorageError::Pager {
-                cause: PagerError::Io(e),
-            })?;
-
-        let metadata = f.metadata().map_err(|e| StorageError::Pager {
-            cause: PagerError::Io(e),
-        })?;
-        let reader = BufReader::new(f.try_clone().map_err(|e| StorageError::Pager {
-            cause: PagerError::Io(e),
-        })?);
-        let writer = BufWriter::new(f);
-
-        let cache_size = CACHED_PAGES;
-        let mut pager = Self {
-            cache: VecDeque::with_capacity(cache_size),
-            cache_size,
-            metadata: PagerMetadata::default(),
-            reader,
-            writer,
-        };
-
-        if metadata.len() > 0 {
-            pager.read_metadata()?;
-        } else {
-            pager.write_metadata()?;
-        }
-
-        Ok(pager)
-    }
-
-    /// Set how many pages to store in cache.
-    pub fn cache_size(&mut self, size: usize) {
-        self.cache_size = size;
-    }
-
-    /// Returns the root page
-    pub fn root(&self) -> usize {
-        self.metadata.root
-    }
-
-    pub fn set_root(&mut self, root: usize) -> Result<(), StorageError> {
-        self.metadata.root = root;
-        self.write_metadata()
-    }
-
-    /// Allocates space for a new page on disk. Returns the page id
-    /// for the allocated page.
-    ///
-    pub fn allocate(&mut self) -> Result<usize, StorageError> {
-        if let Some(id) = self.metadata.free_pages.pop() {
-            self.cached_page(id, Some([0_u8; PAGE_SIZE].try_into()?))?;
-            return Ok(id);
-        }
-
-        self.cached_page(self.metadata.pages, Some([0_u8; PAGE_SIZE].try_into()?))?;
-        let id = self.metadata.pages;
-        self.metadata.pages += 1;
-        self.write_metadata()?;
-
-        Ok(id)
-    }
-
-    /// Frees the space utilized by a page; Returning the used
-    /// space back to the allocation pool.
-    ///
-    pub fn free(&mut self, id: usize) -> Result<(), StorageError> {
-        if id >= self.metadata.pages {
-            panic!("out of bounds");
-        }
-
-        let offset = id * PAGE_SIZE;
-        let buf: [u8; PAGE_SIZE] = [0; PAGE_SIZE];
-        self.metadata.free_pages.push(id);
-        self.write_bytes(offset, &buf)
-    }
-
-    /// Read a page present in the configured file.
-    ///
-    /// # Errors
-    ///
-    /// This function panics if `id` is greater than or equal to `self.pages`.
-    pub fn read(&mut self, id: usize) -> Result<Arc<Mutex<Page>>, StorageError> {
-        if id >= self.metadata.pages {
-            panic!("out of bounds");
-        }
-
-        if let Ok(Some(page)) = self.cached_page(id, None) {
-            Ok(page)
-        } else {
-            panic!("page is unreadable")
-        }
-    }
-
-    /// Writes a page to the on-memory cache. Modifies the `page` offset setting
-    /// the correct offset for the page on-disk.
-    ///
-    /// # Errors
-    ///
-    /// This function errors if the `page` value is greater than or equal to `self.pages`
-    pub fn write(&mut self, id: usize, page: &mut Page) -> Result<(), StorageError> {
-        if id >= self.metadata.pages {
-            panic!("out of bounds");
-        }
-
-        page.offset = id * PAGE_SIZE;
-        self.cached_page(id, Some(page.clone()))?;
-
-        Ok(())
-    }
-
-    /// Attempts to flush the pagers cache buffer
-    ///
-    /// # Panics
-    ///
-    /// If it fails to flush a page to the on disk structure this function panics.
-    pub fn flush(&mut self) {
-        while let Some((id, handle)) = self.cache.pop_back() {
-            eprintln!("flushing page {id} to disk");
-            let inner = Arc::try_unwrap(handle).unwrap().into_inner().unwrap();
-            self.write_page(inner).unwrap();
-        }
-        self.write_metadata().unwrap();
-    }
-
-    fn write_page(&mut self, page: Page) -> Result<(), StorageError> {
-        let buf: [u8; PAGE_SIZE] = page.as_bytes();
-        self.write_bytes(page.offset, &buf)
-    }
-
-    fn read_page(&mut self, id: usize) -> Result<Page, StorageError> {
-        let offset = id * PAGE_SIZE;
-        let mut buf = [0; PAGE_SIZE];
-        self.read_bytes(offset, &mut buf)?;
-        let mut page: Page = buf.try_into()?;
-        page.offset = offset;
-        Ok(page)
-    }
-
-    fn read_bytes(&mut self, offset: usize, buf: &mut [u8]) -> Result<(), StorageError> {
-        self.reader
-            .seek(SeekFrom::Start(offset as u64))
-            .map_err(|e| StorageError::Pager {
-                cause: PagerError::Io(e),
-            })?;
-        self.reader
-            .read_exact(buf)
-            .map_err(|e| StorageError::Pager {
-                cause: PagerError::Io(e),
-            })?;
-
-        Ok(())
-    }
-
-    fn write_bytes(&mut self, offset: usize, bytes: &[u8; PAGE_SIZE]) -> Result<(), StorageError> {
-        self.writer
-            .seek(SeekFrom::Start(offset as u64))
-            .map_err(|e| StorageError::Pager {
-                cause: PagerError::Io(e),
-            })?;
-        self.writer
-            .write_all(bytes)
-            .map_err(|e| StorageError::Pager {
-                cause: PagerError::Io(e),
-            })?;
-        self.writer.flush().map_err(|e| StorageError::Pager {
-            cause: PagerError::Io(e),
-        })?;
-
-        Ok(())
-    }
-
-    fn read_metadata(&mut self) -> Result<(), StorageError> {
-        let mut buf: [u8; PAGE_SIZE] = [0; PAGE_SIZE];
-        self.read_bytes(METADATA_PAGE_ID * PAGE_SIZE, &mut buf)?;
-        self.metadata = buf.into();
-        trace!("pager metadata: {:?}", self.metadata);
-        Ok(())
-    }
-
-    fn write_metadata(&mut self) -> Result<(), StorageError> {
-        if self.metadata.pages == 0 {
-            self.allocate()?;
-            self.metadata.root = self.allocate()?;
-            let mut page = Page::new(PageType::Leaf, None, vec![], 0);
-            self.write(self.metadata.root, &mut page)?;
-        }
-
-        let buf: [u8; PAGE_SIZE] = (&self.metadata).into();
-        self.write_bytes(METADATA_PAGE_ID * PAGE_SIZE, &buf)?;
-        Ok(())
-    }
-
-    fn cached_page(
-        &mut self,
-        id: usize,
-        page: Option<Page>,
-    ) -> Result<Option<Arc<Mutex<Page>>>, StorageError> {
-        if let Some(pos) = self.cache.iter().position(|(page_id, _)| *page_id == id) {
-            if let Some(page) = page {
-                self.cache[pos] = (id, Arc::new(Mutex::new(page)))
-            }
-            Ok(Some(Arc::clone(&(self.cache[pos].1))))
-        } else {
-            if self.cache.len() >= self.cache_size {
-                self.flush();
-            }
-
-            if let Some(page) = page {
-                self.cache.push_front((id, Arc::new(Mutex::new(page))));
-            } else {
-                let page = self.read_page(id)?;
-                self.cache.push_front((id, Arc::new(Mutex::new(page))));
-            }
-
-            self.cached_page(id, None)
-        }
-    }
-}
-
-impl Drop for Pager {
-    fn drop(&mut self) {
-        self.flush();
-    }
-}
-
-impl From<&PagerMetadata> for [u8; PAGE_SIZE] {
-    fn from(value: &PagerMetadata) -> Self {
-        let mut out = [0; PAGE_SIZE];
-
-        out[ROOT_PAGE..ROOT_PAGE + ROOT_PAGE_SIZE]
-            .clone_from_slice(value.root.to_ne_bytes().as_ref());
-        out[FREE_PAGES_LEN..FREE_PAGES_LEN + FREE_PAGES_LEN_SIZE]
-            .clone_from_slice(value.free_pages.len().to_ne_bytes().as_ref());
-        out[NUM_PAGES..NUM_PAGES + NUM_PAGES_SIZE]
-            .clone_from_slice(value.pages.to_ne_bytes().as_ref());
-
-        let mut offset = METADATA_HEADER_SIZE;
-        for free_page in value.free_pages.iter() {
-            out[offset..offset + FREE_PAGE_SIZE].clone_from_slice(free_page.to_ne_bytes().as_ref());
-            offset += FREE_PAGE_SIZE;
-        }
-
-        out
-    }
-}
-
-impl From<[u8; PAGE_SIZE]> for PagerMetadata {
-    fn from(value: [u8; PAGE_SIZE]) -> Self {
+impl PagerMetadata {
+    pub fn from_u8(value: &[u8]) -> Self {
         let root = usize::from_ne_bytes(
             value[ROOT_PAGE..ROOT_PAGE + ROOT_PAGE_SIZE]
                 .try_into()
@@ -380,6 +113,314 @@ impl From<[u8; PAGE_SIZE]> for PagerMetadata {
             pages,
             free_pages,
         }
+    }
+}
+
+#[derive(Debug)]
+pub struct Pager {
+    cache: Option<BTreeMap<usize, Arc<Mutex<Vec<u8>>>>>,
+    /// Whether to automatically commit changes
+    /// to the page. When set to false all state changes
+    /// are temporary.
+    commit: bool,
+    metadata: PagerMetadata,
+    reader: BufReader<File>,
+    writer: BufWriter<File>,
+}
+
+impl Pager {
+    /// Loads a new pager instance for an on-disk file.
+    pub fn open(path: PathBuf) -> Result<Self, StorageError> {
+        let f = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&path)
+            .map_err(|e| StorageError::Pager {
+                cause: PagerError::Io(e),
+            })?;
+
+        let metadata = f.metadata().map_err(|e| StorageError::Pager {
+            cause: PagerError::Io(e),
+        })?;
+
+        let mut pager = Self {
+            cache: Some(BTreeMap::new()),
+            commit: true,
+            metadata: PagerMetadata::default(),
+            reader: BufReader::new(f.try_clone().map_err(|e| StorageError::Pager {
+                cause: PagerError::Io(e),
+            })?),
+            writer: BufWriter::new(f),
+        };
+
+        if metadata.len() > 0 {
+            pager.read_metadata()?;
+        } else {
+            pager.write_metadata()?;
+        }
+
+        Ok(pager)
+    }
+
+    /// Set commit state of the pager
+    pub fn commit(&mut self, commit: bool) {
+        self.commit = commit;
+    }
+
+    /// Returns the root page
+    pub fn root(&self) -> usize {
+        self.metadata.root
+    }
+
+    /// Set the root node of the BTree
+    pub fn set_root(&mut self, root: usize) -> Result<(), StorageError> {
+        self.metadata.root = root;
+        self.write_metadata()
+    }
+
+    /// Allocates space for a new page on disk. Returns the page id
+    /// for the allocated page.
+    ///
+    pub fn allocate(&mut self) -> Result<usize, StorageError> {
+        let id = if let Some(id) = self.metadata.free_pages.pop() {
+            id
+        } else {
+            let id = self.metadata.pages;
+            self.metadata.pages += 1;
+            id
+        };
+
+        self.write_metadata()?;
+        self.stored_bytes(id, Some(vec![0; PAGE_SIZE]))?;
+
+        Ok(id)
+    }
+
+    /// Discards the page; Stops tracking the page and
+    /// adds it to the list of pages that should be reclaimed.
+    ///
+    /// NOTE: Once a page is freed there is no gurantee that the
+    /// state will not be modified.
+    pub fn free(&mut self, id: usize) -> Result<(), StorageError> {
+        self.is_valid(id)?;
+        if let Some(cache) = &mut self.cache {
+            cache.remove(&id);
+        }
+
+        self.metadata.free_pages.push(id);
+        self.write_metadata()
+    }
+
+    /// Reads a page tracked by the pager.
+    ///
+    /// # Error
+    /// This function errors out when accessing invalid IDs or if
+    /// the stored bytes are corrupted.
+    pub fn read(&mut self, id: usize) -> Result<Page, StorageError> {
+        self.is_valid(id)?;
+
+        let bytes = self.stored_bytes(id, None)?;
+        let handle = bytes.as_ref().lock().map_err(|_| StorageError::Pager {
+            cause: PagerError::PoisonedState,
+        })?;
+        let page: Page = handle.as_slice().try_into()?;
+        Ok(page)
+    }
+
+    /// Updates the tracked state of the page.
+    ///
+    /// # Error
+    /// This function errors if the `id` is out of bounds.
+    pub fn write(&mut self, id: usize, page: &mut Page) -> Result<(), StorageError> {
+        self.is_valid(id)?;
+
+        let bytes = page.as_bytes();
+        self.stored_bytes(id, Some(bytes.to_vec()))?;
+        Ok(())
+    }
+
+    /// Writes the entire cache to the on-disk file.
+    ///
+    /// # Panics
+    /// This function panics if it fails to write the entire cache on disk.
+    pub fn flush(&mut self) {
+        if !self.commit {
+            return;
+        }
+
+        if let Some(cache) = self.cache.take() {
+            for (id, bytes) in cache {
+                let offset = id * PAGE_SIZE;
+                let inner = Arc::try_unwrap(bytes).expect("page still in use");
+                let bytes = inner
+                    .into_inner()
+                    .expect("failed to retrieve bytes from mutex");
+                self.write_bytes(
+                    offset,
+                    bytes[..]
+                        .try_into()
+                        .expect("failed to convert to page sized bytes"),
+                )
+                .unwrap();
+            }
+        }
+        self.cache = Some(BTreeMap::new());
+    }
+
+    /// Updates the in-memory representation of the Pager metadata
+    /// structure.
+    ///
+    /// # Panics
+    /// This function panics if the byte representation of the
+    /// metadata structure is corrupted.
+    fn read_metadata(&mut self) -> Result<(), StorageError> {
+        let bytes = self.stored_bytes(METADATA_PAGE_ID, None)?;
+        let handle = bytes.as_ref().lock().map_err(|_| StorageError::Pager {
+            cause: PagerError::PoisonedState,
+        })?;
+        self.metadata = PagerMetadata::from_u8(handle.as_slice());
+
+        trace!("pager metadata: {:?}", self.metadata);
+
+        Ok(())
+    }
+
+    /// Updates the in-memory representation of the Pager
+    /// metadata structure.
+    fn write_metadata(&mut self) -> Result<(), StorageError> {
+        if self.metadata.pages == 0 {
+            self.allocate()?;
+            self.metadata.root = self.allocate()?;
+            let mut page = Page::new(PageType::Leaf, None, vec![], 0);
+            self.write(self.metadata.root, &mut page)?;
+        }
+
+        let buf: [u8; PAGE_SIZE] = (&self.metadata).into();
+        self.stored_bytes(METADATA_PAGE_ID, Some(buf.to_vec()))?;
+        Ok(())
+    }
+
+    fn read_bytes(&mut self, offset: usize, buf: &mut [u8]) -> Result<(), StorageError> {
+        self.reader
+            .seek(SeekFrom::Start(offset as u64))
+            .map_err(|e| StorageError::Pager {
+                cause: PagerError::Io(e),
+            })?;
+
+        self.reader
+            .read_exact(buf)
+            .map_err(|e| StorageError::Pager {
+                cause: PagerError::Io(e),
+            })?;
+
+        Ok(())
+    }
+
+    fn write_bytes(&mut self, offset: usize, bytes: &[u8; PAGE_SIZE]) -> Result<(), StorageError> {
+        self.writer
+            .seek(SeekFrom::Start(offset as u64))
+            .map_err(|e| StorageError::Pager {
+                cause: PagerError::Io(e),
+            })?;
+        self.writer
+            .write_all(bytes)
+            .map_err(|e| StorageError::Pager {
+                cause: PagerError::Io(e),
+            })?;
+        self.writer.flush().map_err(|e| StorageError::Pager {
+            cause: PagerError::Io(e),
+        })?;
+
+        Ok(())
+    }
+
+    /// Ensures the accessed ID is a valid allocated
+    /// page tracked by the Pager.
+    ///
+    /// # Errors
+    /// This function returns a [PagerError::OutOfBounds] if the id
+    /// is not currently being tracked.
+    fn is_valid(&mut self, id: usize) -> Result<(), StorageError> {
+        if id >= self.metadata.pages && !self.metadata.free_pages.contains(&id) {
+            Err(StorageError::Pager {
+                cause: PagerError::OutOfBounds,
+            })
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Retrieves the cached bytes for a particular page. If
+    /// the page is not currently stored in memory it'll be paged
+    /// in.
+    ///
+    /// NOTE: Memory is permanently stored in memory until flush
+    ///       is called.
+    fn stored_bytes(
+        &mut self,
+        id: usize,
+        update: Option<Vec<u8>>,
+    ) -> Result<Arc<Mutex<Vec<u8>>>, StorageError> {
+        if let Some(update) = update {
+            if let Some(cache) = &mut self.cache {
+                cache
+                    .entry(id)
+                    .and_modify(|b| *b = Arc::new(Mutex::new(update.clone())))
+                    .or_insert(Arc::new(Mutex::new(update)));
+            }
+            self.stored_bytes(id, None)
+        } else {
+            let entry = if let Some(cache) = &mut self.cache {
+                cache.get(&id).map(Arc::clone)
+            } else {
+                return Err(StorageError::Pager {
+                    cause: PagerError::PoisonedState,
+                });
+            };
+
+            if let Some(entry) = entry {
+                Ok(entry)
+            } else {
+                let mut buf: [u8; PAGE_SIZE] = [0; PAGE_SIZE];
+                self.read_bytes(id * PAGE_SIZE, &mut buf)?;
+                self.stored_bytes(id, Some(buf.to_vec()))
+            }
+        }
+    }
+}
+
+impl Drop for Pager {
+    fn drop(&mut self) {
+        self.flush();
+    }
+}
+
+impl From<&PagerMetadata> for [u8; PAGE_SIZE] {
+    fn from(value: &PagerMetadata) -> Self {
+        let mut out = [0; PAGE_SIZE];
+
+        out[ROOT_PAGE..ROOT_PAGE + ROOT_PAGE_SIZE]
+            .clone_from_slice(value.root.to_ne_bytes().as_ref());
+        out[FREE_PAGES_LEN..FREE_PAGES_LEN + FREE_PAGES_LEN_SIZE]
+            .clone_from_slice(value.free_pages.len().to_ne_bytes().as_ref());
+        out[NUM_PAGES..NUM_PAGES + NUM_PAGES_SIZE]
+            .clone_from_slice(value.pages.to_ne_bytes().as_ref());
+
+        let mut offset = METADATA_HEADER_SIZE;
+        for free_page in value.free_pages.iter() {
+            out[offset..offset + FREE_PAGE_SIZE].clone_from_slice(free_page.to_ne_bytes().as_ref());
+            offset += FREE_PAGE_SIZE;
+        }
+
+        out
+    }
+}
+
+impl From<[u8; PAGE_SIZE]> for PagerMetadata {
+    fn from(value: [u8; PAGE_SIZE]) -> Self {
+        Self::from_u8(&value)
     }
 }
 
@@ -426,7 +467,7 @@ mod tests {
         let mut page = Page::new(PageType::Internal, None, vec![], 0);
 
         pager.write(page_id, &mut page).unwrap();
-        assert_eq!(page.offset, page_id * PAGE_SIZE);
+        assert_eq!(pager.read(page_id).unwrap(), page);
     }
 
     #[test]
@@ -440,7 +481,6 @@ mod tests {
         pager.write(page_id, &mut page).unwrap();
 
         let returned = pager.read(page_id).unwrap();
-        let returned = returned.as_ref().lock().unwrap();
 
         assert_eq!(returned.offset, page.offset);
         assert_eq!(returned._type, page._type);
@@ -458,5 +498,28 @@ mod tests {
 
         pager.free(free).unwrap();
         assert_eq!(free, pager.allocate().unwrap());
+    }
+
+    #[test]
+    fn pager_commit_false() {
+        let temp = TempDir::new("persistance").unwrap();
+        let mut pager = Pager::open(temp.path().join("cryo.db")).unwrap();
+
+        let pages = pager.metadata.pages;
+        let root = pager.metadata.root;
+
+        pager.commit(false);
+        pager.allocate().unwrap();
+        let new_root = pager.allocate().unwrap();
+        pager.allocate().unwrap();
+        pager.set_root(new_root).unwrap();
+
+        assert!(pager.metadata.pages > pages);
+        assert_ne!(pager.metadata.root, root);
+        drop(pager);
+
+        let pager = Pager::open(temp.path().join("cryo.db")).unwrap();
+        assert_eq!(pages, pager.metadata.pages);
+        assert_eq!(root, pager.metadata.root);
     }
 }

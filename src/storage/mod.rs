@@ -72,6 +72,10 @@ pub enum PageError {
 pub enum PagerError {
     #[error("io error; {0}")]
     Io(#[from] io::Error),
+    #[error("accessed out of bounds memory")]
+    OutOfBounds,
+    #[error("poisoned state")]
+    PoisonedState,
 }
 
 #[derive(Debug, Error)]

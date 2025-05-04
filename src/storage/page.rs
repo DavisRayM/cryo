@@ -65,7 +65,7 @@ pub enum PageType {
 /// Representation of Page
 ///
 /// Pages are the core unit of IO operation in the database.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Page {
     pub _type: PageType,
     pub offset: usize,
