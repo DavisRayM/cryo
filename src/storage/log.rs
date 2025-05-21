@@ -26,9 +26,8 @@
 //! - [`protocol`](crate::protocol): Client commands that trigger WAL writes.
 
 use std::{
-    collections::VecDeque,
     fs::{File, OpenOptions},
-    io::{BufReader, BufWriter, Seek, Write},
+    io::{BufReader, BufWriter, Seek, SeekFrom, Write},
     path::PathBuf,
 };
 
@@ -37,10 +36,13 @@ use bincode::{
     config::{BigEndian, Configuration, Fixint},
     decode_from_reader, encode_into_std_write,
 };
-use log::{info, trace};
+use log::{debug, info, trace};
 
 use super::{LoggerError, Row, StorageError, btree::BTree, pager::Pager};
 
+/// Entry recorded in time for easy recovery; Any state changes
+/// is tracked here and stored before the change is fully
+/// written to the on-disk structure.
 #[derive(Debug, Clone, Encode, Decode, PartialEq, Eq)]
 pub enum LogEntry {
     Insert(Vec<u8>),
@@ -49,55 +51,74 @@ pub enum LogEntry {
     GlobalCheckpoint,
 }
 
+/// Tracks state changes before batch-processing permanent
+/// on-disk writes.
 pub struct Logger {
     config: Configuration<BigEndian, Fixint>,
-    entries: VecDeque<LogEntry>,
+    entries: Vec<(u64, usize)>,
     pager: Pager,
     writer: BufWriter<File>,
+    path: PathBuf,
 }
 
-pub const COMPACTION_THRESHOLD: usize = 100;
-
 impl Logger {
-    pub fn open(path: PathBuf, pager: Pager) -> Result<Self, StorageError> {
+    pub fn open(path: PathBuf, mut pager: Pager) -> Result<Self, StorageError> {
         let log = OpenOptions::new()
             .create(true)
             .read(true)
             .write(true)
             .truncate(false)
-            .open(path)
+            .open(&path)
             .map_err(|e| StorageError::Logger {
                 cause: LoggerError::Io(e),
             })?;
         let config = bincode::config::standard()
             .with_big_endian()
             .with_fixed_int_encoding();
-
         let mut reader = BufReader::new(log);
+        pager.commit(false);
 
-        let mut entries = VecDeque::new();
+        // Apply previous state.
+        let mut btree = BTree::new(&mut pager);
+        let mut entries = Vec::new();
         loop {
+            let offset = reader.stream_position().map_err(|e| StorageError::Logger {
+                cause: LoggerError::Io(e),
+            })?;
             let entry: Result<LogEntry, _> = decode_from_reader(&mut reader, config);
             match entry {
-                Ok(LogEntry::GlobalCheckpoint) => entries.clear(),
-                Ok(log) => entries.push_back(log),
+                Ok(log) => {
+                    let row: Row = match log {
+                        LogEntry::Update(ref bytes)
+                        | LogEntry::Insert(ref bytes)
+                        | LogEntry::Delete(ref bytes) => bytes.as_slice().try_into()?,
+                        LogEntry::GlobalCheckpoint => continue,
+                    };
+                    entries.push((offset, row.id()));
+
+                    match log {
+                        LogEntry::Update(_) => {
+                            btree.update(row)?;
+                        }
+                        LogEntry::Insert(_) => {
+                            btree.insert(row)?;
+                        }
+                        LogEntry::Delete(_) => {
+                            btree.delete(row)?;
+                        }
+                        _ => unreachable!("only row tasks should be handled here"),
+                    };
+                }
                 Err(_) => break,
             }
         }
-        let pos = reader.stream_position().map_err(|e| StorageError::Logger {
-            cause: LoggerError::Io(e),
-        })?;
-        let mut inner = reader.into_inner();
-        inner
-            .seek(std::io::SeekFrom::Start(pos))
-            .map_err(|e| StorageError::Logger {
-                cause: LoggerError::Io(e),
-            })?;
 
+        let inner = reader.into_inner();
         Ok(Self {
             config,
             entries,
             pager,
+            path,
             writer: BufWriter::new(inner),
         })
     }
@@ -106,62 +127,66 @@ impl Logger {
         &mut self.pager
     }
 
+    /// Writes an entry to the Write-Ahead log. If a [LogEntry::GlobalCheckpoint] is
+    /// logged all previous entries are applied permanently and cleared.
     pub fn log(&mut self, entry: LogEntry) -> Result<(), StorageError> {
+        let row: Row = match entry {
+            LogEntry::GlobalCheckpoint => return self.compact(),
+            LogEntry::Update(ref bytes)
+            | LogEntry::Insert(ref bytes)
+            | LogEntry::Delete(ref bytes) => bytes.as_slice().try_into()?,
+        };
+        let id = row.id();
+
+        debug!("attempting to apply entry - {entry:?}");
+        let mut btree = BTree::new(&mut self.pager);
+        match entry {
+            LogEntry::Update(_) => {
+                btree.update(row)?;
+            }
+            LogEntry::Insert(_) => {
+                btree.insert(row)?;
+            }
+            LogEntry::Delete(_) => {
+                btree.delete(row)?;
+            }
+            _ => unreachable!("only row tasks should be handled here"),
+        };
+
         info!("entry logged: {entry:?}");
-        encode_into_std_write(entry.clone(), &mut self.writer, self.config).map_err(|e| {
+        let offset = self
+            .writer
+            .stream_position()
+            .map_err(|e| StorageError::Logger {
+                cause: LoggerError::Io(e),
+            })?;
+        encode_into_std_write(entry, &mut self.writer, self.config).map_err(|e| {
             StorageError::Logger {
                 cause: LoggerError::Serialize(e),
             }
         })?;
-
         self.writer.flush().map_err(|e| StorageError::Logger {
             cause: LoggerError::Io(e),
         })?;
 
-        if entry == LogEntry::GlobalCheckpoint {
-            self.compact(true)?;
-        } else {
-            self.entries.push_back(entry);
-            if self.entries.len() >= COMPACTION_THRESHOLD {
-                return self.log(LogEntry::GlobalCheckpoint);
-            }
-        }
+        self.entries.push((offset, id));
+
         Ok(())
     }
 
-    fn compact(&mut self, clear: bool) -> Result<(), StorageError> {
+    fn compact(&mut self) -> Result<(), StorageError> {
         info!("flushing {} entries", self.entries.len());
         trace!("entries: {:?}", self.entries);
 
-        let mut entries = if clear {
-            let entries = self.entries.clone();
-            self.entries.clear();
-            entries
-        } else {
-            self.entries.clone()
-        };
-
-        while let Some(entry) = entries.pop_front() {
-            let mut btree = BTree::new(&mut self.pager);
-
-            match entry {
-                LogEntry::Insert(items) => {
-                    let row: Row = items.as_slice().try_into()?;
-                    btree.insert(row)?;
-                }
-                LogEntry::Delete(items) => {
-                    let row: Row = items.as_slice().try_into()?;
-                    btree.delete(row)?;
-                }
-                LogEntry::Update(items) => {
-                    let row: Row = items.as_slice().try_into()?;
-                    btree.update(row)?;
-                }
-                LogEntry::GlobalCheckpoint => {}
-            }
-        }
-
+        // Apply in-memory state
+        self.pager.commit(true);
         self.pager.flush();
+        self.pager.commit(false);
+
+        // Clear applied entries
+        // NOTE: This assumes the in-memory entries
+        // have already been applied to the pager.
+        self.entries.clear();
         self.writer.flush().map_err(|e| StorageError::Logger {
             cause: LoggerError::Io(e),
         })?;
@@ -179,8 +204,32 @@ impl Logger {
     }
 
     #[allow(dead_code)]
-    fn list_entries(&mut self) -> Result<Vec<LogEntry>, StorageError> {
-        Ok(self.entries.iter().cloned().collect::<Vec<LogEntry>>())
+    fn list_entries(&self) -> Result<Vec<LogEntry>, StorageError> {
+        let log = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(&self.path)
+            .map_err(|e| StorageError::Logger {
+                cause: LoggerError::Io(e),
+            })?;
+        let mut reader = BufReader::new(log);
+        let mut out = Vec::new();
+
+        for (offset, _) in self.entries.iter() {
+            reader
+                .seek(SeekFrom::Start(*offset))
+                .map_err(|e| StorageError::Logger {
+                    cause: LoggerError::Io(e),
+                })?;
+            let entry: LogEntry =
+                decode_from_reader(&mut reader, self.config).map_err(|e| StorageError::Logger {
+                    cause: LoggerError::Deserialize(e),
+                })?;
+            out.push(entry);
+        }
+        Ok(out)
     }
 }
 
@@ -293,5 +342,25 @@ mod tests {
         let f = File::open(temp.path().join("wal.log")).unwrap();
         let new_len = f.metadata().unwrap().len();
         assert!(new_len < len);
+    }
+
+    #[test]
+    #[should_panic(expected = "Duplicate")]
+    fn logger_pager_state() {
+        let temp = TempDir::new("log").unwrap();
+        let pager = Pager::open(temp.path().join("cryo.db")).unwrap();
+        let mut logger = Logger::open(temp.path().join("wal.log"), pager).unwrap();
+
+        let row = Row::new(10, RowType::Leaf);
+        logger
+            .log(LogEntry::Insert(row.as_bytes().to_vec()))
+            .unwrap();
+        drop(logger);
+
+        let pager = Pager::open(temp.path().join("cryo.db")).unwrap();
+        let mut logger = Logger::open(temp.path().join("wal.log"), pager).unwrap();
+        logger
+            .log(LogEntry::Insert(row.as_bytes().to_vec()))
+            .unwrap();
     }
 }

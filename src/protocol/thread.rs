@@ -69,6 +69,7 @@ impl Worker {
                     }
                     Err(_) => {
                         debug!("worker {id} disconnected!");
+                        break;
                     }
                 }
             }

@@ -72,6 +72,10 @@ pub enum PageError {
 pub enum PagerError {
     #[error("io error; {0}")]
     Io(#[from] io::Error),
+    #[error("accessed out of bounds memory")]
+    OutOfBounds,
+    #[error("poisoned state")]
+    PoisonedState,
 }
 
 #[derive(Debug, Error)]
@@ -80,6 +84,8 @@ pub enum LoggerError {
     Io(#[from] io::Error),
     #[error("serialize error: {0}")]
     Serialize(#[from] bincode::error::EncodeError),
+    #[error("deserialize error: {0}")]
+    Deserialize(#[from] bincode::error::DecodeError),
 }
 
 #[derive(Debug, Error)]

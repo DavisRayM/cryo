@@ -27,6 +27,8 @@
 //! - [`Row`]: Encapsulates record stored within a page.
 //! - [`StorageEngine`](crate::storage::StorageEngine): Issues operations that ultimately read/write to pages.
 
+use log::info;
+
 use super::{
     PageError, Row, StorageError,
     row::{BASE_LEAF_ROW_SIZE, INTERNAL_ROW_SIZE},
@@ -63,7 +65,7 @@ pub enum PageType {
 /// Representation of Page
 ///
 /// Pages are the core unit of IO operation in the database.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Page {
     pub _type: PageType,
     pub offset: usize,
@@ -82,6 +84,38 @@ impl Page {
             rows,
             size,
         }
+    }
+
+    /// Attempts to create a new page from a byte
+    /// array.
+    pub fn from_u8(value: &[u8]) -> Result<Self, StorageError> {
+        let _type: PageType = value[PAGE_TYPE].into();
+        let is_root = value[PAGE_HAS_PARENT] == IS_ROOT;
+        let parent = if is_root {
+            None
+        } else {
+            Some(usize::from_ne_bytes(
+                value[PAGE_PARENT..PAGE_ROWS]
+                    .try_into()
+                    .expect("should be expected byte size"),
+            ))
+        };
+        let num_rows = usize::from_ne_bytes(
+            value[PAGE_ROWS..PAGE_HEADER_SIZE]
+                .try_into()
+                .expect("should be expected byte size"),
+        );
+        info!("Allocating space for {num_rows} rows.");
+        let mut rows = Vec::with_capacity(num_rows);
+        let mut offset = PAGE_HEADER_SIZE;
+
+        for _ in 0..num_rows {
+            let row: Row = (&value[offset..]).try_into()?;
+            offset += row.as_bytes().len();
+            rows.push(row);
+        }
+
+        Ok(Page::new(_type, parent, rows, offset - PAGE_HEADER_SIZE))
     }
 
     /// Select all rows present in the page.
@@ -274,32 +308,15 @@ impl TryFrom<[u8; PAGE_SIZE]> for Page {
     type Error = StorageError;
 
     fn try_from(value: [u8; PAGE_SIZE]) -> Result<Self, Self::Error> {
-        let _type: PageType = value[PAGE_TYPE].into();
-        let is_root = value[PAGE_HAS_PARENT] == IS_ROOT;
-        let parent = if is_root {
-            None
-        } else {
-            Some(usize::from_ne_bytes(
-                value[PAGE_PARENT..PAGE_ROWS]
-                    .try_into()
-                    .expect("should be expected byte size"),
-            ))
-        };
-        let num_rows = usize::from_ne_bytes(
-            value[PAGE_ROWS..PAGE_HEADER_SIZE]
-                .try_into()
-                .expect("should be expected byte size"),
-        );
-        let mut rows = Vec::with_capacity(num_rows);
-        let mut offset = PAGE_HEADER_SIZE;
+        Page::from_u8(&value)
+    }
+}
 
-        for _ in 0..num_rows {
-            let row: Row = (&value[offset..]).try_into()?;
-            offset += row.as_bytes().len();
-            rows.push(row);
-        }
+impl TryFrom<&[u8]> for Page {
+    type Error = StorageError;
 
-        Ok(Page::new(_type, parent, rows, offset - PAGE_HEADER_SIZE))
+    fn try_from(value: &[u8]) -> Result<Self, Self::Error> {
+        Page::from_u8(value)
     }
 }
 
