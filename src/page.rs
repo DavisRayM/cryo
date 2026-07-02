@@ -1,5 +1,7 @@
 use std::ops;
 
+use bitflags::bitflags;
+
 const CHECKSUM_OFFSET: usize = 0;
 const CHECKSUM_SIZE: usize = size_of::<u32>();
 
@@ -70,6 +72,16 @@ macro_rules! field {
 #[derive(Debug, Clone)]
 pub struct Page {
     inner: Box<[u8]>,
+}
+
+bitflags! {
+    /// [`PageFlags`] is a set of all possible flags to a page
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+    pub struct PageFlags: u8 {
+        const IsLeaf = 0x01;
+        const IsRoot = 0x02;
+        const HasOverflow = 0x04;
+    }
 }
 
 impl Page {
