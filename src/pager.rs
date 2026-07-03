@@ -130,6 +130,21 @@ fn create_page(
     page
 }
 
+/// [`FlushGuard`] defines a guarded function that should be run
+/// before a page is committed/flushed into memory. A page is only
+/// allowed to flush onto disk if `before_flush` is successful.
+pub trait FlushGuard: Send + Sync {
+    fn before_flush(&self, page_id: u64, page: &Page) -> io::Result<()>;
+}
+
+pub struct NoopFlushGuard;
+
+impl FlushGuard for NoopFlushGuard {
+    fn before_flush(&self, _page_id: u64, _page: &Page) -> io::Result<()> {
+        Ok(())
+    }
+}
+
 /// Describes how a thread is currently accessing a cached page.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AccessMode {
@@ -148,7 +163,7 @@ pub struct AccessContext {
 }
 
 impl AccessContext {
-    /// No idea... Probably left-over code... FIXME
+    /// No specific access context
     pub const fn anonymous() -> Self {
         Self {
             txn_id: None,
@@ -338,7 +353,6 @@ impl fmt::Debug for CachedPage {
 /// The pager lazily loads pages from the backing store, caches them in memory,
 /// exposes closure-based read and write access, and flushes dirty pages during
 /// eviction or drop.
-#[derive(Debug)]
 pub struct Pager<F>
 where
     F: Read + Write + Seek,
@@ -346,6 +360,7 @@ where
     capacity: usize,
     inner: sync::Mutex<F>,
     page_size: u16,
+    flush_guard: sync::Arc<dyn FlushGuard>,
 
     clock: sync::Mutex<ClockState>,
     pages: sync::RwLock<HashMap<usize, sync::Arc<CachedPage>>>,
@@ -692,6 +707,14 @@ where
                 .dirty
                 .load(Ordering::Acquire)
             {
+                let page_lsn = page.latest_lsn();
+
+                info!(
+                    "page flush requested: page_id={page_id} page_lsn={page_lsn}"
+                );
+                self.flush_guard
+                    .before_flush(page_id as u64, &page)?;
+
                 let mut inner = self
                     .inner
                     .lock()
@@ -709,6 +732,8 @@ where
                 cached_page
                     .dirty
                     .store(false, Ordering::Release);
+
+                info!("page flushed: page_id={page_id} page_lsn={page_lsn}");
             }
 
             drop(page);
@@ -774,13 +799,14 @@ impl Pager<File> {
 
         let mut out = Self {
             capacity,
-            inner: sync::Mutex::new(inner),
-            pages: sync::RwLock::new(HashMap::with_capacity(capacity)),
-            page_size,
             clock: sync::Mutex::new(ClockState {
                 hand: 0,
                 ring: vec![],
             }),
+            flush_guard: sync::Arc::new(NoopFlushGuard),
+            inner: sync::Mutex::new(inner),
+            page_size,
+            pages: sync::RwLock::new(HashMap::with_capacity(capacity)),
         };
         info!("initializing pager with root page:\n\t{root}");
         out.track(ROOT_PAGE_ID, root, created)?;
@@ -870,12 +896,13 @@ mod tests {
 
         Pager {
             capacity: 8,
-            inner: sync::Mutex::new(inner),
-            page_size: DEFAULT_PAGE_SIZE,
             clock: sync::Mutex::new(ClockState {
                 hand: 0,
                 ring: vec![],
             }),
+            flush_guard: sync::Arc::new(NoopFlushGuard),
+            inner: sync::Mutex::new(inner),
+            page_size: DEFAULT_PAGE_SIZE,
             pages: sync::RwLock::new(HashMap::with_capacity(8)),
         }
     }

@@ -2,6 +2,7 @@ use crc::Crc;
 
 pub mod page;
 pub mod pager;
+pub mod recovery;
 
 pub use page::{Page, PageFlags};
 
