@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use clap::Parser;
-use cryo::pager::Pager;
+use cryo::pager::{AccessContext, Pager};
 use env_logger::Env;
 
 #[derive(Parser, Debug, Clone)]
@@ -28,7 +28,7 @@ fn main() {
             start.wait();
 
             pager
-                .mut_page(1, |_| {
+                .mut_page(1, AccessContext::maintenance("main test"), |_| {
                     std::thread::sleep(std::time::Duration::from_millis(250));
                 })
                 .unwrap();

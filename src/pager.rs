@@ -4,7 +4,7 @@ use crate::{
     Page, PageFlags,
     page::{HEADER_SIZE, MAGIC},
 };
-use log::{debug, info, trace};
+use log::{debug, info, trace, warn};
 use std::{
     collections::HashMap,
     fmt,
@@ -137,8 +137,47 @@ pub enum AccessMode {
     Read,
     /// The page is being mutated and will be marked dirty.
     Write,
-    /// The page is being inspected or modified by maintenance code.
-    Maintenance,
+}
+
+/// Describes the context by the which the thread is accessing a cached page
+#[derive(Debug, Clone, Copy)]
+pub struct AccessContext {
+    pub txn_id: Option<u64>,
+    pub lsn: Option<u64>,
+    pub reason: Option<&'static str>,
+}
+
+impl AccessContext {
+    /// No idea... Probably left-over code... FIXME
+    pub const fn anonymous() -> Self {
+        Self {
+            txn_id: None,
+            lsn: None,
+            reason: None,
+        }
+    }
+
+    /// Access [`Page`] as part of a user-initiated transaction.
+    pub const fn txn(
+        txn_id: u64,
+        lsn: Option<u64>,
+        reason: &'static str,
+    ) -> Self {
+        Self {
+            txn_id: Some(txn_id),
+            lsn,
+            reason: Some(reason),
+        }
+    }
+
+    /// Access [`Page`] as part of a maintenance process.
+    pub const fn maintenance(reason: &'static str) -> Self {
+        Self {
+            txn_id: None,
+            lsn: None,
+            reason: Some(reason),
+        }
+    }
 }
 
 /// Records one active access to a cached page.
@@ -147,8 +186,12 @@ pub enum AccessMode {
 /// for eviction safety.
 #[derive(Clone)]
 pub struct PageHandle {
-    pub thread_id: ThreadId,
+    pub lsn: Option<u64>,
     pub mode: AccessMode,
+    pub page_id: usize,
+    pub reason: Option<&'static str>,
+    pub thread_id: ThreadId,
+    pub txn_id: Option<u64>,
 }
 
 impl PageHandle {
@@ -190,7 +233,16 @@ impl PageHandle {
 
 impl fmt::Display for PageHandle {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{:?}(Held by: {:?})", self.mode, self.thread_id)
+        write!(
+            f,
+            "{:?}(page={}, txn={:?}, lsn={:?}, thread={:?}",
+            self.mode, self.page_id, self.txn_id, self.lsn, self.thread_id
+        )?;
+
+        if let Some(reason) = self.reason {
+            write!(f, ", reason={reason}")?;
+        }
+        write!(f, ")")
     }
 }
 
@@ -320,13 +372,13 @@ impl fmt::Display for CacheInfo {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "page {}: dirty={} accessed={} pins={} handles={:?}",
-            self.page_id,
-            self.dirty,
-            self.accessed,
-            self.pin_count,
-            self.handles
-        )
+            "page {}: dirty={} accessed={} pins={} handles=[",
+            self.page_id, self.dirty, self.accessed, self.pin_count,
+        )?;
+        for h in self.handles.iter() {
+            write!(f, "\n\t{}", h)?;
+        }
+        write!(f, "]")
     }
 }
 
@@ -347,14 +399,26 @@ where
     pub fn page<R>(
         &self,
         page_id: usize,
+        ctx: AccessContext,
         f: impl FnOnce(&Page) -> R,
     ) -> io::Result<R> {
+        trace!(
+            "page {page_id} access start: mode={:?} txn={:?} lsn={:?} reason={:?}",
+            AccessMode::Write,
+            ctx.txn_id,
+            ctx.lsn,
+            ctx.reason,
+        );
         let page = self.get_or_load(page_id)?;
         page.pin();
 
         let handle = PageHandle {
-            thread_id: std::thread::current().id(),
+            lsn: ctx.lsn,
             mode: AccessMode::Read,
+            page_id,
+            reason: ctx.reason,
+            thread_id: std::thread::current().id(),
+            txn_id: ctx.txn_id,
         };
         handle.add(&page)?;
 
@@ -372,6 +436,11 @@ where
         };
         handle.remove(&page)?;
         page.unpin();
+        trace!(
+            "page {page_id} access end: mode={:?} txn={:?}",
+            AccessMode::Write,
+            ctx.txn_id,
+        );
 
         Ok(out)
     }
@@ -383,14 +452,32 @@ where
     pub fn mut_page<R>(
         &self,
         page_id: usize,
+        ctx: AccessContext,
         f: impl FnOnce(&mut Page) -> R,
     ) -> io::Result<R> {
+        if ctx.txn_id.is_none() && ctx.reason.is_none() {
+            warn!(
+                "mutating page {page_id} without transaction or maintenance context. You forgot something dingus!"
+            );
+        }
+
+        trace!(
+            "page {page_id} access start: mode={:?} txn={:?} lsn={:?} reason={:?}",
+            AccessMode::Write,
+            ctx.txn_id,
+            ctx.lsn,
+            ctx.reason,
+        );
         let cached = self.get_or_load(page_id)?;
         cached.pin();
 
         let handle = PageHandle {
-            thread_id: std::thread::current().id(),
+            lsn: ctx.lsn,
             mode: AccessMode::Write,
+            page_id,
+            reason: ctx.reason,
+            thread_id: std::thread::current().id(),
+            txn_id: ctx.txn_id,
         };
         handle.add(&cached)?;
 
@@ -413,6 +500,11 @@ where
         };
         handle.remove(&cached)?;
         cached.unpin();
+        trace!(
+            "page {page_id} access end: mode={:?} txn={:?}",
+            AccessMode::Write,
+            ctx.txn_id,
+        );
 
         Ok(out)
     }
@@ -813,7 +905,7 @@ mod tests {
             [(1, 10, b'a'), (2, 20, b'b'), (3, 30, b'c')]
         {
             let (num_keys, marker) = pager
-                .page(id, |page| {
+                .page(id, AccessContext::anonymous(), |page| {
                     (
                         page.num_keys(),
                         page.cell(HEADER_SIZE, HEADER_SIZE + 1)[0],
@@ -839,7 +931,7 @@ mod tests {
         let pager = pager_with_pages([(1, test_page(1, b'a'))]);
 
         let err = pager
-            .page(2, |_| ())
+            .page(2, AccessContext::anonymous(), |_| ())
             .expect_err("missing page should not load");
 
         assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
@@ -851,7 +943,7 @@ mod tests {
         let pager = pager_with_pages([(1, test_page(1, b'a'))]);
 
         let err = pager
-            .page(0, |_| ())
+            .page(0, AccessContext::anonymous(), |_| ())
             .expect_err("page id zero is invalid");
 
         assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
