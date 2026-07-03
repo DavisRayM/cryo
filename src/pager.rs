@@ -544,10 +544,7 @@ where
             })?;
 
         if clock.ring.is_empty() {
-            return Err(io::Error::new(
-                io::ErrorKind::Other,
-                "can not evict from empty cache",
-            ));
+            return Err(io::Error::other("can not evict from empty cache"));
         }
 
         // Traverse through the circular buffer at least twice
@@ -564,7 +561,7 @@ where
 
             let hand = clock.hand;
             let page_id = clock.ring[hand];
-            let Some(cached_page) = pages.get(&page_id).clone() else {
+            let Some(cached_page) = pages.get(&page_id) else {
                 clock.ring.swap_remove(hand);
                 continue;
             };
@@ -609,8 +606,7 @@ where
                     .inner
                     .lock()
                     .map_err(|_e| {
-                        io::Error::new(
-                            io::ErrorKind::Other,
+                        io::Error::other(
                             "failed to acquire lock on pager state",
                         )
                     })?;
@@ -757,7 +753,7 @@ where
     F: Read + Write + Seek,
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "pager contents:\n")?;
+        writeln!(f, "pager contents:")?;
         for i in self.info().iter() {
             write!(f, "\t{i}")?;
         }
