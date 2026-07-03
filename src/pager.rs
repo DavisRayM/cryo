@@ -2,7 +2,7 @@
 //!
 use crate::{
     Page, PageFlags,
-    page::{MAGIC, MAGIC_SIZE, TABLE_HEADER_SIZE},
+    page::{HEADER_SIZE, MAGIC},
 };
 use log::{debug, info, trace};
 use std::{
@@ -57,7 +57,7 @@ fn load_page(
     reader.read_exact(&mut buf)?;
 
     let page = Page::build(buf);
-    if page.cell(size - MAGIC_SIZE, size) != MAGIC.as_bytes() {
+    if page.magic() != MAGIC.as_bytes() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "corrupted data; bytes are not a valid page",
@@ -93,8 +93,7 @@ fn write_page(
 
     let offset = (page_id - 1) * size;
 
-    page.mut_cell(size - MAGIC_SIZE, size)
-        .copy_from_slice(MAGIC.as_bytes());
+    page.set_magic(None);
     page.set_checksum(page.compute_checksum());
     writer.seek(SeekFrom::Start(offset as u64))?;
     writer.write_all(&page[..])?;
@@ -110,7 +109,7 @@ fn write_page(
 fn create_page(
     flags: PageFlags,
     size: u16,
-    free_space_start: u64,
+    free_space_start: u16,
     root: bool,
 ) -> Page {
     info!("creating page of size {size} with {flags:?}");
@@ -123,10 +122,9 @@ fn create_page(
 
     page.set_flags(flags.bits());
     page.set_free_space_start(free_space_start);
-    page.set_free_space_end((size - MAGIC_SIZE as u16) as u64);
-    page.set_free_space(size - free_space_start as u16 - MAGIC_SIZE as u16);
-    page.mut_cell(size as usize - MAGIC_SIZE, size as usize)
-        .copy_from_slice(MAGIC.as_bytes());
+    page.set_free_space_end(size);
+    page.set_free_space(size - free_space_start);
+    page.set_magic(None);
     page.set_checksum(page.compute_checksum());
 
     page
@@ -664,7 +662,7 @@ impl Pager<File> {
             root = create_page(
                 PageFlags::IsRoot | PageFlags::IsLeaf,
                 DEFAULT_PAGE_SIZE,
-                TABLE_HEADER_SIZE as u64,
+                HEADER_SIZE as u16,
                 true,
             );
             created = true;
@@ -794,11 +792,11 @@ mod tests {
         let mut page = create_page(
             PageFlags::IsLeaf,
             DEFAULT_PAGE_SIZE,
-            TABLE_HEADER_SIZE as u64,
+            HEADER_SIZE as u16,
             false,
         );
         page.set_num_keys(num_keys);
-        page.mut_cell(TABLE_HEADER_SIZE, TABLE_HEADER_SIZE + 1)[0] = marker;
+        page.mut_cell(HEADER_SIZE, HEADER_SIZE + 1)[0] = marker;
         page.set_checksum(page.compute_checksum());
         page
     }
@@ -818,7 +816,7 @@ mod tests {
                 .page(id, |page| {
                     (
                         page.num_keys(),
-                        page.cell(TABLE_HEADER_SIZE, TABLE_HEADER_SIZE + 1)[0],
+                        page.cell(HEADER_SIZE, HEADER_SIZE + 1)[0],
                     )
                 })
                 .expect("page exists in backing store");
