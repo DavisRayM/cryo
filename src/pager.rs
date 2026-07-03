@@ -770,7 +770,9 @@ mod tests {
     use super::*;
     use std::io::Cursor;
 
-    fn pager_with_pages(pages: impl IntoIterator<Item = (usize, Page)>) -> Pager<Cursor<Vec<u8>>> {
+    fn pager_with_pages(
+        pages: impl IntoIterator<Item = (usize, Page)>,
+    ) -> Pager<Cursor<Vec<u8>>> {
         let mut inner = Cursor::new(Vec::new());
 
         for (id, mut page) in pages {
@@ -813,13 +815,16 @@ mod tests {
             (3, test_page(30, b'c')),
         ]);
 
-        for (id, expected_keys, expected_marker) in [
-            (1, 10, b'a'),
-            (2, 20, b'b'),
-            (3, 30, b'c'),
-        ] {
+        for (id, expected_keys, expected_marker) in
+            [(1, 10, b'a'), (2, 20, b'b'), (3, 30, b'c')]
+        {
             let (num_keys, marker) = pager
-                .page(id, |page| (page.num_keys(), page.cell(TABLE_HEADER_SIZE, TABLE_HEADER_SIZE + 1)[0]))
+                .page(id, |page| {
+                    (
+                        page.num_keys(),
+                        page.cell(TABLE_HEADER_SIZE, TABLE_HEADER_SIZE + 1)[0],
+                    )
+                })
                 .expect("page exists in backing store");
 
             assert_eq!(num_keys, expected_keys);
