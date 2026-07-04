@@ -352,7 +352,7 @@ impl fmt::Debug for CachedPage {
 ///
 /// The pager lazily loads pages from the backing store, caches them in memory,
 /// exposes closure-based read and write access, and flushes dirty pages during
-/// eviction or drop.
+/// eviction or flush requests.
 pub struct Pager<F>
 where
     F: Read + Write + Seek,
@@ -605,7 +605,7 @@ where
             .map_err(|_| {
                 io::Error::new(
                     io::ErrorKind::PermissionDenied,
-                    "failed to acquire write lock on page cache",
+                    "failed to acquire read lock on page cache",
                 )
             })?
             .keys()
@@ -760,7 +760,6 @@ where
             .get(&page_id)
             .cloned()
         {
-            trace!("page {page_id} retrieved from cache");
             cached_page
                 .accessed
                 .store(true, Ordering::Release);
@@ -957,7 +956,7 @@ impl Pager<File> {
     ///
     /// This is used during pager initialization to register the root page.
     fn track(&mut self, id: usize, page: Page, dirty: bool) -> io::Result<()> {
-        trace!("page track: page={id}, dirty={dirty}");
+        trace!("page start tracking: page={id}, dirty={dirty}");
         self.pages
             .write()
             .map_err(|_e| {

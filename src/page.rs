@@ -201,7 +201,7 @@ impl fmt::Display for Page {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "[PAGE] Keys: {} Start: {} End: {} Free Space: {}",
+            "keys={}, free_space(start={}, end={}, size={})",
             self.num_keys(),
             self.free_space_start(),
             self.free_space_end(),
