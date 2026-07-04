@@ -104,7 +104,7 @@ fn write_page(
 /// Create a new [`Page`].
 ///
 /// The created page is initialized with page flags, free-space metadata,
-/// trailing magic bytes, and a checksum. When `root` is true, the root-only
+/// magic bytes, and a checksum. When `root` is true, the root-only
 /// metadata fields for page size and format version are also written.
 fn create_page(
     flags: PageFlags,
@@ -640,6 +640,25 @@ where
         Ok(page)
     }
 
+    /// Writes [`Page`] bytes to the underlying disk storage.
+    fn flush_page(&self, page_id: usize, page: &mut Page) -> io::Result<()> {
+        let page_lsn = page.latest_lsn();
+
+        info!("page flush requested: page_id={page_id} page_lsn={page_lsn}");
+        self.flush_guard
+            .before_flush(page_id as u64, page)?;
+
+        let mut inner = self
+            .inner
+            .lock()
+            .map_err(|_e| {
+                io::Error::other("failed to acquire lock on pager state")
+            })?;
+        write_page(page_id, self.page_size as usize, &mut *inner, page)?;
+        info!("page flushed: page_id={page_id} page_lsn={page_lsn}");
+        Ok(())
+    }
+
     /// Evicts a single page from the page cache using a variant of
     /// the Clock Page Replacement algorithm:
     ///   <https://en.wikipedia.org/wiki/Page_replacement_algorithm#Clock>.
@@ -717,33 +736,10 @@ where
                 .dirty
                 .load(Ordering::Acquire)
             {
-                let page_lsn = page.latest_lsn();
-
-                info!(
-                    "page flush requested: page_id={page_id} page_lsn={page_lsn}"
-                );
-                self.flush_guard
-                    .before_flush(page_id as u64, &page)?;
-
-                let mut inner = self
-                    .inner
-                    .lock()
-                    .map_err(|_e| {
-                        io::Error::other(
-                            "failed to acquire lock on pager state",
-                        )
-                    })?;
-                write_page(
-                    cached_page.page_id,
-                    self.page_size as usize,
-                    &mut *inner,
-                    &mut page,
-                )?;
+                self.flush_page(page_id, &mut page)?;
                 cached_page
                     .dirty
                     .store(false, Ordering::Release);
-
-                info!("page flushed: page_id={page_id} page_lsn={page_lsn}");
             }
 
             drop(page);
@@ -848,10 +844,6 @@ where
     fn drop(&mut self) {
         debug!("cleaning up pager resources");
 
-        let mut inner = self
-            .inner
-            .lock()
-            .expect("mutex poisoned");
         for (id, page) in self
             .pages
             .write()
@@ -866,9 +858,8 @@ where
                     .page
                     .write()
                     .expect("page is not held by another thread");
-                info!("flushing page {id}: {}", page);
-                write_page(id, self.page_size as usize, &mut *inner, &mut page)
-                    .expect("store should be writeable");
+                self.flush_page(id, &mut page)
+                    .expect("page should be flushable");
             }
         }
     }
