@@ -656,7 +656,7 @@ where
             info!(
                 "page flush attempt fail: page={page_id}, evict={evict} UNCACHED"
             );
-            return Err(io::Error::new(io::ErrorKind::Other, "untracked page"));
+            return Err(io::Error::other("untracked page"));
         };
 
         if cached_page
@@ -767,15 +767,17 @@ where
             return Ok(cached_page);
         }
 
-        let mut pages = self
+        // NOTE: ACQUIRE
+        let pages = self
             .pages
-            .write()
+            .read()
             .map_err(|_e| {
                 io::Error::new(
                     io::ErrorKind::PermissionDenied,
-                    "failed to request write lock on pager state",
+                    "failed to request read lock on pager state",
                 )
             })?;
+        let cache_count = pages.len();
 
         // Check if another thread loaded the page before lock was
         // acquired
@@ -785,9 +787,12 @@ where
                 .store(true, Ordering::Release);
             return Ok(cached_page);
         }
+        drop(pages);
 
-        if pages.len() >= self.capacity {
-            self.evict_one(&mut pages)?;
+        if cache_count >= self.capacity {
+            // NOTE: DROP: Only need the cache to retrieve the page and figure out
+            //             size
+            self.evict_one()?;
         }
 
         let page = {
@@ -804,8 +809,7 @@ where
         };
         info!("loaded page {page_id}: {page}");
 
-        let page = sync::Arc::new(CachedPage::new(page_id, page, false));
-        pages.insert(page_id, page.clone());
+        let page = self.track(page_id, page, false)?;
         self.clock
             .lock()
             .map_err(|e| {
@@ -819,14 +823,33 @@ where
         Ok(page)
     }
 
+    /// Caches a [`Page`] in memory.
+    ///
+    /// This is used during pager initialization to register the root page.
+    fn track(
+        &self,
+        id: usize,
+        page: Page,
+        dirty: bool,
+    ) -> io::Result<sync::Arc<CachedPage>> {
+        trace!("page start tracking: page={id}, dirty={dirty}");
+        let page = sync::Arc::new(CachedPage::new(id, page, dirty));
+        self.pages
+            .write()
+            .map_err(|_e| {
+                io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "failed to retrieve write lock",
+                )
+            })?
+            .insert(id, page.clone());
+        Ok(page)
+    }
+
     /// Evicts a single page from the page cache using a variant of
     /// the Clock Page Replacement algorithm:
     ///   <https://en.wikipedia.org/wiki/Page_replacement_algorithm#Clock>.
-    fn evict_one(
-        &self,
-        pages: &mut HashMap<usize, sync::Arc<CachedPage>>,
-    ) -> io::Result<()> {
-        info!("page evict: candidate=\n\t{pages:#?}");
+    fn evict_one(&self) -> io::Result<()> {
         let mut clock = self
             .clock
             .lock()
@@ -840,6 +863,7 @@ where
         if clock.ring.is_empty() {
             return Err(io::Error::other("can not evict from empty cache"));
         }
+        info!("page evict: candidate=\n\t{:?}", clock.ring);
 
         // Traverse through the circular buffer at least twice
         // before giving up on finding a slot.
@@ -935,7 +959,7 @@ impl Pager<File> {
             page_size = root.page_size();
         }
 
-        let mut out = Self {
+        let out = Self {
             capacity,
             clock: sync::Mutex::new(ClockState {
                 hand: 0,
@@ -950,23 +974,6 @@ impl Pager<File> {
         out.track(ROOT_PAGE_ID, root, created)?;
 
         Ok(out)
-    }
-
-    /// Caches a [`Page`] in memory.
-    ///
-    /// This is used during pager initialization to register the root page.
-    fn track(&mut self, id: usize, page: Page, dirty: bool) -> io::Result<()> {
-        trace!("page start tracking: page={id}, dirty={dirty}");
-        self.pages
-            .write()
-            .map_err(|_e| {
-                io::Error::new(
-                    io::ErrorKind::PermissionDenied,
-                    "failed to retrieve write lock",
-                )
-            })?
-            .insert(id, sync::Arc::new(CachedPage::new(id, page, dirty)));
-        Ok(())
     }
 }
 
