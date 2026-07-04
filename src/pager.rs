@@ -947,7 +947,7 @@ impl Pager<File> {
             page_size,
             pages: sync::RwLock::new(HashMap::with_capacity(capacity)),
         };
-        info!("initializing pager with root page:\n\t{root}");
+        trace!("pager initialize: root={root}");
         out.track(ROOT_PAGE_ID, root, created)?;
 
         Ok(out)
@@ -957,6 +957,7 @@ impl Pager<File> {
     ///
     /// This is used during pager initialization to register the root page.
     fn track(&mut self, id: usize, page: Page, dirty: bool) -> io::Result<()> {
+        trace!("page track: page={id}, dirty={dirty}");
         self.pages
             .write()
             .map_err(|_e| {
