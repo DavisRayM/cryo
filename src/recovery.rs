@@ -9,8 +9,8 @@ use std::{
 
 use log::{info, trace};
 
-use crate::pager::FlushGuard;
 use crate::read_be;
+use crate::{Page, pager::FlushGuard};
 
 const MAGIC: &str = "PD";
 const MAGIC_SIZE: usize = MAGIC.len();
@@ -376,8 +376,11 @@ pub struct WalFlushGuard<W> {
     wal: sync::Arc<sync::Mutex<Logger<W>>>,
 }
 
-impl FlushGuard for WalFlushGuard<std::io::Cursor<Vec<u8>>> {
-    fn before_flush(&self, page_id: u64, page: &crate::Page) -> io::Result<()> {
+impl<W> WalFlushGuard<W>
+where
+    W: Read + Write + Seek,
+{
+    fn flush_page(&self, page_id: u64, page: &Page) -> io::Result<()> {
         let lsn = page.latest_lsn();
 
         let mut wal = self.wal.lock().map_err(|_| {
@@ -400,28 +403,19 @@ impl FlushGuard for WalFlushGuard<std::io::Cursor<Vec<u8>>> {
     }
 }
 
+impl FlushGuard for WalFlushGuard<std::io::Cursor<Vec<u8>>> {
+    fn before_flush(&self, page_id: u64, page: &crate::Page) -> io::Result<()> {
+        self.flush_page(page_id, page)
+    }
+}
+
 impl FlushGuard for WalFlushGuard<File> {
     fn before_flush(&self, page_id: u64, page: &crate::Page) -> io::Result<()> {
-        let lsn = page.latest_lsn();
-
-        let mut wal = self.wal.lock().map_err(|_| {
-            io::Error::other("failed to lock Write-Ahead Log before page flush")
-        })?;
-
-        if wal.flushed_lsn < lsn {
-            info!(
-                "[WAL][BEFORE][FLUSH] Page: id={page_id} lsn={lsn} last_wal_flushed={}",
-                wal.flushed_lsn
-            );
-            wal.flush_through(lsn)?;
-            wal.sync_all()
-        } else {
-            trace!(
-                "[WAL][BEFORE][FLUSHED] Page: {page_id} lsn={lsn} last_wal_flushed={}",
-                wal.flushed_lsn
-            );
-            Ok(())
-        }
+        self.flush_page(page_id, page)?;
+        self.wal
+            .lock()
+            .map_err(|_| io::Error::other("failed to lock WAL for fsync"))?
+            .sync_all()
     }
 }
 
