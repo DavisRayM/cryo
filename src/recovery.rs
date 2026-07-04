@@ -3,13 +3,14 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::VecDeque,
     fs::File,
-    io::{self, Read, Seek, Write},
+    io::{self, Read, Seek, SeekFrom, Write},
     sync,
 };
 
 use log::{info, trace};
 
 use crate::pager::FlushGuard;
+use crate::read_be;
 
 const MAGIC: &str = "PD";
 const MAGIC_SIZE: usize = MAGIC.len();
@@ -20,6 +21,28 @@ bitflags! {
     pub struct RecordFlags: u8 {}
 }
 
+fn read_exact_or_eof(
+    reader: &mut impl Read,
+    buf: &mut [u8],
+) -> io::Result<bool> {
+    let mut read = 0;
+
+    while read < buf.len() {
+        match reader.read(&mut buf[read..])? {
+            0 if read == 0 => return Ok(false),
+            0 => {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "partial WAL frame",
+                ));
+            }
+            n => read += n,
+        }
+    }
+
+    Ok(true)
+}
+
 /// [`Record`] is an entry in the Write-Ahead Log.
 ///
 /// The [`Record`] keeps track of actions taken against pages in memory so they
@@ -27,13 +50,13 @@ bitflags! {
 ///
 /// Record Layout:
 ///
-/// [0..2]      u16     magic
-/// [2..3]      u8      format
-/// [3..4]      u8      flags
-/// [4..12]      u64     lsn
-/// [12..16]     u32     crc
-/// [16..20]    u32     payload_len
-/// [20..]      bytes   payload
+/// [0..2]       bytes[2]     magic
+/// [2..3]       u8           format
+/// [3..4]       u8           flags
+/// [4..12]      u64          lsn
+/// [12..16]     u32          crc
+/// [16..20]     u32          payload_len
+/// [20..]       bytes        payload
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Record {
     /// Marks the beginning of a transaction.
@@ -81,42 +104,12 @@ pub enum Record {
     EndCheckpoint,
 }
 
-fn read_exact_or_eof(
-    reader: &mut impl Read,
-    buf: &mut [u8],
-) -> io::Result<bool> {
-    let mut read = 0;
-
-    while read < buf.len() {
-        match reader.read(&mut buf[read..])? {
-            0 if read == 0 => return Ok(false),
-            0 => {
-                return Err(io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    "partial WAL frame",
-                ));
-            }
-            n => read += n,
-        }
-    }
-
-    Ok(read == buf.len())
-}
-
-macro_rules! read_be {
-    ($reader:expr, $ty:ty) => {{
-        let mut buf = [0; size_of::<$ty>()];
-        $reader.read_exact(&mut buf)?;
-
-        <$ty>::from_be_bytes(buf)
-    }};
-}
-
 impl Record {
     pub fn scan_existing(reader: &mut (impl Read + Seek)) -> io::Result<u64> {
-        reader.seek(std::io::SeekFrom::Start(0))?;
-
         let mut last_lsn = 0;
+        let mut last_offset = 0;
+
+        reader.seek(std::io::SeekFrom::Start(last_offset))?;
 
         loop {
             match Self::read(reader) {
@@ -125,10 +118,14 @@ impl Record {
                 }
                 Ok(None) => break,
                 Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
+                    // recover to last know good position
+                    reader.seek(SeekFrom::Start(last_offset))?;
                     break;
                 }
                 Err(e) => return Err(e),
             }
+
+            last_offset = reader.seek(SeekFrom::Current(0))?;
         }
 
         Ok(last_lsn)
@@ -136,11 +133,9 @@ impl Record {
 
     pub fn read(reader: &mut impl Read) -> io::Result<Option<(u64, Self)>> {
         let mut magic = [0; MAGIC_SIZE];
-
         if !read_exact_or_eof(reader, &mut magic)? {
             return Ok(None);
         }
-
         if &magic != MAGIC.as_bytes() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -250,10 +245,12 @@ impl<W> Logger<W>
 where
     W: Read + Write + Seek,
 {
-    pub fn new(mut inner: W) -> io::Result<Self> {
+    /// Open a WAL [`Logger`].
+    ///
+    /// [`Logger`] will load latest state from the backing record log
+    /// and continue tracking from the latest known `lsn`.
+    pub fn open(mut inner: W) -> io::Result<Self> {
         let last_lsn = Record::scan_existing(&mut inner)?;
-
-        inner.seek(std::io::SeekFrom::End(0))?;
 
         Ok(Self {
             buffer: VecDeque::new(),
@@ -263,11 +260,14 @@ where
             flushed_lsn: last_lsn,
         })
     }
+
     /// Append [`Record`] into WAL Log.
     ///
     /// The append operation is buffered in memory and is flushed on
     /// call to [Self::flush_through].
     pub fn append(&mut self, record: Record) -> io::Result<u64> {
+        // TODO: Compact the log. The Logger keeps track of
+        //       generation but never truly does anything with it.
         let lsn = self.next_lsn;
         self.next_lsn += 1;
 
@@ -282,6 +282,17 @@ where
             .push_back((lsn, record));
 
         Ok(lsn)
+    }
+
+    /// Read all [`Record`] currently in the WAL
+    pub fn read_all(&mut self) -> io::Result<Vec<(u64, Record)>> {
+        self.inner
+            .seek(SeekFrom::Start(0))?;
+        let mut out = Vec::new();
+        while let Some(r) = Record::read(&mut self.inner)? {
+            out.push(r);
+        }
+        Ok(out)
     }
 
     /// Flushes all changes up to `target_lsn`
@@ -418,7 +429,7 @@ impl FlushGuard for WalFlushGuard<File> {
 mod tests {
     use super::*;
     use crate::Page;
-    use std::io::{Cursor, SeekFrom};
+    use std::io::Cursor;
 
     fn update_record(prev_lsn: Option<u64>) -> Record {
         Record::Update {
@@ -429,19 +440,6 @@ mod tests {
             after: vec![b'x', b'y', b'z'],
             prev_lsn,
         }
-    }
-
-    fn read_all_records(
-        cursor: &mut Cursor<Vec<u8>>,
-    ) -> io::Result<Vec<(u64, Record)>> {
-        cursor.seek(SeekFrom::Start(0))?;
-
-        let mut out = Vec::new();
-        while let Some((lsn, record)) = Record::read(cursor)? {
-            out.push((lsn, record));
-        }
-
-        Ok(out)
     }
 
     #[test]
@@ -475,7 +473,7 @@ mod tests {
     #[test]
     fn append_buffers_records_until_flush_through() {
         let inner = Cursor::new(Vec::new());
-        let mut logger = Logger::new(inner).expect("logger can be created");
+        let mut logger = Logger::open(inner).expect("logger can be created");
 
         let begin_lsn = logger
             .append(Record::Begin {
@@ -505,7 +503,8 @@ mod tests {
         assert_eq!(logger.flushed_lsn, begin_lsn);
         assert_eq!(logger.buffer.len(), 1);
 
-        let records = read_all_records(&mut logger.inner)
+        let records = logger
+            .read_all()
             .expect("flushed WAL records can be read");
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].0, begin_lsn);
@@ -518,7 +517,8 @@ mod tests {
         assert_eq!(logger.flushed_lsn, update_lsn);
         assert!(logger.buffer.is_empty());
 
-        let records = read_all_records(&mut logger.inner)
+        let records = logger
+            .read_all()
             .expect("all flushed WAL records can be read");
         assert_eq!(records.len(), 2);
         assert_eq!(records[0].0, begin_lsn);
@@ -530,7 +530,7 @@ mod tests {
     #[test]
     fn logger_new_scans_existing_records_and_resumes_lsn_numbering() {
         let inner = Cursor::new(Vec::new());
-        let mut logger = Logger::new(inner).expect("logger can be created");
+        let mut logger = Logger::open(inner).expect("logger can be created");
 
         let begin_lsn = logger
             .append(Record::Begin {
@@ -550,7 +550,7 @@ mod tests {
 
         let inner = logger.inner;
         let mut reopened =
-            Logger::new(inner).expect("logger can scan existing WAL");
+            Logger::open(inner).expect("logger can scan existing WAL");
 
         assert_eq!(reopened.flushed_lsn, commit_lsn);
         assert_eq!(reopened.next_lsn, commit_lsn + 1);
@@ -579,7 +579,7 @@ mod tests {
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
 
         let inner = Cursor::new(Vec::new());
-        let mut logger = Logger::new(inner).expect("logger can be created");
+        let mut logger = Logger::open(inner).expect("logger can be created");
         let lsn = logger
             .append(Record::Begin {
                 txn_id: 1,
@@ -603,7 +603,7 @@ mod tests {
     #[test]
     fn scan_existing_stops_at_trailing_partial_frame() {
         let inner = Cursor::new(Vec::new());
-        let mut logger = Logger::new(inner).expect("logger can be created");
+        let mut logger = Logger::open(inner).expect("logger can be created");
 
         let begin_lsn = logger
             .append(Record::Begin {
@@ -629,7 +629,7 @@ mod tests {
     fn wal_flush_guard_flushes_through_page_lsn() {
         let inner = Cursor::new(Vec::new());
         let wal = sync::Arc::new(sync::Mutex::new(
-            Logger::new(inner).expect("logger can be created"),
+            Logger::open(inner).expect("logger can be created"),
         ));
 
         let lsn = {

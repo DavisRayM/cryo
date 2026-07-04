@@ -8,3 +8,16 @@ pub use page::{Page, PageFlags};
 
 /// https://reveng.sourceforge.io/crc-catalogue/all.htm
 pub(crate) const CRC32C: Crc<u32> = Crc::<u32>::new(&crc::CRC_32_ISCSI);
+
+/// Read from `reader` N bytes that would construct `ty`pe.
+///
+/// This Macro needs to be run in a `io::Result<R>` context.
+#[macro_export]
+macro_rules! read_be {
+    ($reader:expr, $ty:ty) => {{
+        let mut buf = [0; size_of::<$ty>()];
+        $reader.read_exact(&mut buf)?;
+
+        <$ty>::from_be_bytes(buf)
+    }};
+}

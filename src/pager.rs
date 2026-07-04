@@ -479,7 +479,7 @@ where
     ) -> io::Result<R> {
         if ctx.txn_id.is_none() && ctx.reason.is_none() {
             warn!(
-                "mutating page {page_id} without transaction or maintenance context. You forgot something dingus!"
+                "mutating page {page_id} without transaction or maintenance context."
             );
         }
 
