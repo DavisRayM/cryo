@@ -5,6 +5,8 @@ pub mod pager;
 pub mod recovery;
 
 pub use page::{Page, PageFlags};
+pub use pager::{AccessContext, Pager};
+pub use recovery::{Logger, Record, RecordFlags};
 
 /// https://reveng.sourceforge.io/crc-catalogue/all.htm
 pub(crate) const CRC32C: Crc<u32> = Crc::<u32>::new(&crc::CRC_32_ISCSI);
