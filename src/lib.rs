@@ -3,10 +3,11 @@ use crc::Crc;
 pub mod page;
 pub mod pager;
 pub mod recovery;
+pub mod wal;
 
 pub use page::{Page, PageFlags};
 pub use pager::{AccessContext, Pager};
-pub use recovery::{Logger, Record, RecordFlags};
+pub use wal::{Logger, Lsn, Record, RecordEntry, RecordFlags, WalFlushGuard};
 
 /// https://reveng.sourceforge.io/crc-catalogue/all.htm
 pub(crate) const CRC32C: Crc<u32> = Crc::<u32>::new(&crc::CRC_32_ISCSI);
