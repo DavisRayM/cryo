@@ -517,6 +517,9 @@ where
             cached
                 .dirty
                 .store(true, Ordering::Release);
+            if let Some(lsn) = ctx.lsn {
+                page.set_lsn(lsn)
+            }
 
             out
         };
