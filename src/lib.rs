@@ -16,7 +16,7 @@ pub(crate) const CRC32C: Crc<u32> = Crc::<u32>::new(&crc::CRC_32_ISCSI);
 macro_rules! read_be {
     ($reader:expr, $ty:ty) => {{
         let mut buf = [0; size_of::<$ty>()];
-        $reader.read_exact(&mut buf)?;
+        ::std::io::Read::read_exact($reader, &mut buf)?;
 
         <$ty>::from_be_bytes(buf)
     }};
