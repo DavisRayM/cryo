@@ -125,7 +125,7 @@ impl Record {
                 Err(e) => return Err(e),
             }
 
-            last_offset = reader.seek(SeekFrom::Current(0))?;
+            last_offset = reader.stream_position()?;
         }
 
         Ok(last_lsn)
@@ -136,7 +136,7 @@ impl Record {
         if !read_exact_or_eof(reader, &mut magic)? {
             return Ok(None);
         }
-        if &magic != MAGIC.as_bytes() {
+        if magic != MAGIC.as_bytes() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "invalid WAL record magic",
