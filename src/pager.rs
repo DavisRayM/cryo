@@ -407,6 +407,13 @@ impl<F> Pager<F>
 where
     F: Read + Write + Seek,
 {
+    /// Set the [`FlushGuard`] for the [`Pager`]. Ensuring the set
+    /// guards [`FlushGuard::before_flush`] is called before any data is synced
+    /// to disk.
+    pub fn set_guard(&mut self, guard: sync::Arc<dyn FlushGuard>) {
+        self.flush_guard = guard;
+    }
+
     /// Access a [`Page`] with read access.
     ///
     /// The page is loaded into the cache if needed, pinned for the duration of
@@ -419,7 +426,7 @@ where
     ) -> io::Result<R> {
         trace!(
             "page {page_id} access start: mode={:?} txn={:?} lsn={:?} reason={:?}",
-            AccessMode::Write,
+            AccessMode::Read,
             ctx.txn_id,
             ctx.lsn,
             ctx.reason,
@@ -453,7 +460,7 @@ where
         page.unpin();
         trace!(
             "page {page_id} access end: mode={:?} txn={:?}",
-            AccessMode::Write,
+            AccessMode::Read,
             ctx.txn_id,
         );
 
