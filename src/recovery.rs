@@ -2,6 +2,7 @@ use bitflags::bitflags;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::VecDeque,
+    fs::File,
     io::{self, Read, Seek, Write},
     sync,
 };
@@ -12,27 +13,12 @@ use crate::pager::FlushGuard;
 
 const MAGIC: &str = "PD";
 const MAGIC_SIZE: usize = MAGIC.len();
-const MAGIC_OFFSET: usize = 0;
-
 const RECORD_FORMAT_VERSION: u8 = 1;
-const RECORD_FORMAT_SIZE: usize = size_of::<u8>();
-const RECORD_FORMAT_OFFSET: usize = MAGIC_OFFSET + MAGIC_SIZE;
 
 bitflags! {
     #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
     pub struct RecordFlags: u8 {}
 }
-const RECORD_FLAGS_SIZE: usize = size_of::<u8>();
-const RECORD_FLAGS_OFFSET: usize = RECORD_FORMAT_OFFSET + RECORD_FORMAT_SIZE;
-
-const LSN_SIZE: usize = size_of::<u32>();
-const LSN_OFFSET: usize = RECORD_FLAGS_OFFSET + RECORD_FLAGS_SIZE;
-
-const CHECKSUM_SIZE: usize = size_of::<u32>();
-const CHECKSUM_OFFSET: usize = LSN_OFFSET + LSN_SIZE;
-
-const PAYLOAD_LEN_SIZE: usize = size_of::<u32>();
-const PAYLOAD_LEN_OFFSET: usize = CHECKSUM_OFFSET + CHECKSUM_SIZE;
 
 /// [`Record`] is an entry in the Write-Ahead Log.
 ///
@@ -44,10 +30,10 @@ const PAYLOAD_LEN_OFFSET: usize = CHECKSUM_OFFSET + CHECKSUM_SIZE;
 /// [0..2]      u16     magic
 /// [2..3]      u8      format
 /// [3..4]      u8      flags
-/// [4..8]      u32     lsn
-/// [8..12]     u32     crc
-/// [12..16]    u32     payload_len
-/// [16..]      bytes   payload
+/// [4..12]      u64     lsn
+/// [12..16]     u32     crc
+/// [16..20]    u32     payload_len
+/// [20..]      bytes   payload
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Record {
     /// Marks the beginning of a transaction.
@@ -114,19 +100,16 @@ fn read_exact_or_eof(
         }
     }
 
-    Ok(true)
+    Ok(read == buf.len())
 }
 
-fn read_u32_be(reader: &mut impl Read) -> io::Result<u32> {
-    let mut buf = [0; 4];
-    reader.read_exact(&mut buf)?;
-    Ok(u32::from_be_bytes(buf))
-}
+macro_rules! read_be {
+    ($reader:expr, $ty:ty) => {{
+        let mut buf = [0; size_of::<$ty>()];
+        $reader.read_exact(&mut buf)?;
 
-fn read_u64_be(reader: &mut impl Read) -> io::Result<u64> {
-    let mut buf = [0; 8];
-    reader.read_exact(&mut buf)?;
-    Ok(u64::from_be_bytes(buf))
+        <$ty>::from_be_bytes(buf)
+    }};
 }
 
 impl Record {
@@ -165,23 +148,32 @@ impl Record {
             ));
         }
 
-        let mut version = [0; RECORD_FORMAT_SIZE];
-        reader.read_exact(&mut version)?;
-
-        if version[0] != RECORD_FORMAT_VERSION {
+        let version = read_be!(reader, u8);
+        if version != RECORD_FORMAT_VERSION {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "unsupported WAL record version",
             ));
         }
 
-        let mut flags = [0; 1];
-        reader.read_exact(&mut flags)?;
-        let _flags = RecordFlags::from_bits(flags[0]);
+        let flags = read_be!(reader, u8);
+        let _flags = RecordFlags::from_bits(flags).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "corrupted WAL record flags",
+            )
+        })?;
 
-        let lsn = read_u64_be(reader)?;
-        let crc = read_u32_be(reader)?;
-        let payload_len = read_u32_be(reader)?;
+        let lsn = read_be!(reader, u64);
+        let crc = read_be!(reader, u32);
+        let payload_len = read_be!(reader, u32);
+
+        if payload_len > u16::MAX as u32 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "WAL payload too large",
+            ));
+        }
 
         let mut payload = vec![0; payload_len as usize];
         reader.read_exact(&mut payload)?;
@@ -308,13 +300,14 @@ where
         );
         let mut flushed_until = self.flushed_lsn;
 
-        while let Some((lsn, record)) = self.buffer.front().cloned() {
+        while let Some((lsn, record)) = self.buffer.pop_front() {
             if lsn > target_lsn {
+                self.buffer
+                    .push_front((lsn, record));
                 break;
             }
 
             self.write(lsn, &record)?;
-            self.buffer.pop_front();
             flushed_until = lsn;
         }
 
@@ -328,7 +321,7 @@ where
     fn write(&mut self, lsn: u64, record: &Record) -> io::Result<()> {
         let payload = postcard::to_allocvec(record)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-        if payload.len() > u32::MAX as usize {
+        if payload.len() > u16::MAX as usize {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "WAL record too large",
@@ -358,14 +351,21 @@ where
     }
 }
 
+impl Logger<File> {
+    /// Ensure the underlying file is actually synced
+    ///
+    /// This is the equivalent of an `fsync` syscall
+    pub fn sync_all(&mut self) -> io::Result<()> {
+        self.inner.sync_all()?;
+        Ok(())
+    }
+}
+
 pub struct WalFlushGuard<W> {
     wal: sync::Arc<sync::Mutex<Logger<W>>>,
 }
 
-impl<W> FlushGuard for WalFlushGuard<W>
-where
-    W: Read + Write + Seek + Send,
-{
+impl FlushGuard for WalFlushGuard<std::io::Cursor<Vec<u8>>> {
     fn before_flush(&self, page_id: u64, page: &crate::Page) -> io::Result<()> {
         let lsn = page.latest_lsn();
 
@@ -386,6 +386,31 @@ where
             );
         }
         Ok(())
+    }
+}
+
+impl FlushGuard for WalFlushGuard<File> {
+    fn before_flush(&self, page_id: u64, page: &crate::Page) -> io::Result<()> {
+        let lsn = page.latest_lsn();
+
+        let mut wal = self.wal.lock().map_err(|_| {
+            io::Error::other("failed to lock Write-Ahead Log before page flush")
+        })?;
+
+        if wal.flushed_lsn < lsn {
+            info!(
+                "[WAL][BEFORE][FLUSH] Page: id={page_id} lsn={lsn} last_wal_flushed={}",
+                wal.flushed_lsn
+            );
+            wal.flush_through(lsn)?;
+            wal.sync_all()
+        } else {
+            trace!(
+                "[WAL][BEFORE][FLUSHED] Page: {page_id} lsn={lsn} last_wal_flushed={}",
+                wal.flushed_lsn
+            );
+            Ok(())
+        }
     }
 }
 
