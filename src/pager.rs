@@ -656,6 +656,23 @@ where
     ///   cannot be acquired.
     /// - Any error returned by the underlying flush operation.
     pub fn flush_page(&self, page_id: usize, evict: bool) -> io::Result<()> {
+        let evicted = self.flush_page_maps_only(page_id, evict)?;
+        if evicted {
+            self.remove_from_ring(page_id);
+        }
+        Ok(())
+    }
+
+    /// Flush and optionally evict `page_id` from the `pages` map only.
+    ///
+    /// Returns `true` when the page was removed from the map so the caller can
+    /// follow up with [`Self::remove_from_ring`] once the `pages` lock has been
+    /// dropped.
+    fn flush_page_maps_only(
+        &self,
+        page_id: usize,
+        evict: bool,
+    ) -> io::Result<bool> {
         info!("page flush attempt: page={page_id}, evict={evict}");
         let mut pages = self
             .pages
@@ -673,20 +690,20 @@ where
             return Err(io::Error::other("untracked page"));
         };
 
+        if cached_page.is_pinned() {
+            trace!(
+                "page flush attempt fail: page={page_id}, evict={evict}, pin=true, accessed=?"
+            );
+            return Err(io::Error::new(
+                io::ErrorKind::ResourceBusy,
+                "page is in use",
+            ));
+        }
+
         if cached_page
             .dirty
             .load(Ordering::Acquire)
         {
-            if cached_page.is_pinned() {
-                trace!(
-                    "page flush attempt fail: page={page_id}, evict={evict}, pin=true, accessed=?"
-                );
-                return Err(io::Error::new(
-                    io::ErrorKind::ResourceBusy,
-                    "page is in use",
-                ));
-            }
-
             if cached_page
                 .accessed
                 .swap(false, Ordering::AcqRel)
@@ -730,9 +747,30 @@ where
         if evict {
             info!("page flush: page {page_id} has been evicted");
             pages.remove(&page_id);
+            return Ok(true);
         }
 
-        Ok(())
+        Ok(false)
+    }
+
+    /// Remove `page_id` from the Clock ring.
+    ///
+    /// Must only be called **after** the `pages` lock has been released so the
+    /// clock-before-pages lock ordering is respected.
+    fn remove_from_ring(&self, page_id: usize) {
+        let Ok(mut clock) = self.clock.lock() else {
+            return;
+        };
+        if let Some(pos) = clock
+            .ring
+            .iter()
+            .position(|&id| id == page_id)
+        {
+            clock.ring.swap_remove(pos);
+            if clock.hand >= clock.ring.len() && !clock.ring.is_empty() {
+                clock.hand = 0;
+            }
+        }
     }
 
     /// Write [`Page`] to the underlying disk storage.
@@ -915,7 +953,11 @@ where
             let page_id = clock.ring[hand];
 
             info!("page evict: candidate={page_id}");
-            match self.flush_page(page_id, true) {
+            // Use flush_page_maps_only: we already hold the clock lock so we
+            // must not call flush_page (which would call remove_from_ring and
+            // try to re-acquire the clock lock, causing a deadlock). Ring
+            // cleanup is our responsibility here.
+            match self.flush_page_maps_only(page_id, true) {
                 Err(e)
                     if matches!(
                         e.kind(),
@@ -928,6 +970,10 @@ where
                 }
                 Err(e) if e.kind() == io::ErrorKind::Other => {
                     clock.ring.swap_remove(hand);
+                    if clock.hand >= clock.ring.len() && !clock.ring.is_empty()
+                    {
+                        clock.hand = 0;
+                    }
                     continue;
                 }
                 Err(e) => return Err(e),
