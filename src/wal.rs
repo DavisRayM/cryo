@@ -174,11 +174,16 @@ impl Lsn {
 
     /// The [`Lsn`] of the record that would follow a record of `len` bytes
     /// written at `self`, staying within the same generation.
-    fn advanced_by(self, len: u32) -> Lsn {
-        Lsn {
+    ///
+    /// Returns `None` when the addition would overflow the 32-bit offset field,
+    /// i.e. the generation has grown beyond 4 GiB. The caller must rotate to a
+    /// new generation before appending further.
+    fn advanced_by(self, len: u32) -> Option<Lsn> {
+        let offset = self.offset.checked_add(len)?;
+        Some(Lsn {
             generation: self.generation,
-            offset: self.offset + len,
-        }
+            offset,
+        })
     }
 
     /// The first [`Lsn`] of the generation following `self`.
@@ -726,7 +731,13 @@ impl Logger {
 
         let mut inner = self.lock()?;
         let lsn = inner.next_lsn;
-        inner.next_lsn = lsn.advanced_by(record.len() as u32);
+        inner.next_lsn = lsn
+            .advanced_by(record.len() as u32)
+            .ok_or_else(|| {
+                io::Error::other(
+                    "WAL generation offset overflow: rotate to a new generation before appending",
+                )
+            })?;
 
         info!(
             "wal append: lsn={lsn} txn={:?} page={:?} kind={}",
@@ -976,8 +987,9 @@ mod tests {
             prev_lsn: None,
         };
         let expected_begin_lsn = Lsn::new(0, 0);
-        let expected_update_lsn =
-            expected_begin_lsn.advanced_by(begin.len() as u32);
+        let expected_update_lsn = expected_begin_lsn
+            .advanced_by(begin.len() as u32)
+            .unwrap();
         let begin_lsn = logger
             .append(begin)
             .expect("begin can be appended");
@@ -1084,7 +1096,9 @@ mod tests {
         );
         assert_eq!(
             reopened.next_lsn().unwrap(),
-            commit_lsn.advanced_by(commit_len)
+            commit_lsn
+                .advanced_by(commit_len)
+                .unwrap()
         );
         assert!(
             reopened
@@ -1100,7 +1114,12 @@ mod tests {
                 prev_lsn: Some(commit_lsn.into()),
             })
             .expect("end can be appended after reopening");
-        assert_eq!(end_lsn, commit_lsn.advanced_by(commit_len));
+        assert_eq!(
+            end_lsn,
+            commit_lsn
+                .advanced_by(commit_len)
+                .unwrap()
+        );
     }
 
     #[test]
