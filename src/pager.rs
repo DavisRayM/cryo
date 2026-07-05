@@ -357,6 +357,7 @@ pub struct CacheInfo {
     pub page_id: usize,
     pub dirty: bool,
     pub accessed: bool,
+    pub latest_lsn: u64,
     pub pin_count: usize,
     pub handles: Vec<PageHandle>,
 }
@@ -588,6 +589,11 @@ impl Pager {
             .values()
             .map(|p| CacheInfo {
                 page_id: p.page_id,
+                latest_lsn: p
+                    .page
+                    .read()
+                    .expect("able to acquire read lock")
+                    .latest_lsn(),
                 dirty: p
                     .dirty
                     .load(Ordering::Acquire),
@@ -658,6 +664,8 @@ impl Pager {
             // TODO: Instead of failing immediately collect the pages
             //       that failed to flush and provide the information to the caller.
             //       This allows them to retry flushing on the specific cases ?
+            //
+            // NOTE: For now `Self::info()` is enough to debug
             self.flush_page(page, evict)?;
         }
         Ok(())
