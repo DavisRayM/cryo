@@ -353,6 +353,20 @@ impl fmt::Debug for CachedPage {
 /// The pager lazily loads pages from the backing store, caches them in memory,
 /// exposes closure-based read and write access, and flushes dirty pages during
 /// eviction or flush requests.
+///
+/// # Lock ordering
+///
+/// Several locks guard the pager's state. To stay deadlock-free every code
+/// path that holds more than one at a time acquires them in this order and
+/// releases them in the reverse order:
+///
+/// ```text
+/// clock  >  pages  >  CachedPage::page  >  inner
+/// ```
+///
+/// [`CachedPage::handles`] is only ever taken on its own (never while another
+/// pager lock is held), so it sits outside this hierarchy. A lock later in the
+/// chain must never be held while acquiring one earlier in the chain.
 pub struct Pager<F>
 where
     F: Read + Write + Seek,
@@ -767,31 +781,33 @@ where
             return Ok(cached_page);
         }
 
-        // NOTE: ACQUIRE
-        let pages = self
-            .pages
-            .read()
-            .map_err(|_e| {
-                io::Error::new(
-                    io::ErrorKind::PermissionDenied,
-                    "failed to request read lock on pager state",
-                )
-            })?;
-        let cache_count = pages.len();
+        // Snapshot the current cache occupancy so we can decide whether an
+        // eviction is required before loading. Another thread may load the same
+        // page after this read lock is dropped; `track` performs a final
+        // double-check under lock before inserting.
+        let cache_count = {
+            let pages = self
+                .pages
+                .read()
+                .map_err(|_e| {
+                    io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "failed to request read lock on pager state",
+                    )
+                })?;
 
-        // Check if another thread loaded the page before lock was
-        // acquired
-        if let Some(cached_page) = pages.get(&page_id).cloned() {
-            cached_page
-                .accessed
-                .store(true, Ordering::Release);
-            return Ok(cached_page);
-        }
-        drop(pages);
+            if let Some(cached_page) = pages.get(&page_id).cloned() {
+                cached_page
+                    .accessed
+                    .store(true, Ordering::Release);
+                return Ok(cached_page);
+            }
+
+            pages.len()
+        };
 
         if cache_count >= self.capacity {
-            // NOTE: DROP: Only need the cache to retrieve the page and figure out
-            //             size
+            // Eviction locks `clock` then `pages`; we hold neither here.
             self.evict_one()?;
         }
 
@@ -809,23 +825,19 @@ where
         };
         info!("loaded page {page_id}: {page}");
 
-        let page = self.track(page_id, page, false)?;
-        self.clock
-            .lock()
-            .map_err(|e| {
-                io::Error::new(
-                    io::ErrorKind::PermissionDenied,
-                    format!("failed to lock pager state: {e}"),
-                )
-            })?
-            .ring
-            .push(page_id);
-        Ok(page)
+        self.track(page_id, page, false)
     }
 
-    /// Caches a [`Page`] in memory.
+    /// Caches a [`Page`] in memory, returning the tracked [`CachedPage`].
     ///
-    /// This is used during pager initialization to register the root page.
+    /// This performs an atomic check-and-insert: if another thread already
+    /// tracked `id` in the window since the caller last checked, the existing
+    /// entry is returned and `page` is discarded. The Clock ring is only
+    /// extended when a genuinely new entry is inserted, keeping it in sync with
+    /// the cache map.
+    ///
+    /// The `clock` lock is acquired before `pages` to respect the pager's lock
+    /// ordering (see [`Pager`]).
     fn track(
         &self,
         id: usize,
@@ -833,17 +845,40 @@ where
         dirty: bool,
     ) -> io::Result<sync::Arc<CachedPage>> {
         trace!("page start tracking: page={id}, dirty={dirty}");
-        let page = sync::Arc::new(CachedPage::new(id, page, dirty));
-        self.pages
+
+        let mut clock = self
+            .clock
+            .lock()
+            .map_err(|_e| {
+                io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "failed to acquire clock state lock",
+                )
+            })?;
+        let mut pages = self
+            .pages
             .write()
             .map_err(|_e| {
                 io::Error::new(
                     io::ErrorKind::PermissionDenied,
                     "failed to retrieve write lock",
                 )
-            })?
-            .insert(id, page.clone());
-        Ok(page)
+            })?;
+
+        // Another thread may have loaded and tracked this page while we were
+        // reading it from the backing store. Prefer the existing entry so all
+        // callers share a single `CachedPage` per page id.
+        if let Some(existing) = pages.get(&id).cloned() {
+            existing
+                .accessed
+                .store(true, Ordering::Release);
+            return Ok(existing);
+        }
+
+        let cached = sync::Arc::new(CachedPage::new(id, page, dirty));
+        pages.insert(id, cached.clone());
+        clock.ring.push(id);
+        Ok(cached)
     }
 
     /// Evicts a single page from the page cache using a variant of
