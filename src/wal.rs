@@ -92,8 +92,12 @@ fn scan_records_from(
                 records.push(RecordEntry { lsn, record });
             }
             Ok(None) => break,
-            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
-                // recover to last known good position
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    io::ErrorKind::UnexpectedEof | io::ErrorKind::InvalidData
+                ) =>
+            {
                 reader.seek(SeekFrom::Start(offset as u64))?;
                 break;
             }
