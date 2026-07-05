@@ -75,7 +75,7 @@ fn load_page(
 
 /// Writes a [`Page`] to `writer`.
 ///
-/// Before writing, this updates the [`Page`]'s trailing magic bytes and recalculates
+/// Before writing, this updates the [`Page`]'s magic bytes and recalculates
 /// its checksum so the persisted [`Page`] can be validated during durability checks.
 fn write_page(
     page_id: usize,
@@ -93,7 +93,7 @@ fn write_page(
 
     let offset = (page_id - 1) * size;
 
-    page.set_magic(None);
+    page.set_magic();
     page.set_checksum(page.compute_checksum());
     writer.seek(SeekFrom::Start(offset as u64))?;
     writer.write_all(&page[..])?;
@@ -124,7 +124,7 @@ fn create_page(
     page.set_free_space_start(free_space_start);
     page.set_free_space_end(size);
     page.set_free_space(size - free_space_start);
-    page.set_magic(None);
+    page.set_magic();
     page.set_checksum(page.compute_checksum());
 
     page

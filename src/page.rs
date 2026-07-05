@@ -136,10 +136,9 @@ impl Page {
         self.cell(MAGIC_OFFSET, HEADER_SIZE)
     }
 
-    pub fn set_magic(&mut self, magic: Option<&str>) {
-        let magic = magic.unwrap_or(MAGIC);
+    pub fn set_magic(&mut self) {
         self.mut_cell(MAGIC_OFFSET, HEADER_SIZE)
-            .copy_from_slice(magic.as_bytes());
+            .copy_from_slice(MAGIC.as_bytes());
     }
 
     field!(checksum, set_checksum, u32, CHECKSUM_OFFSET, FLAGS_OFFSET);
