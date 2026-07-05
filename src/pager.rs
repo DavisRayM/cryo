@@ -131,8 +131,8 @@ fn create_page(
 }
 
 /// [`FlushGuard`] defines a guarded function that should be run
-/// before a page is committed/flushed into memory. A page is only
-/// allowed to flush onto disk if `before_flush` is successful.
+/// before a page is committed/flushed to disk. A page is only
+/// allowed to flush to disk if `before_flush` is successful.
 pub trait FlushGuard: Send + Sync {
     fn before_flush(&self, page_id: u64, page: &Page) -> io::Result<()>;
 }
