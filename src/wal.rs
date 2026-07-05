@@ -367,6 +367,7 @@ impl Record {
 
         let record: Record = postcard::from_bytes(&payload[..])
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        record.validate(None)?;
 
         Ok(Some((lsn, record)))
     }
@@ -436,6 +437,88 @@ impl Record {
         }
 
         Ok(payload.into())
+    }
+
+    /// Validate that this record is structurally sound before it is applied to
+    /// or read from the log.
+    ///
+    /// These checks reject records that recovery could never apply correctly:
+    ///
+    /// - `Update.before` and `Update.after` must have equal length so an undo
+    ///   can restore exactly the bytes a redo replaced.
+    /// - `Update`/`Compensation` payloads must be non-empty (a zero-length
+    ///   change carries no redo/undo information).
+    /// - `Compensation` records are redo-only and must carry an
+    ///   `undo_next_lsn` so undo can continue past the compensated action.
+    ///
+    /// A `page_size` hint, when provided, additionally requires the changed
+    /// byte range (`offset + len`) to fit within a single page.
+    pub fn validate(&self, page_size: Option<u16>) -> io::Result<()> {
+        let invalid = |msg: &str| {
+            io::Error::new(io::ErrorKind::InvalidData, msg.to_string())
+        };
+
+        match self {
+            Self::Update {
+                offset,
+                before,
+                after,
+                ..
+            } => {
+                if before.len() != after.len() {
+                    return Err(invalid(
+                        "WAL Update before/after length mismatch",
+                    ));
+                }
+                if after.is_empty() {
+                    return Err(invalid("WAL Update carries no bytes"));
+                }
+                Self::check_range(*offset, after.len(), page_size)?;
+            }
+            Self::Compensation {
+                offset,
+                after,
+                undo_next_lsn,
+                ..
+            } => {
+                if after.is_empty() {
+                    return Err(invalid("WAL Compensation carries no bytes"));
+                }
+                if undo_next_lsn.is_none() {
+                    return Err(invalid(
+                        "WAL Compensation missing undo_next_lsn",
+                    ));
+                }
+                Self::check_range(*offset, after.len(), page_size)?;
+            }
+            _ => {}
+        }
+
+        Ok(())
+    }
+
+    /// Ensure a changed byte range `[offset, offset + len)` fits within a page.
+    fn check_range(
+        offset: u16,
+        len: usize,
+        page_size: Option<u16>,
+    ) -> io::Result<()> {
+        let Some(page_size) = page_size else {
+            return Ok(());
+        };
+
+        let end = offset as usize + len;
+        if end > page_size as usize {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "WAL record byte range {offset}+{len} exceeds page size \
+                     {page_size}"
+                ),
+            ));
+        }
+
+        Ok(())
     }
 }
 
@@ -635,6 +718,8 @@ impl Logger {
     /// The append is buffered in memory and only reaches disk on a call to
     /// [`Logger::flush_through`].
     pub fn append(&self, record: Record) -> io::Result<Lsn> {
+        record.validate(None)?;
+
         let mut inner = self.lock()?;
         let lsn = inner.next_lsn;
         inner.next_lsn = lsn.advanced_by(record.len() as u32);
@@ -1288,6 +1373,216 @@ mod tests {
                 .unwrap()
                 .buffer
                 .is_empty()
+        );
+    }
+
+    /// A commit is only "durable" once its record has been flushed through
+    /// and synced.
+    #[test]
+    fn commit_is_durable_before_being_reported() {
+        let dir = TempDir::new().expect("temp dir can be created");
+
+        let commit_lsn;
+        {
+            let logger =
+                Logger::open(dir.path()).expect("logger can be created");
+            let begin = logger
+                .append(Record::Begin {
+                    txn_id: 1,
+                    prev_lsn: None,
+                })
+                .expect("begin can be appended");
+            commit_lsn = logger
+                .append(Record::Commit {
+                    txn_id: 1,
+                    prev_lsn: Some(begin.into()),
+                })
+                .expect("commit can be appended");
+
+            // Commit protocol: force WAL through the Commit record, then sync.
+            logger
+                .flush_through(commit_lsn)
+                .expect("commit record can be flushed");
+            logger
+                .sync_all()
+                .expect("commit record can be synced");
+
+            assert!(
+                logger
+                    .flushed_lsn()
+                    .unwrap()
+                    .unwrap()
+                    >= commit_lsn,
+                "commit must be flushed before success is reported"
+            );
+        }
+
+        // Reopen: the committed record survived without an explicit End.
+        let reopened =
+            Logger::open(dir.path()).expect("logger can reopen after commit");
+        let commit = reopened
+            .get(commit_lsn)
+            .expect("commit lookup succeeds")
+            .expect("commit is durable");
+        assert_eq!(commit.record.kind(), "commit");
+    }
+
+    #[test]
+    fn append_rejects_update_with_mismatched_before_after() {
+        let (_dir, logger) = temp_logger();
+
+        let bad = Record::Update {
+            txn_id: 1,
+            page_id: 1,
+            offset: 0,
+            before: vec![1, 2, 3],
+            after: vec![9, 9],
+            prev_lsn: None,
+        };
+
+        let err = logger
+            .append(bad)
+            .expect_err("mismatched before/after must be rejected");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn append_rejects_compensation_without_undo_next() {
+        let (_dir, logger) = temp_logger();
+
+        let bad = Record::Compensation {
+            txn_id: 1,
+            page_id: 1,
+            offset: 0,
+            after: vec![1, 2, 3],
+            undo_next_lsn: None,
+            prev_lsn: None,
+        };
+
+        let err = logger
+            .append(bad)
+            .expect_err("redo-only CLR without undo_next must be rejected");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn validate_rejects_byte_range_beyond_page_size() {
+        let update = Record::Update {
+            txn_id: 1,
+            page_id: 1,
+            offset: 4094,
+            before: vec![0, 0, 0, 0],
+            after: vec![1, 1, 1, 1],
+            prev_lsn: None,
+        };
+
+        assert!(update.validate(None).is_ok());
+        let err = update
+            .validate(Some(4096))
+            .expect_err("range past page size must be rejected");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn compensation_undo_next_lsn_drives_undo_traversal() {
+        let (_dir, logger) = temp_logger();
+
+        let begin = logger
+            .append(Record::Begin {
+                txn_id: 1,
+                prev_lsn: None,
+            })
+            .expect("begin can be appended");
+        let update = logger
+            .append(update_record(Some(begin.into())))
+            .expect("update can be appended");
+
+        // Compensate the update: its undo_next_lsn points before the update,
+        // i.e. at the Begin record.
+        let clr = logger
+            .append(Record::Compensation {
+                txn_id: 1,
+                page_id: 7,
+                offset: 42,
+                after: vec![b'a', b'b', b'c'],
+                undo_next_lsn: Some(begin.into()),
+                prev_lsn: Some(update.into()),
+            })
+            .expect("clr can be appended");
+
+        logger
+            .flush_through(clr)
+            .expect("records can be flushed");
+
+        let clr_entry = logger
+            .get(clr)
+            .expect("clr lookup succeeds")
+            .expect("clr is found");
+        let Record::Compensation { undo_next_lsn, .. } = clr_entry.record()
+        else {
+            panic!("expected compensation record");
+        };
+
+        // Undo resumes at undo_next_lsn, which resolves to the Begin record.
+        let resume = Lsn::from(undo_next_lsn.expect("clr carries undo_next"));
+        assert_eq!(resume, begin);
+        let resumed = logger
+            .get(resume)
+            .expect("resume lookup succeeds")
+            .expect("resume record is found");
+        assert_eq!(resumed.record().kind(), "begin");
+    }
+
+    #[test]
+    fn flush_through_preserves_records_after_target() {
+        let (_dir, logger) = temp_logger();
+
+        let begin = logger
+            .append(Record::Begin {
+                txn_id: 1,
+                prev_lsn: None,
+            })
+            .expect("begin can be appended");
+        let update = logger
+            .append(update_record(Some(begin.into())))
+            .expect("update can be appended");
+        let commit = logger
+            .append(Record::Commit {
+                txn_id: 1,
+                prev_lsn: Some(update.into()),
+            })
+            .expect("commit can be appended");
+
+        logger
+            .flush_through(update)
+            .expect("flush through the update only");
+
+        assert_eq!(logger.flushed_lsn().unwrap(), Some(update));
+        // The commit remains buffered and is still retrievable by LSN.
+        assert_eq!(
+            logger
+                .lock()
+                .unwrap()
+                .buffer
+                .len(),
+            1
+        );
+        let buffered = logger
+            .get(commit)
+            .expect("buffered commit lookup succeeds")
+            .expect("commit still buffered");
+        assert_eq!(buffered.record().kind(), "commit");
+
+        // The on-disk prefix stops at the flushed target.
+        let on_disk = logger
+            .read_all()
+            .expect("flushed prefix can be read");
+        assert_eq!(
+            on_disk
+                .iter()
+                .map(|e| e.lsn())
+                .collect::<Vec<_>>(),
+            vec![begin, update]
         );
     }
 }
