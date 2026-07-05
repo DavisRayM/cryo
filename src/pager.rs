@@ -414,9 +414,9 @@ impl Pager {
                 META_PAGE_ID,
                 AccessContext::maintenance("startup"),
                 |p| -> io::Result<u16> {
-                    if PageFlags::from_bits(p.flags())
+                    if !PageFlags::from_bits(p.flags())
                         .expect("is valid flag bits")
-                        .is_set(PageFlags::IsMeta)
+                        .contains(PageFlags::IsMeta)
                     {
                         return Err(io::Error::new(
                             io::ErrorKind::InvalidData,
@@ -435,35 +435,43 @@ impl Pager {
                 },
             )??;
         } else {
-            let mut meta_page = Page::new(DEFAULT_PAGE_SIZE, PageFlags::IsMeta);
-            out.flush(META_PAGE_ID, &mut meta_page)?;
+            let mut meta = Page::new(out.page_size, PageFlags::IsMeta);
+            meta.set_next_page((META_PAGE_ID + 1) as u16);
+            out.flush(META_PAGE_ID, &mut meta)?;
         }
         Ok(out)
     }
 
     /// Allocates `Self::page_size` in the storage file. Returning the
     /// new page_id.
-    pub fn allocate_page(&self, flags: PageFlags) -> io::Result<usize> {
-        let mut inner = self
-            .inner
-            .lock()
-            .map_err(|_| {
-                io::Error::new(
-                    io::ErrorKind::PermissionDenied,
-                    "page allocate: mutex poisoned",
-                )
-            })?;
-        let size = inner.seek(SeekFrom::End(0))?;
+    pub fn allocate_page(
+        &self,
+        ctx: AccessContext,
+        flags: PageFlags,
+    ) -> io::Result<usize> {
+        let page_id = self.mut_page(META_PAGE_ID, ctx, |p| {
+            let page_id = p.next_page();
+            p.set_next_page(page_id + 1);
+            if let Some(lsn) = ctx.lsn {
+                p.set_lsn(lsn);
+            }
+            page_id
+        })? as usize;
 
-        if size % self.page_size as u64 != 0 {
+        let page_size = self.page_size as usize;
+        let offset = page_id * page_size;
+
+        if !offset.is_multiple_of(page_size) {
             warn!(
-                "page storage file size ({size} bytes) is not a multiple of page size ({} bytes); file structure may be corrupted",
+                "page storage file size ({offset} bytes) is not a multiple of page size ({} bytes); file structure may be corrupted",
                 self.page_size
             )
         }
 
-        let page_id = (size as usize / self.page_size as usize) + 1;
-        let page = Page::new(self.page_size, flags);
+        let mut page = Page::new(self.page_size, flags);
+        if let Some(lsn) = ctx.lsn {
+            page.set_lsn(lsn);
+        }
         self.track(page_id, page, true)?;
 
         Ok(page_id)
@@ -846,7 +854,14 @@ impl Pager {
                 )
             })?;
         write_page(page_id, self.page_size as usize, &mut inner, page)?;
-        info!("page flushed: page_id={page_id} page_lsn={page_lsn}");
+        let flags =
+            PageFlags::from_bits(page.flags()).expect("flags is parseable");
+        info!(
+            "page flushed: page_id={page_id} page_lsn={page_lsn} meta={} leaf={} internal={}",
+            flags.contains(PageFlags::IsMeta),
+            flags.contains(PageFlags::IsLeaf),
+            flags.contains(PageFlags::IsInternal)
+        );
         Ok(())
     }
 
@@ -1084,7 +1099,10 @@ mod tests {
 
         for (num_keys, marker) in pages {
             let page_id = pager
-                .allocate_page(PageFlags::IsLeaf)
+                .allocate_page(
+                    AccessContext::maintenance("pager with pages"),
+                    PageFlags::IsLeaf,
+                )
                 .expect("test page can be allocated");
             pager
                 .mut_page(
@@ -1102,6 +1120,12 @@ mod tests {
                 .expect_err("first flush clears accessed bit");
             pager
                 .flush_page(page_id, true)
+                .expect("test page can be persisted and evicted");
+            pager
+                .flush_page(META_PAGE_ID, false)
+                .expect_err("first flush clears accessed bit");
+            pager
+                .flush_page(META_PAGE_ID, true)
                 .expect("test page can be persisted and evicted");
             ids.push(page_id);
         }

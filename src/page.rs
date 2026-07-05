@@ -42,6 +42,9 @@ pub const FORMAT_VERSION_SIZE: usize = size_of::<u8>();
 
 pub const BTREE_ROOT_OFFSET: usize =
     FORMAT_VERSION_OFFSET + FORMAT_VERSION_SIZE;
+pub const BTREE_ROOT_SIZE: usize = size_of::<u32>();
+
+pub const NEXT_PAGE_OFFSET: usize = BTREE_ROOT_OFFSET + BTREE_ROOT_SIZE;
 
 pub const RIGHT_SIBLING_OFFSET: usize = LEFT_SIBLING_OFFSET + LEFT_SIBLING_SIZE;
 pub const RIGHT_SIBLING_SIZE: usize = size_of::<u32>();
@@ -116,6 +119,7 @@ macro_rules! field {
 /// [..]
 /// [29..30]    u8              format_version
 /// [30..34]    u32             tree_root
+/// [34..36]    u16             next_page
 /// [..]
 /// [64..] body start
 /// ```
@@ -153,12 +157,6 @@ bitflags! {
     }
 }
 
-impl PageFlags {
-    pub fn is_set(&self, other: PageFlags) -> bool {
-        (*self & other).bits() == 1
-    }
-}
-
 impl Page {
     /// Build a page from `bytes`
     ///
@@ -190,7 +188,7 @@ impl Page {
         out.set_magic();
         out.set_checksum(out.compute_checksum());
 
-        if flags.is_set(PageFlags::IsMeta) {
+        if flags.contains(PageFlags::IsMeta) {
             out.set_page_size(size);
             out.set_format_version(FORMAT_VERSION);
         }
@@ -278,6 +276,7 @@ impl Page {
         FORMAT_VERSION_OFFSET
     );
     field!(tree_root, set_tree_root, u32, BTREE_ROOT_OFFSET);
+    field!(next_page, set_next_page, u16, NEXT_PAGE_OFFSET);
 }
 
 impl ops::DerefMut for Page {
