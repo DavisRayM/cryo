@@ -1,9 +1,6 @@
 //! Pager and page-cache support for on-disk pages.
 //!
-use crate::{
-    Page, PageFlags,
-    page::{HEADER_SIZE, MAGIC},
-};
+use crate::{Page, PageFlags};
 use log::{debug, info, trace, warn};
 use std::{
     collections::HashMap,
@@ -24,13 +21,10 @@ const O_DIRECT: i32 = 0o40000;
 /// Default size, in bytes, used when creating a new database file.
 pub const DEFAULT_PAGE_SIZE: u16 = 4096;
 
-/// On-disk format version written into the root page of newly created files.
-pub const FORMAT_VERSION: u8 = 1;
-
 /// Page identifier reserved for the root page.
 ///
 /// Page identifiers are one-based; page id `0` is invalid.
-pub const ROOT_PAGE_ID: usize = 1;
+pub const META_PAGE_ID: usize = 1;
 
 /// Loads a [`Page`] of `size` bytes from `reader`.
 ///
@@ -57,17 +51,8 @@ fn load_page(
     reader.read_exact(&mut buf)?;
 
     let page = Page::build(buf);
-    if page.magic() != MAGIC.as_bytes() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "corrupted data; bytes are not a valid page",
-        ));
-    }
-    if page.checksum() != page.compute_checksum() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "corrupted data; crc check failed",
-        ));
+    if let (_, Some(reason)) = page.valid() {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, reason));
     }
 
     Ok(page)
@@ -110,35 +95,6 @@ fn write_page(
     writer.sync_all()?;
 
     Ok(())
-}
-
-/// Create a new [`Page`].
-///
-/// The created page is initialized with page flags, free-space metadata,
-/// magic bytes, and a checksum. When `root` is true, the root-only
-/// metadata fields for page size and format version are also written.
-fn create_page(
-    flags: PageFlags,
-    size: u16,
-    free_space_start: u16,
-    root: bool,
-) -> Page {
-    info!("creating page of size {size} with {flags:?}");
-    let mut page = Page::build(vec![0; size as usize]);
-
-    if root {
-        page.set_page_size(size);
-        page.set_format_version(FORMAT_VERSION);
-    }
-
-    page.set_flags(flags.bits());
-    page.set_free_space_start(free_space_start);
-    page.set_free_space_end(size);
-    page.set_free_space(size - free_space_start);
-    page.set_magic();
-    page.set_checksum(page.compute_checksum());
-
-    page
 }
 
 /// [`FlushGuard`] defines a guarded function that should be run
@@ -454,19 +410,14 @@ impl Pager {
 
         if len >= DEFAULT_PAGE_SIZE as u64 {
             let page_size = out.page(
-                ROOT_PAGE_ID,
+                META_PAGE_ID,
                 AccessContext::maintenance("startup"),
                 |p| p.page_size(),
             )?;
             out.page_size = page_size;
         } else {
-            let mut root = create_page(
-                PageFlags::IsRoot,
-                DEFAULT_PAGE_SIZE,
-                HEADER_SIZE as u16,
-                true,
-            );
-            out.flush(ROOT_PAGE_ID, &mut root)?;
+            let mut meta_page = Page::new(DEFAULT_PAGE_SIZE, PageFlags::IsMeta);
+            out.flush(META_PAGE_ID, &mut meta_page)?;
         }
         Ok(out)
     }
@@ -493,8 +444,7 @@ impl Pager {
         }
 
         let page_id = (size as usize / self.page_size as usize) + 1;
-        let page =
-            create_page(flags, self.page_size, HEADER_SIZE as u16, false);
+        let page = Page::new(self.page_size, flags);
         self.track(page_id, page, true)?;
 
         Ok(page_id)
@@ -1115,8 +1065,9 @@ mod tests {
                     page_id,
                     AccessContext::maintenance("test setup"),
                     |page| {
+                        let start = page.free_space_start() as usize;
                         page.set_num_keys(num_keys);
-                        page.mut_cell(HEADER_SIZE, HEADER_SIZE + 1)[0] = marker;
+                        page.mut_cell(start, start + 1)[0] = marker;
                     },
                 )
                 .expect("test page can be initialized");
@@ -1160,7 +1111,10 @@ mod tests {
                 .page(id, AccessContext::anonymous(), |page| {
                     (
                         page.num_keys(),
-                        page.cell(HEADER_SIZE, HEADER_SIZE + 1)[0],
+                        page.cell(
+                            page.free_space_start() as usize,
+                            page.free_space_start() as usize + 1,
+                        )[0],
                     )
                 })
                 .expect("page exists in backing store");
@@ -1229,7 +1183,10 @@ mod tests {
                 AccessContext::maintenance("test mutation"),
                 |page| {
                     page.set_num_keys(42);
-                    page.mut_cell(HEADER_SIZE, HEADER_SIZE + 1)[0] = b'z';
+                    page.mut_cell(
+                        page.free_space_start() as usize,
+                        page.free_space_start() as usize + 1,
+                    )[0] = b'z';
                 },
             )
             .expect("page can be mutated");
@@ -1257,7 +1214,13 @@ mod tests {
         let persisted =
             persisted_page(&pager, ids[0]).expect("flushed page is valid");
         assert_eq!(persisted.num_keys(), 42);
-        assert_eq!(persisted.cell(HEADER_SIZE, HEADER_SIZE + 1)[0], b'z');
+        assert_eq!(
+            persisted.cell(
+                persisted.free_space_start() as usize,
+                persisted.free_space_start() as usize + 1
+            )[0],
+            b'z'
+        );
     }
 
     #[test]
@@ -1270,7 +1233,10 @@ mod tests {
                 AccessContext::maintenance("test mutation"),
                 |page| {
                     page.set_num_keys(7);
-                    page.mut_cell(HEADER_SIZE, HEADER_SIZE + 1)[0] = b'x';
+                    page.mut_cell(
+                        page.free_space_start() as usize,
+                        page.free_space_start() as usize + 1,
+                    )[0] = b'x';
                 },
             )
             .expect("page can be mutated");
@@ -1287,7 +1253,13 @@ mod tests {
         let persisted =
             persisted_page(&pager, ids[0]).expect("flushed page is valid");
         assert_eq!(persisted.num_keys(), 7);
-        assert_eq!(persisted.cell(HEADER_SIZE, HEADER_SIZE + 1)[0], b'x');
+        assert_eq!(
+            persisted.cell(
+                persisted.free_space_start() as usize,
+                persisted.free_space_start() as usize + 1
+            )[0],
+            b'x'
+        );
     }
 
     #[test]
@@ -1324,7 +1296,10 @@ mod tests {
                 AccessContext::maintenance("test mutation"),
                 |page| {
                     page.set_num_keys(99);
-                    page.mut_cell(HEADER_SIZE, HEADER_SIZE + 1)[0] = b'q';
+                    page.mut_cell(
+                        page.free_space_start() as usize,
+                        page.free_space_start() as usize + 1,
+                    )[0] = b'q';
                 },
             )
             .expect("page can be mutated");
@@ -1346,7 +1321,13 @@ mod tests {
         let persisted =
             persisted_page(&pager, ids[0]).expect("original page is valid");
         assert_eq!(persisted.num_keys(), 1);
-        assert_eq!(persisted.cell(HEADER_SIZE, HEADER_SIZE + 1)[0], b'a');
+        assert_eq!(
+            persisted.cell(
+                persisted.free_space_start() as usize,
+                persisted.free_space_start() as usize + 1
+            )[0],
+            b'a'
+        );
     }
 
     #[test]
@@ -1359,7 +1340,10 @@ mod tests {
                 AccessContext::maintenance("test mutation"),
                 |page| {
                     page.set_num_keys(11);
-                    page.mut_cell(HEADER_SIZE, HEADER_SIZE + 1)[0] = b'x';
+                    page.mut_cell(
+                        page.free_space_start() as usize,
+                        page.free_space_start() as usize + 1,
+                    )[0] = b'x';
                 },
             )
             .expect("page 1 can be mutated");
@@ -1369,7 +1353,10 @@ mod tests {
                 AccessContext::maintenance("test mutation"),
                 |page| {
                     page.set_num_keys(22);
-                    page.mut_cell(HEADER_SIZE, HEADER_SIZE + 1)[0] = b'y';
+                    page.mut_cell(
+                        page.free_space_start() as usize,
+                        page.free_space_start() as usize + 1,
+                    )[0] = b'y';
                 },
             )
             .expect("page 2 can be mutated");
@@ -1397,12 +1384,24 @@ mod tests {
         let persisted =
             persisted_page(&pager, ids[0]).expect("page 1 was flushed");
         assert_eq!(persisted.num_keys(), 11);
-        assert_eq!(persisted.cell(HEADER_SIZE, HEADER_SIZE + 1)[0], b'x');
+        assert_eq!(
+            persisted.cell(
+                persisted.free_space_start() as usize,
+                persisted.free_space_start() as usize + 1
+            )[0],
+            b'x'
+        );
 
         let persisted =
             persisted_page(&pager, ids[1]).expect("page 2 was flushed");
         assert_eq!(persisted.num_keys(), 22);
-        assert_eq!(persisted.cell(HEADER_SIZE, HEADER_SIZE + 1)[0], b'y');
+        assert_eq!(
+            persisted.cell(
+                persisted.free_space_start() as usize,
+                persisted.free_space_start() as usize + 1
+            )[0],
+            b'y'
+        );
     }
 
     #[test]
@@ -1436,7 +1435,10 @@ mod tests {
                 AccessContext::maintenance("test mutation"),
                 |page| {
                     page.set_num_keys(31);
-                    page.mut_cell(HEADER_SIZE, HEADER_SIZE + 1)[0] = b'm';
+                    page.mut_cell(
+                        page.free_space_start() as usize,
+                        page.free_space_start() as usize + 1,
+                    )[0] = b'm';
                 },
             )
             .expect("page 1 can be mutated");
@@ -1446,7 +1448,10 @@ mod tests {
                 AccessContext::maintenance("test mutation"),
                 |page| {
                     page.set_num_keys(32);
-                    page.mut_cell(HEADER_SIZE, HEADER_SIZE + 1)[0] = b'n';
+                    page.mut_cell(
+                        page.free_space_start() as usize,
+                        page.free_space_start() as usize + 1,
+                    )[0] = b'n';
                 },
             )
             .expect("page 2 can be mutated");
@@ -1468,12 +1473,24 @@ mod tests {
         let persisted =
             persisted_page(&pager, ids[0]).expect("page 1 was flushed");
         assert_eq!(persisted.num_keys(), 31);
-        assert_eq!(persisted.cell(HEADER_SIZE, HEADER_SIZE + 1)[0], b'm');
+        assert_eq!(
+            persisted.cell(
+                persisted.free_space_start() as usize,
+                persisted.free_space_start() as usize + 1
+            )[0],
+            b'm'
+        );
 
         let persisted =
             persisted_page(&pager, ids[1]).expect("page 2 was flushed");
         assert_eq!(persisted.num_keys(), 32);
-        assert_eq!(persisted.cell(HEADER_SIZE, HEADER_SIZE + 1)[0], b'n');
+        assert_eq!(
+            persisted.cell(
+                persisted.free_space_start() as usize,
+                persisted.free_space_start() as usize + 1
+            )[0],
+            b'n'
+        );
     }
 
     #[test]
@@ -1486,7 +1503,10 @@ mod tests {
                 AccessContext::maintenance("test mutation"),
                 |page| {
                     page.set_num_keys(44);
-                    page.mut_cell(HEADER_SIZE, HEADER_SIZE + 1)[0] = b'r';
+                    page.mut_cell(
+                        page.free_space_start() as usize,
+                        page.free_space_start() as usize + 1,
+                    )[0] = b'r';
                 },
             )
             .expect("page can be mutated");
@@ -1510,7 +1530,13 @@ mod tests {
         let persisted =
             persisted_page(&pager, ids[0]).expect("flushed page is valid");
         assert_eq!(persisted.num_keys(), 44);
-        assert_eq!(persisted.cell(HEADER_SIZE, HEADER_SIZE + 1)[0], b'r');
+        assert_eq!(
+            persisted.cell(
+                persisted.free_space_start() as usize,
+                persisted.free_space_start() as usize + 1
+            )[0],
+            b'r'
+        );
     }
 
     #[test]

@@ -4,7 +4,11 @@ use bitflags::bitflags;
 
 use crate::CRC32C;
 
-pub const CHECKSUM_OFFSET: usize = 0;
+pub const MAGIC_SIZE: usize = 8;
+pub const MAGIC: [u8; MAGIC_SIZE] = [25, 3, 20, 26, 7, 4, 8, 0];
+pub const MAGIC_OFFSET: usize = 0;
+
+pub const CHECKSUM_OFFSET: usize = MAGIC_OFFSET + MAGIC_SIZE;
 pub const CHECKSUM_SIZE: usize = size_of::<u32>();
 
 pub const FLAGS_OFFSET: usize = CHECKSUM_OFFSET + CHECKSUM_SIZE;
@@ -23,20 +27,38 @@ pub const FREESPACE_SIZE: usize = size_of::<u16>();
 pub const NUM_KEY_OFFSET: usize = FREESPACE_OFFSET + FREESPACE_SIZE;
 pub const NUM_KEY_SIZE: usize = size_of::<u16>();
 
+pub const PAGE_SIZE_OFFSET: usize = NUM_KEY_OFFSET;
+pub const PAGE_SIZE_SIZE: usize = NUM_KEY_SIZE;
+
 pub const LSN_OFFSET: usize = NUM_KEY_OFFSET + NUM_KEY_SIZE;
 pub const LSN_SIZE: usize = size_of::<u64>();
 
-pub const PAGE_SIZE_OFFSET: usize = LSN_OFFSET + LSN_SIZE;
-pub const PAGE_SIZE_SIZE: usize = size_of::<u16>();
+pub const LEFT_SIBLING_OFFSET: usize = LSN_OFFSET + LSN_SIZE;
+pub const LEFT_SIBLING_SIZE: usize = size_of::<u32>();
 
-pub const FORMAT_VERSION_OFFSET: usize = PAGE_SIZE_OFFSET + PAGE_SIZE_SIZE;
+pub const FORMAT_VERSION_OFFSET: usize = LSN_OFFSET + LSN_SIZE;
+pub const FORMAT_VERSION: u8 = 1;
 pub const FORMAT_VERSION_SIZE: usize = size_of::<u8>();
 
-pub const HEADER_SIZE: usize = 100;
+pub const BTREE_ROOT_OFFSET: usize =
+    FORMAT_VERSION_OFFSET + FORMAT_VERSION_SIZE;
 
-pub const MAGIC: &str = "CRYOGENIC";
-pub const MAGIC_SIZE: usize = MAGIC.len();
-pub const MAGIC_OFFSET: usize = HEADER_SIZE - MAGIC_SIZE;
+pub const RIGHT_SIBLING_OFFSET: usize = LEFT_SIBLING_OFFSET + LEFT_SIBLING_SIZE;
+pub const RIGHT_SIBLING_SIZE: usize = size_of::<u32>();
+
+pub const RIGHT_MOST_POINTER_OFFSET: usize =
+    RIGHT_SIBLING_OFFSET + RIGHT_SIBLING_SIZE;
+pub const RIGHT_MOST_POINTER_SIZE: usize = size_of::<u32>();
+
+pub const NODE_HIGH_KEY_OFFSET: usize =
+    RIGHT_MOST_POINTER_OFFSET + RIGHT_MOST_POINTER_SIZE;
+pub const NODE_HIGH_KEY_SIZE: usize = size_of::<u64>();
+
+pub const OVERFLOW_OFFSET_OFFSET: usize =
+    NODE_HIGH_KEY_OFFSET + NODE_HIGH_KEY_SIZE;
+pub const OVERFLOW_OFFSET_SIZE: usize = size_of::<u32>();
+
+pub const HEADER_SIZE: usize = 64;
 
 macro_rules! read_be {
     ($page:expr, $ty:ty, $start:expr, $end: expr) => {
@@ -56,50 +78,99 @@ macro_rules! write_be {
     };
 }
 macro_rules! field {
-    ($getter:ident, $setter:ident, $ty:ty, $start:expr, $end:expr) => {
+    ($getter:ident, $setter:ident, $ty:ty, $start:expr) => {
         pub fn $getter(&self) -> $ty {
-            read_be!(self, $ty, $start, $end)
+            read_be!(self, $ty, $start, $start + size_of::<$ty>())
         }
 
         pub fn $setter(&mut self, value: $ty) {
-            write_be!(self, $start, $end, value)
+            write_be!(self, $start, $start + size_of::<$ty>(), value)
         }
     };
 }
 
 /// Basic operational unit within the index-organized table.
 ///
-/// Page Layout:
-/// [0..4]      u32     checksum
-/// [4..5]      u8      flags (is_leaf, is_root, has_overflow, ...)
-/// [5..7]      u16     free_space_start
-/// [7..9]      u16     free_space_end
-/// [9..11]     u16     free_space
-/// [11..13]    u16     number_of_keys
-/// [13..21]    u64     latest_lsn
-/// [21..23]    u16     page_size       (first page only; free space otherwise)
-/// [23..24]    u8      format_version  (first page only; free space otherwise)
-/// [24..91]            reserved
-/// [91..100]   bytes   magic
-/// [100..]             content
+/// ## Page Header
+///
+/// ### Common
+/// ```text
+/// [0..8]      bytes[8]        magic
+/// [8..12]     u32             checksum
+/// [12..13]    u8              flags (is_meta, is_leaf, is_root, has_overflow, ...)
+/// [13..15]    u16             free_space_start
+/// [15..17]    u16             free_space_end
+/// [17..19]    u16             free_space
+/// [..]
+/// [21..29]    u64             latest_lsn
+/// [..]
+/// [49..53]    u32             overflow_offset (only valid if has_overflow bit is set)
+/// [..]                        reserved
+/// [64..] body start
+/// ```
+///
+/// ### Meta Page:
+/// ```text
+/// [..]
+/// [19..21]    u16             page_size
+/// [..]
+/// [29..30]    u8              format_version
+/// [30..34]    u32             tree_root
+/// [..]
+/// [64..] body start
+/// ```
+///
+/// ### Table Page
+/// ``` text
+/// [..]
+/// [19..21]    u16             number_of_keys
+/// [..]
+/// [29..33]    u32             left_sibling_offset
+/// [33..37]    u32             right_sibling_offset
+/// [37..41]    u32             right_most_pointer  (only valid if internal page)
+/// [41..49]    u64             node_high_key       (only valid if internal page)
+/// [..]
+/// [64..] body start
+/// ```
+///
 ///
 #[derive(Clone)]
 pub struct Page {
     inner: Box<[u8]>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub enum PageKind {
+    Meta,
+    Leaf,
+    Root,
+    Internal,
+    Overflow,
+    Free,
+}
+
 bitflags! {
     /// [`PageFlags`] is a set of all possible flags to a page
     #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
     pub struct PageFlags: u8 {
-        const IsLeaf = 0x01;
-        const IsRoot = 0x02;
-        const HasOverflow = 0x04;
+        const IsLeaf = 1;
+        const IsRoot = 1 << 1;
+        const HasOverflow = 1 << 2;
+        const IsMeta = 1 << 3;
+        const IsInternal = 1 << 4;
+        const IsOverflow = 1 << 5;
+        const IsFree = 1 << 6;
+    }
+}
+
+impl PageFlags {
+    pub fn is_set(&self, other: PageFlags) -> bool {
+        (*self & other).bits() == 1
     }
 }
 
 impl Page {
-    /// Create a new [`Page`]
+    /// Build a page from `bytes`
     ///
     /// ## Note
     ///
@@ -117,9 +188,34 @@ impl Page {
         Self { inner }
     }
 
+    /// Create a new [`Page`] of `size` size.
+    pub fn new(size: u16, flags: PageFlags) -> Self {
+        let inner = vec![0; size as usize];
+        let mut out = Self::build(inner);
+
+        out.set_flags(flags.bits());
+        out.set_free_space_start(HEADER_SIZE as u16);
+        out.set_free_space_end(size);
+        out.set_free_space(size - HEADER_SIZE as u16);
+        out.set_magic();
+        out.set_checksum(out.compute_checksum());
+
+        if flags.is_set(PageFlags::IsMeta) {
+            out.set_page_size(size);
+            out.set_format_version(FORMAT_VERSION);
+        }
+
+        out
+    }
+
     /// Immutable view into the held [`Page`]
     pub fn cell(&self, start: usize, end: usize) -> &[u8] {
         &self[start..end]
+    }
+
+    /// Immutable view into the held [`Page`]
+    pub fn cell_from(&self, start: usize) -> &[u8] {
+        &self[start..]
     }
 
     /// Mutable view into the held [`Page`]
@@ -133,53 +229,65 @@ impl Page {
     }
 
     pub fn magic(&self) -> &[u8] {
-        self.cell(MAGIC_OFFSET, HEADER_SIZE)
+        self.cell(MAGIC_OFFSET, CHECKSUM_OFFSET)
     }
 
     pub fn set_magic(&mut self) {
-        self.mut_cell(MAGIC_OFFSET, HEADER_SIZE)
-            .copy_from_slice(MAGIC.as_bytes());
+        self.mut_cell(MAGIC_OFFSET, CHECKSUM_OFFSET)
+            .copy_from_slice(&MAGIC);
     }
 
-    field!(checksum, set_checksum, u32, CHECKSUM_OFFSET, FLAGS_OFFSET);
-    field!(flags, set_flags, u8, FLAGS_OFFSET, FREESPACE_START_OFFSET);
+    /// Returns whether the [`Page`] is valid.
+    ///
+    /// A page is valid if it contains valid `magic` bytes and
+    /// stored checksum matches computed checksum
+    pub fn valid(&self) -> (bool, Option<&str>) {
+        if self.magic() != MAGIC {
+            return (false, Some("unexpected magic bytes, not reading a page"));
+        }
+
+        if self.checksum() != self.compute_checksum() {
+            return (false, Some("corrupted data, checksum is not valid"));
+        }
+
+        (true, None)
+    }
+
+    field!(checksum, set_checksum, u32, CHECKSUM_OFFSET);
+    field!(flags, set_flags, u8, FLAGS_OFFSET);
     field!(
         free_space_start,
         set_free_space_start,
         u16,
-        FREESPACE_START_OFFSET,
-        FREESPACE_END_OFFSET
+        FREESPACE_START_OFFSET
     );
     field!(
         free_space_end,
         set_free_space_end,
         u16,
-        FREESPACE_END_OFFSET,
-        FREESPACE_OFFSET
+        FREESPACE_END_OFFSET
     );
+    field!(free_space, set_free_space, u16, FREESPACE_OFFSET);
+    field!(num_keys, set_num_keys, u16, NUM_KEY_OFFSET);
+    field!(page_size, set_page_size, u16, PAGE_SIZE_OFFSET);
+    field!(latest_lsn, set_lsn, u64, LSN_OFFSET);
+    field!(left_sibling, set_left_sibling, u32, LEFT_SIBLING_OFFSET);
+    field!(right_sibling, set_right_sibling, u32, RIGHT_SIBLING_OFFSET);
+    field!(high_key, set_high_key, u64, NODE_HIGH_KEY_OFFSET);
     field!(
-        free_space,
-        set_free_space,
-        u16,
-        FREESPACE_OFFSET,
-        NUM_KEY_OFFSET
+        right_pointer,
+        set_right_pointer,
+        u32,
+        RIGHT_MOST_POINTER_OFFSET
     );
-    field!(num_keys, set_num_keys, u16, NUM_KEY_OFFSET, LSN_OFFSET);
-    field!(latest_lsn, set_lsn, u64, LSN_OFFSET, PAGE_SIZE_OFFSET);
-    field!(
-        page_size,
-        set_page_size,
-        u16,
-        PAGE_SIZE_OFFSET,
-        FORMAT_VERSION_OFFSET
-    );
+    field!(overflow, set_overflow, u32, OVERFLOW_OFFSET_OFFSET);
     field!(
         format_version,
         set_format_version,
         u8,
-        FORMAT_VERSION_OFFSET,
-        FORMAT_VERSION_OFFSET + FORMAT_VERSION_SIZE
+        FORMAT_VERSION_OFFSET
     );
+    field!(tree_root, set_tree_root, u32, BTREE_ROOT_OFFSET);
 }
 
 impl ops::DerefMut for Page {
