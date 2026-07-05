@@ -11,11 +11,11 @@ pub const FLAGS_OFFSET: usize = CHECKSUM_OFFSET + CHECKSUM_SIZE;
 pub const FLAGS_SIZE: usize = size_of::<u8>();
 
 pub const FREESPACE_START_OFFSET: usize = FLAGS_OFFSET + FLAGS_SIZE;
-pub const FREESPACE_START_SIZE: usize = size_of::<u64>();
+pub const FREESPACE_START_SIZE: usize = size_of::<u16>();
 
 pub const FREESPACE_END_OFFSET: usize =
     FREESPACE_START_OFFSET + FREESPACE_START_SIZE;
-pub const FREESPACE_END_SIZE: usize = size_of::<u64>();
+pub const FREESPACE_END_SIZE: usize = size_of::<u16>();
 
 pub const FREESPACE_OFFSET: usize = FREESPACE_END_OFFSET + FREESPACE_END_SIZE;
 pub const FREESPACE_SIZE: usize = size_of::<u16>();
@@ -23,24 +23,20 @@ pub const FREESPACE_SIZE: usize = size_of::<u16>();
 pub const NUM_KEY_OFFSET: usize = FREESPACE_OFFSET + FREESPACE_SIZE;
 pub const NUM_KEY_SIZE: usize = size_of::<u16>();
 
-pub const PAGE_SIZE_OFFSET: usize = NUM_KEY_OFFSET + NUM_KEY_SIZE;
+pub const LSN_OFFSET: usize = NUM_KEY_OFFSET + NUM_KEY_SIZE;
+pub const LSN_SIZE: usize = size_of::<u64>();
+
+pub const PAGE_SIZE_OFFSET: usize = LSN_OFFSET + LSN_SIZE;
 pub const PAGE_SIZE_SIZE: usize = size_of::<u16>();
 
 pub const FORMAT_VERSION_OFFSET: usize = PAGE_SIZE_OFFSET + PAGE_SIZE_SIZE;
 pub const FORMAT_VERSION_SIZE: usize = size_of::<u8>();
 
-pub const HEADER_SIZE: usize = CHECKSUM_SIZE
-    + FLAGS_SIZE
-    + FREESPACE_START_SIZE
-    + FREESPACE_END_SIZE
-    + FREESPACE_SIZE
-    + NUM_KEY_SIZE;
-
-pub const TABLE_HEADER_SIZE: usize =
-    HEADER_SIZE + PAGE_SIZE_SIZE + FORMAT_VERSION_SIZE;
+pub const HEADER_SIZE: usize = 100;
 
 pub const MAGIC: &str = "CRYOGENIC";
 pub const MAGIC_SIZE: usize = MAGIC.len();
+pub const MAGIC_OFFSET: usize = HEADER_SIZE - MAGIC_SIZE;
 
 macro_rules! read_be {
     ($page:expr, $ty:ty, $start:expr, $end: expr) => {
@@ -74,20 +70,18 @@ macro_rules! field {
 /// Basic operational unit within the index-organized table.
 ///
 /// Page Layout:
-/// [0..4]     u32   checksum
-/// [4..5]     u8    flags (is_leaf,is_root,has_overflow,...)
-/// [5..13]    u64   free_space_start
-/// [13..21]   u64   free_space_end
-/// [21..23]   u16   free_space
-/// [23..25]   u16   number_of_keys
-/// [25..27]   u16   page_size           *-- only present in first page - otherwise freespace --*
-/// [27..28]   u8    format_version      *-- only present in first page - otherwise freespace --*
-/// [28..]
-///
-///
-/// The page layout is not enforced by any mechanisms. It's up
-/// to the user to ensure that the values are not garbage when
-/// accessed.
+/// [0..4]      u32     checksum
+/// [4..5]      u8      flags (is_leaf, is_root, has_overflow, ...)
+/// [5..7]      u16     free_space_start
+/// [7..9]      u16     free_space_end
+/// [9..11]     u16     free_space
+/// [11..13]    u16     number_of_keys
+/// [13..21]    u64     latest_lsn
+/// [21..23]    u16     page_size       (first page only; free space otherwise)
+/// [23..24]    u8      format_version  (first page only; free space otherwise)
+/// [24..91]            reserved
+/// [91..100]   bytes   magic
+/// [100..]             content
 ///
 #[derive(Clone)]
 pub struct Page {
@@ -138,19 +132,28 @@ impl Page {
         CRC32C.checksum(&self[FLAGS_OFFSET..])
     }
 
+    pub fn magic(&self) -> &[u8] {
+        self.cell(MAGIC_OFFSET, HEADER_SIZE)
+    }
+
+    pub fn set_magic(&mut self) {
+        self.mut_cell(MAGIC_OFFSET, HEADER_SIZE)
+            .copy_from_slice(MAGIC.as_bytes());
+    }
+
     field!(checksum, set_checksum, u32, CHECKSUM_OFFSET, FLAGS_OFFSET);
     field!(flags, set_flags, u8, FLAGS_OFFSET, FREESPACE_START_OFFSET);
     field!(
         free_space_start,
         set_free_space_start,
-        u64,
+        u16,
         FREESPACE_START_OFFSET,
         FREESPACE_END_OFFSET
     );
     field!(
         free_space_end,
         set_free_space_end,
-        u64,
+        u16,
         FREESPACE_END_OFFSET,
         FREESPACE_OFFSET
     );
@@ -161,13 +164,8 @@ impl Page {
         FREESPACE_OFFSET,
         NUM_KEY_OFFSET
     );
-    field!(
-        num_keys,
-        set_num_keys,
-        u16,
-        NUM_KEY_OFFSET,
-        PAGE_SIZE_OFFSET
-    );
+    field!(num_keys, set_num_keys, u16, NUM_KEY_OFFSET, LSN_OFFSET);
+    field!(latest_lsn, set_lsn, u64, LSN_OFFSET, PAGE_SIZE_OFFSET);
     field!(
         page_size,
         set_page_size,
@@ -180,7 +178,7 @@ impl Page {
         set_format_version,
         u8,
         FORMAT_VERSION_OFFSET,
-        TABLE_HEADER_SIZE
+        FORMAT_VERSION_OFFSET + FORMAT_VERSION_SIZE
     );
 }
 
@@ -202,7 +200,7 @@ impl fmt::Display for Page {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "[PAGE] Keys: {} Start: {} End: {} Free Space: {}",
+            "keys={}, free_space(start={}, end={}, size={})",
             self.num_keys(),
             self.free_space_start(),
             self.free_space_end(),
