@@ -1,6 +1,6 @@
 //! Pager and page-cache support for on-disk pages.
 //!
-use crate::{Page, PageFlags};
+use crate::{Page, PageFlags, page::FORMAT_VERSION};
 use log::{debug, info, trace, warn};
 use std::{
     collections::HashMap,
@@ -385,8 +385,8 @@ impl fmt::Debug for CacheInfo {
 impl Pager {
     /// Opens an existing pager file or creates a new one.
     ///
-    /// New files are initialized with a root leaf page using
-    /// [`DEFAULT_PAGE_SIZE`]. Existing files read the root page at the default
+    /// New files are initialized with a metadata(meta) page using
+    /// [`DEFAULT_PAGE_SIZE`]. Existing files read the meta page at the default
     /// size first so the stored page size can be discovered.
     pub fn open(path: impl Into<PathBuf>, capacity: usize) -> io::Result<Self> {
         let inner = OpenOptions::new()
@@ -410,12 +410,30 @@ impl Pager {
         };
 
         if len >= DEFAULT_PAGE_SIZE as u64 {
-            let page_size = out.page(
+            out.page_size = out.page(
                 META_PAGE_ID,
                 AccessContext::maintenance("startup"),
-                |p| p.page_size(),
-            )?;
-            out.page_size = page_size;
+                |p| -> io::Result<u16> {
+                    if PageFlags::from_bits(p.flags())
+                        .expect("is valid flag bits")
+                        .is_set(PageFlags::IsMeta)
+                    {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "unable to locate database meta page",
+                        ));
+                    }
+
+                    if p.format_version() != FORMAT_VERSION {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "unsupported format version",
+                        ));
+                    }
+
+                    Ok(p.page_size())
+                },
+            )??;
         } else {
             let mut meta_page = Page::new(DEFAULT_PAGE_SIZE, PageFlags::IsMeta);
             out.flush(META_PAGE_ID, &mut meta_page)?;

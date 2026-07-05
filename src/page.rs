@@ -139,16 +139,6 @@ pub struct Page {
     inner: Box<[u8]>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-pub enum PageKind {
-    Meta,
-    Leaf,
-    Root,
-    Internal,
-    Overflow,
-    Free,
-}
-
 bitflags! {
     /// [`PageFlags`] is a set of all possible flags to a page
     #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
