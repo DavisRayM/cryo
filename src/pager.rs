@@ -73,14 +73,16 @@ fn load_page(
     Ok(page)
 }
 
-/// Writes a [`Page`] to `writer`.
+/// Durably persists a [`Page`] to the given `writer` file, guaranteeing that
+/// the written bytes are safely flushed and stored on disk.
 ///
-/// Before writing, this updates the [`Page`]'s magic bytes and recalculates
-/// its checksum so the persisted [`Page`] can be validated during durability checks.
+/// Prior to writing, this refreshes the [`Page`]'s magic bytes and recomputes
+/// its checksum, ensuring the persisted [`Page`] can be verified during
+/// durability checks.
 fn write_page(
     page_id: usize,
     size: usize,
-    writer: &mut (impl Write + Seek),
+    writer: &mut File,
     page: &mut Page,
 ) -> io::Result<()> {
     info!("writing page {page_id} (size: {size})");
@@ -91,12 +93,21 @@ fn write_page(
         ));
     }
 
-    let offset = (page_id - 1) * size;
-
     page.set_magic();
     page.set_checksum(page.compute_checksum());
+
+    let offset = (page_id - 1) * size;
+    let size = writer.metadata()?.len();
+
+    if offset > size as usize {
+        // If offset is past the written size, resize the file till offset
+        // and write page.
+        writer.set_len(offset as u64)?;
+    }
+
     writer.seek(SeekFrom::Start(offset as u64))?;
     writer.write_all(&page[..])?;
+    writer.sync_all()?;
 
     Ok(())
 }
@@ -367,12 +378,9 @@ impl fmt::Debug for CachedPage {
 /// [`CachedPage::handles`] is only ever taken on its own (never while another
 /// pager lock is held), so it sits outside this hierarchy. A lock later in the
 /// chain must never be held while acquiring one earlier in the chain.
-pub struct Pager<F>
-where
-    F: Read + Write + Seek,
-{
+pub struct Pager {
     capacity: usize,
-    inner: sync::Mutex<F>,
+    inner: sync::Mutex<File>,
     page_size: u16,
     flush_guard: sync::Arc<dyn FlushGuard>,
 
@@ -417,10 +425,81 @@ impl fmt::Debug for CacheInfo {
     }
 }
 
-impl<F> Pager<F>
-where
-    F: Read + Write + Seek,
-{
+impl Pager {
+    /// Opens an existing pager file or creates a new one.
+    ///
+    /// New files are initialized with a root leaf page using
+    /// [`DEFAULT_PAGE_SIZE`]. Existing files read the root page at the default
+    /// size first so the stored page size can be discovered.
+    pub fn open(path: impl Into<PathBuf>, capacity: usize) -> io::Result<Self> {
+        let inner = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .custom_flags(O_DIRECT)
+            .open(path.into())?;
+        let len = inner.metadata()?.len();
+
+        let mut out = Self {
+            capacity,
+            clock: sync::Mutex::new(ClockState {
+                hand: 0,
+                ring: vec![],
+            }),
+            flush_guard: sync::Arc::new(NoopFlushGuard),
+            inner: sync::Mutex::new(inner),
+            page_size: DEFAULT_PAGE_SIZE,
+            pages: sync::RwLock::new(HashMap::with_capacity(capacity)),
+        };
+
+        if len >= DEFAULT_PAGE_SIZE as u64 {
+            let page_size = out.page(
+                ROOT_PAGE_ID,
+                AccessContext::maintenance("startup"),
+                |p| p.page_size(),
+            )?;
+            out.page_size = page_size;
+        } else {
+            let mut root = create_page(
+                PageFlags::IsRoot,
+                DEFAULT_PAGE_SIZE,
+                HEADER_SIZE as u16,
+                true,
+            );
+            out.flush(ROOT_PAGE_ID, &mut root)?;
+        }
+        Ok(out)
+    }
+
+    /// Allocates `Self::page_size` in the storage file. Returning the
+    /// new page_id.
+    pub fn allocate_page(&self, flags: PageFlags) -> io::Result<usize> {
+        let mut inner = self
+            .inner
+            .lock()
+            .map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "page allocate: mutex poisoned",
+                )
+            })?;
+        let size = inner.seek(SeekFrom::End(0))?;
+
+        if size % self.page_size as u64 != 0 {
+            warn!(
+                "page storage file size ({size} bytes) is not a multiple of page size ({} bytes); file structure may be corrupted",
+                self.page_size
+            )
+        }
+
+        let page_id = (size as usize / self.page_size as usize) + 1;
+        let page =
+            create_page(flags, self.page_size, HEADER_SIZE as u16, false);
+        self.track(page_id, page, true)?;
+
+        Ok(page_id)
+    }
+
     /// Set the [`FlushGuard`] for the [`Pager`]. Ensuring the set
     /// guards [`FlushGuard::before_flush`] is called before any data is synced
     /// to disk.
@@ -790,7 +869,7 @@ where
                     "failed to acquire lock on pager state",
                 )
             })?;
-        write_page(page_id, self.page_size as usize, &mut *inner, page)?;
+        write_page(page_id, self.page_size as usize, &mut inner, page)?;
         info!("page flushed: page_id={page_id} page_lsn={page_lsn}");
         Ok(())
     }
@@ -999,69 +1078,7 @@ where
     }
 }
 
-impl Pager<File> {
-    /// Opens an existing pager file or creates a new one.
-    ///
-    /// New files are initialized with a root leaf page using
-    /// [`DEFAULT_PAGE_SIZE`]. Existing files read the root page at the default
-    /// size first so the stored page size can be discovered.
-    pub fn open(path: impl Into<PathBuf>, capacity: usize) -> io::Result<Self> {
-        let mut inner = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .custom_flags(O_DIRECT)
-            .open(path.into())?;
-        let len = inner.metadata()?.len();
-
-        let page_size: u16;
-        let root: Page;
-        let created: bool;
-
-        if len < DEFAULT_PAGE_SIZE as u64 {
-            root = create_page(
-                PageFlags::IsRoot | PageFlags::IsLeaf,
-                DEFAULT_PAGE_SIZE,
-                HEADER_SIZE as u16,
-                true,
-            );
-            created = true;
-            page_size = DEFAULT_PAGE_SIZE;
-        } else {
-            root =
-                load_page(ROOT_PAGE_ID, DEFAULT_PAGE_SIZE as usize, &mut inner)
-                    .map_err(|e| {
-                        io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            format!("corrupted root information: {e}"),
-                        )
-                    })?;
-            created = false;
-            page_size = root.page_size();
-        }
-
-        let out = Self {
-            capacity,
-            clock: sync::Mutex::new(ClockState {
-                hand: 0,
-                ring: vec![],
-            }),
-            flush_guard: sync::Arc::new(NoopFlushGuard),
-            inner: sync::Mutex::new(inner),
-            page_size,
-            pages: sync::RwLock::new(HashMap::with_capacity(capacity)),
-        };
-        trace!("pager initialize: root={root}");
-        out.track(ROOT_PAGE_ID, root, created)?;
-
-        Ok(out)
-    }
-}
-
-impl<F> fmt::Display for Pager<F>
-where
-    F: Read + Write + Seek,
-{
+impl fmt::Display for Pager {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         writeln!(f, "pager contents:")?;
         for i in self.info().iter() {
@@ -1074,56 +1091,70 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Cursor;
+    use tempfile::TempDir;
 
-    fn pager_with_pages(
-        pages: impl IntoIterator<Item = (usize, Page)>,
-    ) -> Pager<Cursor<Vec<u8>>> {
-        let mut inner = Cursor::new(Vec::new());
-
-        for (id, mut page) in pages {
-            write_page(id, DEFAULT_PAGE_SIZE as usize, &mut inner, &mut page)
-                .expect("test page can be written");
-        }
-
-        inner.set_position(0);
-
-        Pager {
-            capacity: 8,
-            clock: sync::Mutex::new(ClockState {
-                hand: 0,
-                ring: vec![],
-            }),
-            flush_guard: sync::Arc::new(NoopFlushGuard),
-            inner: sync::Mutex::new(inner),
-            page_size: DEFAULT_PAGE_SIZE,
-            pages: sync::RwLock::new(HashMap::with_capacity(8)),
-        }
+    fn temp_pager(capacity: usize) -> (TempDir, Pager) {
+        let dir = TempDir::new().expect("temp dir can be created");
+        let path = dir.path().join("cryo.db");
+        let pager = Pager::open(path, capacity).expect("pager can be created");
+        (dir, pager)
     }
 
-    fn test_page(num_keys: u16, marker: u8) -> Page {
-        let mut page = create_page(
-            PageFlags::IsLeaf,
-            DEFAULT_PAGE_SIZE,
-            HEADER_SIZE as u16,
-            false,
-        );
-        page.set_num_keys(num_keys);
-        page.mut_cell(HEADER_SIZE, HEADER_SIZE + 1)[0] = marker;
-        page.set_checksum(page.compute_checksum());
-        page
+    fn pager_with_pages(
+        pages: impl IntoIterator<Item = (u16, u8)>,
+    ) -> (TempDir, Pager, Vec<usize>) {
+        let (dir, pager) = temp_pager(8);
+        let mut ids = Vec::new();
+
+        for (num_keys, marker) in pages {
+            let page_id = pager
+                .allocate_page(PageFlags::IsLeaf)
+                .expect("test page can be allocated");
+            pager
+                .mut_page(
+                    page_id,
+                    AccessContext::maintenance("test setup"),
+                    |page| {
+                        page.set_num_keys(num_keys);
+                        page.mut_cell(HEADER_SIZE, HEADER_SIZE + 1)[0] = marker;
+                    },
+                )
+                .expect("test page can be initialized");
+            pager
+                .flush_page(page_id, false)
+                .expect_err("first flush clears accessed bit");
+            pager
+                .flush_page(page_id, true)
+                .expect("test page can be persisted and evicted");
+            ids.push(page_id);
+        }
+
+        (dir, pager, ids)
+    }
+
+    fn persisted_page(pager: &Pager, page_id: usize) -> io::Result<Page> {
+        let mut inner = pager
+            .inner
+            .lock()
+            .expect("test can lock pager backing store");
+        load_page(page_id, DEFAULT_PAGE_SIZE as usize, &mut *inner)
+    }
+
+    struct FailingFlushGuard;
+
+    impl FlushGuard for FailingFlushGuard {
+        fn before_flush(&self, _page_id: u64, _page: &Page) -> io::Result<()> {
+            Err(io::Error::other("blocked by test guard"))
+        }
     }
 
     #[test]
     fn loads_multiple_pages_from_backing_store() {
-        let pager = pager_with_pages([
-            (1, test_page(10, b'a')),
-            (2, test_page(20, b'b')),
-            (3, test_page(30, b'c')),
-        ]);
+        let (_dir, pager, ids) =
+            pager_with_pages([(10, b'a'), (20, b'b'), (30, b'c')]);
 
         for (id, expected_keys, expected_marker) in
-            [(1, 10, b'a'), (2, 20, b'b'), (3, 30, b'c')]
+            [(ids[0], 10, b'a'), (ids[1], 20, b'b'), (ids[2], 30, b'c')]
         {
             let (num_keys, marker) = pager
                 .page(id, AccessContext::anonymous(), |page| {
@@ -1144,38 +1175,28 @@ mod tests {
             .map(|info| info.page_id)
             .collect::<Vec<_>>();
         cached_ids.sort_unstable();
-        assert_eq!(cached_ids, vec![1, 2, 3]);
+        assert_eq!(cached_ids, ids);
     }
 
     #[test]
     fn accessing_page_not_in_backing_store_returns_unexpected_eof() {
-        let pager = pager_with_pages([(1, test_page(1, b'a'))]);
+        let (_dir, pager, ids) = pager_with_pages([(1, b'a')]);
+        let missing = ids[0] + 1;
 
         let err = pager
-            .page(2, AccessContext::anonymous(), |_| ())
+            .page(missing, AccessContext::anonymous(), |_| ())
             .expect_err("missing page should not load");
 
         assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
         assert!(pager.info().is_empty());
     }
 
-    fn persisted_page(
-        pager: &Pager<Cursor<Vec<u8>>>,
-        page_id: usize,
-    ) -> io::Result<Page> {
-        let mut inner = pager
-            .inner
-            .lock()
-            .expect("test can lock pager backing store");
-        load_page(page_id, DEFAULT_PAGE_SIZE as usize, &mut *inner)
-    }
-
     #[test]
     fn flushing_untracked_page_returns_other() {
-        let pager = pager_with_pages([(1, test_page(1, b'a'))]);
+        let (_dir, pager, ids) = pager_with_pages([(1, b'a')]);
 
         let err = pager
-            .flush_page(1, false)
+            .flush_page(ids[0], false)
             .expect_err("uncached page should not flush");
 
         assert_eq!(err.kind(), io::ErrorKind::Other);
@@ -1183,16 +1204,16 @@ mod tests {
 
     #[test]
     fn flushing_clean_page_with_evict_removes_it_from_cache() {
-        let pager = pager_with_pages([(1, test_page(1, b'a'))]);
+        let (_dir, pager, ids) = pager_with_pages([(1, b'a')]);
 
         pager
-            .page(1, AccessContext::anonymous(), |_| ())
+            .page(ids[0], AccessContext::anonymous(), |_| ())
             .expect("page can be loaded into cache");
 
         assert_eq!(pager.info().len(), 1);
 
         pager
-            .flush_page(1, true)
+            .flush_page(ids[0], true)
             .expect("clean page can be evicted");
 
         assert!(pager.info().is_empty());
@@ -1200,17 +1221,21 @@ mod tests {
 
     #[test]
     fn dirty_page_gets_second_chance_before_flush() {
-        let pager = pager_with_pages([(1, test_page(1, b'a'))]);
+        let (_dir, pager, ids) = pager_with_pages([(1, b'a')]);
 
         pager
-            .mut_page(1, AccessContext::maintenance("test mutation"), |page| {
-                page.set_num_keys(42);
-                page.mut_cell(HEADER_SIZE, HEADER_SIZE + 1)[0] = b'z';
-            })
+            .mut_page(
+                ids[0],
+                AccessContext::maintenance("test mutation"),
+                |page| {
+                    page.set_num_keys(42);
+                    page.mut_cell(HEADER_SIZE, HEADER_SIZE + 1)[0] = b'z';
+                },
+            )
             .expect("page can be mutated");
 
         let err = pager
-            .flush_page(1, false)
+            .flush_page(ids[0], false)
             .expect_err(
                 "recently accessed dirty page should get a second chance",
             );
@@ -1222,7 +1247,7 @@ mod tests {
         assert!(!info[0].accessed);
 
         pager
-            .flush_page(1, false)
+            .flush_page(ids[0], false)
             .expect("dirty page can flush after second chance is cleared");
 
         let info = pager.info();
@@ -1230,42 +1255,46 @@ mod tests {
         assert!(!info[0].dirty);
 
         let persisted =
-            persisted_page(&pager, 1).expect("flushed page is valid");
+            persisted_page(&pager, ids[0]).expect("flushed page is valid");
         assert_eq!(persisted.num_keys(), 42);
         assert_eq!(persisted.cell(HEADER_SIZE, HEADER_SIZE + 1)[0], b'z');
     }
 
     #[test]
     fn dirty_page_can_be_flushed_and_evicted() {
-        let pager = pager_with_pages([(1, test_page(1, b'a'))]);
+        let (_dir, pager, ids) = pager_with_pages([(1, b'a')]);
 
         pager
-            .mut_page(1, AccessContext::maintenance("test mutation"), |page| {
-                page.set_num_keys(7);
-                page.mut_cell(HEADER_SIZE, HEADER_SIZE + 1)[0] = b'x';
-            })
+            .mut_page(
+                ids[0],
+                AccessContext::maintenance("test mutation"),
+                |page| {
+                    page.set_num_keys(7);
+                    page.mut_cell(HEADER_SIZE, HEADER_SIZE + 1)[0] = b'x';
+                },
+            )
             .expect("page can be mutated");
 
         pager
-            .flush_page(1, false)
+            .flush_page(ids[0], false)
             .expect_err("first flush clears accessed bit");
         pager
-            .flush_page(1, true)
+            .flush_page(ids[0], true)
             .expect("second flush writes and evicts dirty page");
 
         assert!(pager.info().is_empty());
 
         let persisted =
-            persisted_page(&pager, 1).expect("flushed page is valid");
+            persisted_page(&pager, ids[0]).expect("flushed page is valid");
         assert_eq!(persisted.num_keys(), 7);
         assert_eq!(persisted.cell(HEADER_SIZE, HEADER_SIZE + 1)[0], b'x');
     }
 
     #[test]
     fn pinned_dirty_page_is_resource_busy() {
-        let pager = pager_with_pages([(1, test_page(1, b'a'))]);
+        let (_dir, pager, ids) = pager_with_pages([(1, b'a')]);
         let cached = pager
-            .get_or_load(1)
+            .get_or_load(ids[0])
             .expect("page can be loaded into cache");
         cached.pin();
         cached
@@ -1276,7 +1305,7 @@ mod tests {
             .store(false, Ordering::Release);
 
         let err = pager
-            .flush_page(1, false)
+            .flush_page(ids[0], false)
             .expect_err("pinned dirty page should not flush");
 
         cached.unpin();
@@ -1284,69 +1313,70 @@ mod tests {
         assert!(pager.info()[0].dirty);
     }
 
-    struct FailingFlushGuard;
-
-    impl FlushGuard for FailingFlushGuard {
-        fn before_flush(&self, _page_id: u64, _page: &Page) -> io::Result<()> {
-            Err(io::Error::other("blocked by test guard"))
-        }
-    }
-
     #[test]
     fn flush_guard_error_prevents_write_and_keeps_page_dirty() {
-        let mut pager = pager_with_pages([(1, test_page(1, b'a'))]);
+        let (_dir, mut pager, ids) = pager_with_pages([(1, b'a')]);
         pager.set_guard(sync::Arc::new(FailingFlushGuard));
 
         pager
-            .mut_page(1, AccessContext::maintenance("test mutation"), |page| {
-                page.set_num_keys(99);
-                page.mut_cell(HEADER_SIZE, HEADER_SIZE + 1)[0] = b'q';
-            })
+            .mut_page(
+                ids[0],
+                AccessContext::maintenance("test mutation"),
+                |page| {
+                    page.set_num_keys(99);
+                    page.mut_cell(HEADER_SIZE, HEADER_SIZE + 1)[0] = b'q';
+                },
+            )
             .expect("page can be mutated");
 
         let cached = pager
-            .get_or_load(1)
+            .get_or_load(ids[0])
             .expect("page remains cached after mutation");
         cached
             .accessed
             .store(false, Ordering::Release);
 
         let err = pager
-            .flush_page(1, false)
+            .flush_page(ids[0], false)
             .expect_err("failing guard should block flush");
 
         assert_eq!(err.kind(), io::ErrorKind::Other);
         assert!(pager.info()[0].dirty);
 
         let persisted =
-            persisted_page(&pager, 1).expect("original page is valid");
+            persisted_page(&pager, ids[0]).expect("original page is valid");
         assert_eq!(persisted.num_keys(), 1);
         assert_eq!(persisted.cell(HEADER_SIZE, HEADER_SIZE + 1)[0], b'a');
     }
 
     #[test]
     fn flush_all_flushes_dirty_pages_and_keeps_them_cached() {
-        let pager = pager_with_pages([
-            (1, test_page(1, b'a')),
-            (2, test_page(2, b'b')),
-        ]);
+        let (_dir, pager, ids) = pager_with_pages([(1, b'a'), (2, b'b')]);
 
         pager
-            .mut_page(1, AccessContext::maintenance("test mutation"), |page| {
-                page.set_num_keys(11);
-                page.mut_cell(HEADER_SIZE, HEADER_SIZE + 1)[0] = b'x';
-            })
+            .mut_page(
+                ids[0],
+                AccessContext::maintenance("test mutation"),
+                |page| {
+                    page.set_num_keys(11);
+                    page.mut_cell(HEADER_SIZE, HEADER_SIZE + 1)[0] = b'x';
+                },
+            )
             .expect("page 1 can be mutated");
         pager
-            .mut_page(2, AccessContext::maintenance("test mutation"), |page| {
-                page.set_num_keys(22);
-                page.mut_cell(HEADER_SIZE, HEADER_SIZE + 1)[0] = b'y';
-            })
+            .mut_page(
+                ids[1],
+                AccessContext::maintenance("test mutation"),
+                |page| {
+                    page.set_num_keys(22);
+                    page.mut_cell(HEADER_SIZE, HEADER_SIZE + 1)[0] = b'y';
+                },
+            )
             .expect("page 2 can be mutated");
 
-        for page_id in [1, 2] {
+        for page_id in &ids {
             pager
-                .get_or_load(page_id)
+                .get_or_load(*page_id)
                 .expect("page remains cached")
                 .accessed
                 .store(false, Ordering::Release);
@@ -1359,32 +1389,31 @@ mod tests {
         let mut info = pager.info();
         info.sort_by_key(|info| info.page_id);
         assert_eq!(info.len(), 2);
-        assert_eq!(info[0].page_id, 1);
+        assert_eq!(info[0].page_id, ids[0]);
         assert!(!info[0].dirty);
-        assert_eq!(info[1].page_id, 2);
+        assert_eq!(info[1].page_id, ids[1]);
         assert!(!info[1].dirty);
 
-        let persisted = persisted_page(&pager, 1).expect("page 1 was flushed");
+        let persisted =
+            persisted_page(&pager, ids[0]).expect("page 1 was flushed");
         assert_eq!(persisted.num_keys(), 11);
         assert_eq!(persisted.cell(HEADER_SIZE, HEADER_SIZE + 1)[0], b'x');
 
-        let persisted = persisted_page(&pager, 2).expect("page 2 was flushed");
+        let persisted =
+            persisted_page(&pager, ids[1]).expect("page 2 was flushed");
         assert_eq!(persisted.num_keys(), 22);
         assert_eq!(persisted.cell(HEADER_SIZE, HEADER_SIZE + 1)[0], b'y');
     }
 
     #[test]
     fn flush_all_evicts_clean_pages() {
-        let pager = pager_with_pages([
-            (1, test_page(1, b'a')),
-            (2, test_page(2, b'b')),
-        ]);
+        let (_dir, pager, ids) = pager_with_pages([(1, b'a'), (2, b'b')]);
 
         pager
-            .page(1, AccessContext::anonymous(), |_| ())
+            .page(ids[0], AccessContext::anonymous(), |_| ())
             .expect("page 1 can be loaded");
         pager
-            .page(2, AccessContext::anonymous(), |_| ())
+            .page(ids[1], AccessContext::anonymous(), |_| ())
             .expect("page 2 can be loaded");
 
         assert_eq!(pager.info().len(), 2);
@@ -1398,27 +1427,33 @@ mod tests {
 
     #[test]
     fn flush_all_evicts_dirty_pages_after_flush() {
-        let pager = pager_with_pages([
-            (1, test_page(1, b'a')),
-            (2, test_page(2, b'b')),
-        ]);
+        let (_dir, pager, ids) = pager_with_pages([(1, b'a'), (2, b'b')]);
+        eprintln!("pager: {pager} ids: {ids:?}");
 
         pager
-            .mut_page(1, AccessContext::maintenance("test mutation"), |page| {
-                page.set_num_keys(31);
-                page.mut_cell(HEADER_SIZE, HEADER_SIZE + 1)[0] = b'm';
-            })
+            .mut_page(
+                ids[0],
+                AccessContext::maintenance("test mutation"),
+                |page| {
+                    page.set_num_keys(31);
+                    page.mut_cell(HEADER_SIZE, HEADER_SIZE + 1)[0] = b'm';
+                },
+            )
             .expect("page 1 can be mutated");
         pager
-            .mut_page(2, AccessContext::maintenance("test mutation"), |page| {
-                page.set_num_keys(32);
-                page.mut_cell(HEADER_SIZE, HEADER_SIZE + 1)[0] = b'n';
-            })
+            .mut_page(
+                ids[1],
+                AccessContext::maintenance("test mutation"),
+                |page| {
+                    page.set_num_keys(32);
+                    page.mut_cell(HEADER_SIZE, HEADER_SIZE + 1)[0] = b'n';
+                },
+            )
             .expect("page 2 can be mutated");
 
-        for page_id in [1, 2] {
+        for page_id in &ids {
             pager
-                .get_or_load(page_id)
+                .get_or_load(*page_id)
                 .expect("page remains cached")
                 .accessed
                 .store(false, Ordering::Release);
@@ -1430,24 +1465,30 @@ mod tests {
 
         assert!(pager.info().is_empty());
 
-        let persisted = persisted_page(&pager, 1).expect("page 1 was flushed");
+        let persisted =
+            persisted_page(&pager, ids[0]).expect("page 1 was flushed");
         assert_eq!(persisted.num_keys(), 31);
         assert_eq!(persisted.cell(HEADER_SIZE, HEADER_SIZE + 1)[0], b'm');
 
-        let persisted = persisted_page(&pager, 2).expect("page 2 was flushed");
+        let persisted =
+            persisted_page(&pager, ids[1]).expect("page 2 was flushed");
         assert_eq!(persisted.num_keys(), 32);
         assert_eq!(persisted.cell(HEADER_SIZE, HEADER_SIZE + 1)[0], b'n');
     }
 
     #[test]
     fn flush_all_returns_resource_busy_for_recently_accessed_dirty_page() {
-        let pager = pager_with_pages([(1, test_page(1, b'a'))]);
+        let (_dir, pager, ids) = pager_with_pages([(1, b'a')]);
 
         pager
-            .mut_page(1, AccessContext::maintenance("test mutation"), |page| {
-                page.set_num_keys(44);
-                page.mut_cell(HEADER_SIZE, HEADER_SIZE + 1)[0] = b'r';
-            })
+            .mut_page(
+                ids[0],
+                AccessContext::maintenance("test mutation"),
+                |page| {
+                    page.set_num_keys(44);
+                    page.mut_cell(HEADER_SIZE, HEADER_SIZE + 1)[0] = b'r';
+                },
+            )
             .expect("page can be mutated");
 
         let err = pager
@@ -1467,14 +1508,14 @@ mod tests {
         assert!(!pager.info()[0].dirty);
 
         let persisted =
-            persisted_page(&pager, 1).expect("flushed page is valid");
+            persisted_page(&pager, ids[0]).expect("flushed page is valid");
         assert_eq!(persisted.num_keys(), 44);
         assert_eq!(persisted.cell(HEADER_SIZE, HEADER_SIZE + 1)[0], b'r');
     }
 
     #[test]
     fn accessing_page_zero_is_invalid() {
-        let pager = pager_with_pages([(1, test_page(1, b'a'))]);
+        let (_dir, pager, _ids) = pager_with_pages([(1, b'a')]);
 
         let err = pager
             .page(0, AccessContext::anonymous(), |_| ())
