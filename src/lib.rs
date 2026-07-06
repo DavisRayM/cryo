@@ -55,8 +55,11 @@ pub(crate) struct KeyCell {
 }
 
 impl KeyCell {
-    pub(crate) fn with_key(key: Key) -> Self {
-        Self { key, offset: 0 }
+    pub(crate) fn with_key(key: &Key) -> Self {
+        Self {
+            key: *key,
+            offset: 0,
+        }
     }
 
     pub(crate) fn from_bytes(bytes: &[u8]) -> io::Result<Self> {
