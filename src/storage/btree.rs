@@ -1,8 +1,10 @@
-use std::{io, path::PathBuf, sync::Arc};
+use std::{path::PathBuf, sync::Arc};
 
 use super::{
-    AccessContext, Cursor, MetaPage, Page, PageFlags, Pager, TablePage,
+    AccessContext, Cursor, MetaPage, Page, PageFlags, Pager, StorageError,
+    TablePage,
     constants::page::META_PAGE_ID,
+    error::Result,
     page::{AnyPage, AnyPageMut},
 };
 
@@ -19,7 +21,7 @@ pub(crate) struct TreeInner {
 
 impl TreeInner {
     /// Returns the root of the [`Tree`]
-    pub fn root(&self) -> io::Result<usize> {
+    pub fn root(&self) -> Result<usize> {
         self.meta_page(
             AccessContext::maintenance("tree locate root page id"),
             |p| p.tree_root() as usize,
@@ -27,7 +29,7 @@ impl TreeInner {
     }
 
     /// Set current tree root to `root`
-    pub fn set_root(&self, ctx: AccessContext, root: u32) -> io::Result<()> {
+    pub fn set_root(&self, ctx: AccessContext, root: u32) -> Result<()> {
         self.mut_meta_page(ctx, |mut p| {
             p.set_tree_root(root);
         })
@@ -41,7 +43,7 @@ impl TreeInner {
         &self,
         ctx: AccessContext,
         flags: PageFlags,
-    ) -> io::Result<()> {
+    ) -> Result<()> {
         let new_root = self
             .pager
             .allocate_page(ctx, flags | PageFlags::IsRoot)?;
@@ -55,14 +57,14 @@ impl TreeInner {
         &self,
         ctx: AccessContext,
         f: impl FnOnce(MetaPage<&Page>) -> R,
-    ) -> io::Result<R> {
+    ) -> Result<R> {
         self.pager
             .page(META_PAGE_ID, ctx, |p| match p {
                 AnyPage::Meta(p) => Ok(f(p)),
-                _ => Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "expected metadata page, got table instead",
-                )),
+                _ => Err(StorageError::CorruptedData(format!(
+                    "expected metadata page at ID {}",
+                    META_PAGE_ID
+                ))),
             })?
     }
 
@@ -70,14 +72,14 @@ impl TreeInner {
         &self,
         ctx: AccessContext,
         f: impl FnOnce(MetaPage<&mut Page>) -> R,
-    ) -> io::Result<R> {
+    ) -> Result<R> {
         self.pager
             .mut_page(META_PAGE_ID, ctx, |p| match p {
                 AnyPageMut::Meta(p) => Ok(f(p)),
-                _ => Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "expected metadata page, got table instead",
-                )),
+                _ => Err(StorageError::CorruptedData(format!(
+                    "expected metadata page at ID {}",
+                    META_PAGE_ID
+                ))),
             })?
     }
 
@@ -86,14 +88,14 @@ impl TreeInner {
         ctx: AccessContext,
         page_id: usize,
         f: impl FnOnce(TablePage<&Page>) -> R,
-    ) -> io::Result<R> {
+    ) -> Result<R> {
         self.pager
             .page(page_id, ctx, |p| match p {
                 AnyPage::Table(p) => Ok(f(p)),
-                _ => Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "expected table page, got metadata instead",
-                )),
+                _ => Err(StorageError::CorruptedData(format!(
+                    "expected table page at ID {}",
+                    META_PAGE_ID
+                ))),
             })?
     }
 
@@ -102,14 +104,14 @@ impl TreeInner {
         ctx: AccessContext,
         page_id: usize,
         f: impl FnOnce(TablePage<&mut Page>) -> R,
-    ) -> io::Result<R> {
+    ) -> Result<R> {
         self.pager
             .mut_page(page_id, ctx, |p| match p {
                 AnyPageMut::Table(p) => Ok(f(p)),
-                _ => Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "expected table page, got metadata instead",
-                )),
+                _ => Err(StorageError::CorruptedData(format!(
+                    "expected table page at ID {}",
+                    META_PAGE_ID
+                ))),
             })?
     }
 }
@@ -117,10 +119,7 @@ impl TreeInner {
 impl Tree {
     /// Load/Create a [`Tree`] at the given `path`. Initiating table meta page
     /// and tree root if not initiated.
-    pub fn load(
-        path: impl Into<PathBuf>,
-        cache_size: usize,
-    ) -> io::Result<Self> {
+    pub fn load(path: impl Into<PathBuf>, cache_size: usize) -> Result<Self> {
         let tree = Self {
             inner: Arc::new(TreeInner {
                 pager: Pager::open(path, cache_size)?,
@@ -140,7 +139,7 @@ impl Tree {
 
     /// Creates a new [`Cursor`] that can be used to traverse
     /// the tree.
-    pub fn cursor(&self) -> io::Result<Cursor> {
+    pub fn cursor(&self) -> Result<Cursor> {
         Cursor::from_root(&self.inner)
     }
 }

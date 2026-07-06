@@ -1,4 +1,4 @@
-use std::{io, sync::Arc};
+use std::sync::Arc;
 
 use log::{debug, trace, warn};
 
@@ -6,8 +6,8 @@ use log::{debug, trace, warn};
 const MAX_HOPS: usize = 64;
 
 use super::{
-    AccessContext, Page, PageFlags, PageView, TablePage, btree::TreeInner,
-    constants::page::HEADER_SIZE,
+    AccessContext, Page, PageFlags, PageView, StorageError, TablePage,
+    btree::TreeInner, constants::page::HEADER_SIZE, error::Result,
 };
 
 use crate::{
@@ -38,7 +38,7 @@ impl From<(usize, ValueCell)> for CursorValue {
 
 impl Cursor {
     /// Initialize a [`Cursor`] at `root` position of [`super::Tree`]
-    pub(crate) fn from_root(tree: &Arc<TreeInner>) -> io::Result<Self> {
+    pub(crate) fn from_root(tree: &Arc<TreeInner>) -> Result<Self> {
         Ok(Self {
             breadcrumbs: vec![],
             current_page: tree.root()?,
@@ -54,7 +54,7 @@ impl Cursor {
         ctx: AccessContext,
         key: &Key,
         value: Vec<u8>,
-    ) -> io::Result<Option<ValueCell>> {
+    ) -> Result<Option<ValueCell>> {
         self.find(
             AccessContext::maintenance("tree cursor locate insert location"),
             key,
@@ -78,7 +78,7 @@ impl Cursor {
 
     /// Locate the `Leaf` page that would hold `key` and return `key`
     /// bytes if present. This action will leave the cursor at the leaf node.
-    pub fn search(&mut self, key: &Key) -> io::Result<Option<ValueCell>> {
+    pub fn search(&mut self, key: &Key) -> Result<Option<ValueCell>> {
         self.find(
             AccessContext::maintenance("tree cursor locate key position"),
             key,
@@ -101,10 +101,12 @@ impl Cursor {
 
     /// Attempts to locate `key` in tree. Navigating to `key` position while
     /// validating that `MAX_HOPS` is not exceeded.
-    pub fn find(&mut self, ctx: AccessContext, key: &Key) -> io::Result<()> {
+    pub fn find(&mut self, ctx: AccessContext, key: &Key) -> Result<()> {
         for attempt in 0..MAX_HOPS {
             if attempt >= MAX_HOPS {
-                return Err(io::Error::other("cursor reached maximum hops"));
+                return Err(StorageError::RecursionDetected(
+                    "cursor reached maximum hops",
+                ));
             }
 
             trace!(
@@ -127,15 +129,11 @@ impl Cursor {
     /// current page and pushing breadcrumb.
     ///
     /// This function will return `true` once a `Leaf` page is located.
-    fn find_inner(
-        &mut self,
-        ctx: AccessContext,
-        key: &Key,
-    ) -> io::Result<bool> {
+    fn find_inner(&mut self, ctx: AccessContext, key: &Key) -> Result<bool> {
         let next_location = self.tree.table_page(
             ctx,
             self.current_page,
-            |page| -> io::Result<Option<KeyCell>> {
+            |page| -> Result<Option<KeyCell>> {
                 let flags = page.flags();
                 if flags.contains(PageFlags::IsLeaf) {
                     return Ok(None);
@@ -152,11 +150,10 @@ impl Cursor {
                                 KeyCell {
                                     key: page.high_key() as u32,
                                     offset: page.right_pointer().ok_or(
-                                        io::Error::new(
-                                            io::ErrorKind::InvalidData,
-                                            "key position unknown",
-                                        ),
-                                    )?,
+                                        StorageError::CorruptedData(
+                                            format!(
+                                                "unable to locate pointer for high key {} in page {}", page.high_key(), self.current_page))
+                                    )?
                                 }
                             } else {
                                 keys[pos - 1].clone()
@@ -182,11 +179,7 @@ impl Cursor {
     }
 
     /// Inserts new value cell in the page cursor is currently in
-    fn insert_new(
-        &self,
-        ctx: AccessContext,
-        cell: &ValueCell,
-    ) -> io::Result<()> {
+    fn insert_new(&self, ctx: AccessContext, cell: &ValueCell) -> Result<()> {
         self.tree
             .mut_table_page(ctx, self.current_page, |mut page| {
                 let key_count = page.num_keys() as usize;
@@ -198,10 +191,7 @@ impl Cursor {
                 let free_space_end = page.free_space_end() as usize;
 
                 if cell.len() > free_space {
-                    return Err(io::Error::new(
-                        io::ErrorKind::StorageFull,
-                        "cursor insert to page would overflow",
-                    ));
+                    return Err(StorageError::WouldSplit);
                 }
 
                 let new_space_end = free_space_end - cell.len();
@@ -209,7 +199,7 @@ impl Cursor {
                 let new_space = free_space - cell.len();
 
                 if new_space_end < free_space_start {
-                    return Err(io::Error::other("page is heavily fragmented"));
+                    return Err(StorageError::FragmentedPage);
                 }
 
                 let key = KeyCell {
@@ -252,7 +242,7 @@ impl Cursor {
 
                         Ok(())
                     }
-                    Ok(_) => Err(io::Error::other(
+                    Ok(_) => Err(StorageError::NotAllowed(
                         "called insert new on existing key",
                     )),
                 }
@@ -265,9 +255,9 @@ impl Cursor {
         ctx: AccessContext,
         old: &CursorValue,
         updated: &ValueCell,
-    ) -> io::Result<()> {
+    ) -> Result<()> {
         let inserted = self.tree
-            .mut_table_page(ctx, self.current_page, |mut page| -> io::Result<bool> {
+            .mut_table_page(ctx, self.current_page, |mut page| -> Result<bool> {
                 let key = self
                     .key_range(old.idx, old.idx + 1, &page)?
                     .pop()
@@ -304,17 +294,13 @@ impl Cursor {
         &self,
         ctx: AccessContext,
         key: &Key,
-    ) -> io::Result<Option<CursorValue>> {
+    ) -> Result<Option<CursorValue>> {
         self.tree
             .table_page(ctx, self.current_page, |page| {
                 let flags = page.flags();
                 if !flags.contains(PageFlags::IsLeaf) {
-                    return Err(io::Error::new(
-                        io::ErrorKind::Unsupported,
-                        format!(
-                            "attempt to read non-leaf page {}",
-                            self.current_page
-                        ),
+                    return Err(StorageError::NotAllowed(
+                        "attempt to read value from non-leaf page",
                     ));
                 }
 
@@ -352,7 +338,7 @@ impl Cursor {
         start_index: usize,
         end_index: usize,
         page: &impl PageView,
-    ) -> io::Result<Vec<KeyCell>> {
+    ) -> Result<Vec<KeyCell>> {
         let start_offset = HEADER_SIZE + (start_index * KEYCELL_SIZE);
         let end_offset = HEADER_SIZE + (end_index * KEYCELL_SIZE);
 
@@ -363,7 +349,7 @@ impl Cursor {
         let mut keys = bytes
             .chunks(KEYCELL_SIZE)
             .map(KeyCell::from_bytes)
-            .collect::<Vec<io::Result<_>>>();
+            .collect::<Vec<std::io::Result<_>>>();
 
         debug!(
             "cursor key range: start={}:{} end={}:{}",
@@ -383,7 +369,7 @@ impl Cursor {
         &self,
         page: &mut TablePage<&mut Page>,
         key: &KeyCell,
-    ) -> io::Result<()> {
+    ) -> Result<()> {
         if !page
             .flags()
             .contains(PageFlags::IsLeaf)
@@ -419,7 +405,7 @@ impl Cursor {
         &self,
         page: &mut TablePage<&mut Page>,
         key: &KeyCell,
-    ) -> io::Result<()> {
+    ) -> Result<()> {
         let mut keys = self.key_range(0, page.num_keys() as usize, page)?;
 
         match keys.binary_search(key) {
@@ -448,8 +434,7 @@ impl Cursor {
 
                 Ok(())
             }
-            Err(_) => Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
+            Err(_) => Err(StorageError::NotAllowed(
                 "attempt to remove non-existent key",
             )),
         }

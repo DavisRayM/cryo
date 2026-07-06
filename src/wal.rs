@@ -10,7 +10,7 @@ use std::{
 
 use log::{info, trace, warn};
 
-use crate::{FlushGuard, read_be};
+use crate::{FlushGuard, read_be, storage};
 
 const MAGIC: &str = "PD";
 const MAGIC_SIZE: usize = MAGIC.len();
@@ -917,10 +917,11 @@ impl FlushGuard for WalFlushGuard {
         &self,
         _page_id: u64,
         page: &crate::Page,
-    ) -> io::Result<()> {
+    ) -> storage::Result<()> {
         let lsn = Lsn::from(page.latest_lsn());
         self.wal.flush_through(lsn)?;
-        self.wal.sync_all()
+        self.wal.sync_all()?;
+        Ok(())
     }
 }
 

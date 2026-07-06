@@ -182,6 +182,7 @@ dependencies = [
  "postcard",
  "serde",
  "tempfile",
+ "thiserror",
 ]
 
 [[package]]

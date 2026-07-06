@@ -1,11 +1,11 @@
-use crate::storage::page::{AnyPage, AnyPageMut};
-
 use super::{
-    Page, PageFlags,
+    Page, PageFlags, StorageError,
     constants::{
         O_DIRECT,
         page::{FORMAT_VERSION, META_PAGE_ID},
     },
+    error::Result,
+    page::{AnyPage, AnyPageMut},
 };
 use log::{debug, info, trace, warn};
 use std::{
@@ -34,12 +34,11 @@ fn load_page(
     page_id: usize,
     size: usize,
     reader: &mut (impl Read + Seek),
-) -> io::Result<Page> {
+) -> Result<Page> {
     info!("loading page {page_id} (size: {size})");
     if page_id == 0 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "page id can not be zero",
+        return Err(StorageError::InvalidPage(
+            "page ID zero is not allowed".into(),
         ));
     }
 
@@ -51,7 +50,7 @@ fn load_page(
 
     let page = Page::build(buf);
     if let (_, Some(reason)) = page.valid() {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, reason));
+        return Err(StorageError::InvalidPage(reason.into()));
     }
 
     Ok(page)
@@ -68,12 +67,11 @@ fn write_page(
     size: usize,
     writer: &mut File,
     page: &mut Page,
-) -> io::Result<()> {
+) -> Result<()> {
     info!("writing page {page_id} (size: {size})");
     if page_id == 0 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "page id can not be zero",
+        return Err(StorageError::InvalidPage(
+            "page ID zero is not allowed".into(),
         ));
     }
 
@@ -177,7 +175,7 @@ pub struct PageHandle {
 
 impl PageHandle {
     /// Adds this handle to a cached page's diagnostic handle list.
-    pub fn add(&self, page: &CachedPage) -> io::Result<()> {
+    pub fn add(&self, page: &CachedPage) -> Result<()> {
         page.handles
             .lock()
             .map_err(|_e| {
@@ -191,7 +189,7 @@ impl PageHandle {
     }
 
     /// Removes this handle from a cached page's diagnostic handle list.
-    pub fn remove(&self, page: &CachedPage) -> io::Result<()> {
+    pub fn remove(&self, page: &CachedPage) -> Result<()> {
         let mut handles = page
             .handles
             .lock()
@@ -384,7 +382,7 @@ impl Pager {
     /// New files are initialized with a metadata(meta) page using
     /// [`DEFAULT_PAGE_SIZE`]. Existing files read the meta page at the default
     /// size first so the stored page size can be discovered.
-    pub fn open(path: impl Into<PathBuf>, capacity: usize) -> io::Result<Self> {
+    pub fn open(path: impl Into<PathBuf>, capacity: usize) -> Result<Self> {
         let inner = OpenOptions::new()
             .read(true)
             .write(true)
@@ -409,22 +407,16 @@ impl Pager {
             out.page_size = out.page(
                 META_PAGE_ID,
                 AccessContext::maintenance("startup"),
-                |p| -> io::Result<u16> {
-                    match p {
-                        AnyPage::Meta(p) => {
-                            if p.format_version() != FORMAT_VERSION {
-                                return Err(io::Error::new(
-                                    io::ErrorKind::InvalidData,
-                                    "unsupported format version",
-                                ));
-                            }
-                            Ok(p.page_size())
+                |p| match p {
+                    AnyPage::Meta(p) => {
+                        if p.format_version() != FORMAT_VERSION {
+                            return Err(StorageError::FormatVersion);
                         }
-                        _ => Err(io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            "unable to locate database meta page",
-                        )),
+                        Ok(p.page_size())
                     }
+                    _ => Err(StorageError::CorruptedData(
+                        "unable to locate database meta page".into(),
+                    )),
                 },
             )??;
         } else {
@@ -444,7 +436,7 @@ impl Pager {
         &self,
         ctx: AccessContext,
         flags: PageFlags,
-    ) -> io::Result<usize> {
+    ) -> Result<usize> {
         let page_id = self.mut_page(META_PAGE_ID, ctx, |p| match p {
             AnyPageMut::Meta(mut p) => {
                 let page_id = p.next_page();
@@ -452,10 +444,13 @@ impl Pager {
                 if let Some(lsn) = ctx.lsn {
                     p.set_lsn(lsn);
                 }
-                page_id
+
+                Ok(page_id as usize)
             }
-            _ => panic!("meta page id returned a non meta page"),
-        })? as usize;
+            _ => Err(StorageError::CorruptedData(format!(
+                "expected {META_PAGE_ID} to be metadata page"
+            ))),
+        })??;
 
         let page_size = self.page_size as usize;
         let offset = page_id * page_size;
@@ -492,7 +487,7 @@ impl Pager {
         page_id: usize,
         ctx: AccessContext,
         f: impl FnOnce(AnyPage<'_>) -> R,
-    ) -> io::Result<R> {
+    ) -> Result<R> {
         trace!(
             "page {page_id} access start: mode={:?} txn={:?} lsn={:?} reason={:?}",
             AccessMode::Read,
@@ -545,7 +540,7 @@ impl Pager {
         page_id: usize,
         ctx: AccessContext,
         f: impl FnOnce(AnyPageMut) -> R,
-    ) -> io::Result<R> {
+    ) -> Result<R> {
         if ctx.txn_id.is_none() && ctx.reason.is_none() {
             warn!(
                 "mutating page {page_id} without transaction or maintenance context."
@@ -672,7 +667,7 @@ impl Pager {
     ///
     /// This function stops at the first error. Pages flushed before the error remain
     /// flushed, and pages evicted before the error remain evicted.
-    pub fn flush_all(&self, evict: bool) -> io::Result<()> {
+    pub fn flush_all(&self, evict: bool) -> Result<()> {
         let mut pages = self
             .pages
             .read()
@@ -717,7 +712,7 @@ impl Pager {
     /// - [`io::ErrorKind::PermissionDenied`] if the cached page contents write lock
     ///   cannot be acquired.
     /// - Any error returned by the underlying flush operation.
-    pub fn flush_page(&self, page_id: usize, evict: bool) -> io::Result<()> {
+    pub fn flush_page(&self, page_id: usize, evict: bool) -> Result<()> {
         let evicted = self.flush_page_maps_only(page_id, evict)?;
         if evicted {
             self.remove_from_ring(page_id);
@@ -734,32 +729,24 @@ impl Pager {
         &self,
         page_id: usize,
         evict: bool,
-    ) -> io::Result<bool> {
+    ) -> Result<bool> {
         info!("page flush attempt: page={page_id}, evict={evict}");
         let mut pages = self
             .pages
             .write()
-            .map_err(|_| {
-                io::Error::new(
-                    io::ErrorKind::PermissionDenied,
-                    "failed to acquire write lock on page cache",
-                )
-            })?;
+            .map_err(|_| StorageError::LockPoisoned)?;
         let Some(cached_page) = pages.get(&page_id) else {
             info!(
                 "page flush attempt fail: page={page_id}, evict={evict} UNCACHED"
             );
-            return Err(io::Error::other("untracked page"));
+            return Err(StorageError::CacheMiss(page_id));
         };
 
         if cached_page.is_pinned() {
             trace!(
                 "page flush attempt fail: page={page_id}, evict={evict}, pin=true, accessed=?"
             );
-            return Err(io::Error::new(
-                io::ErrorKind::ResourceBusy,
-                "page is in use",
-            ));
+            return Err(StorageError::PagePinned);
         }
 
         if cached_page
@@ -773,31 +760,20 @@ impl Pager {
                 trace!(
                     "page flush attempt fail: page={page_id}, evict={evict}, pin=false, accessed=true"
                 );
-                return Err(io::Error::new(
-                    io::ErrorKind::ResourceBusy,
-                    "page has been accessed recently",
-                ));
+                return Err(StorageError::PagePinned);
             }
 
             let mut page = cached_page
                 .page
                 .write()
-                .map_err(|_e| {
-                    io::Error::new(
-                        io::ErrorKind::PermissionDenied,
-                        "failed to acquire write lock on cached page contents",
-                    )
-                })?;
+                .map_err(|_| StorageError::LockPoisoned)?;
 
             // Re-check; lock might have been acquired after pin
             if cached_page.is_pinned() {
                 trace!(
                     "page flush attempt fail: page={page_id}, evict={evict}, pin=true, accessed=false"
                 );
-                return Err(io::Error::new(
-                    io::ErrorKind::ResourceBusy,
-                    "page is in use",
-                ));
+                return Err(StorageError::PagePinned);
             }
 
             self.flush(page_id, &mut page)?;
@@ -836,7 +812,7 @@ impl Pager {
     }
 
     /// Write [`Page`] to the underlying disk storage.
-    fn flush(&self, page_id: usize, page: &mut Page) -> io::Result<()> {
+    fn flush(&self, page_id: usize, page: &mut Page) -> Result<()> {
         let page_lsn = page.latest_lsn();
 
         info!("page flush requested: page_id={page_id} page_lsn={page_lsn}");
@@ -846,12 +822,7 @@ impl Pager {
         let mut inner = self
             .inner
             .lock()
-            .map_err(|_e| {
-                io::Error::new(
-                    io::ErrorKind::PermissionDenied,
-                    "failed to acquire lock on pager state",
-                )
-            })?;
+            .map_err(|_| StorageError::LockPoisoned)?;
         write_page(page_id, self.page_size as usize, &mut inner, page)?;
         let flags = page.flags();
         info!(
@@ -867,16 +838,11 @@ impl Pager {
     ///
     /// If loading a new page would exceed the configured cache capacity, this
     /// attempts to evict one unpinned page first.
-    fn get_or_load(&self, page_id: usize) -> io::Result<sync::Arc<CachedPage>> {
+    fn get_or_load(&self, page_id: usize) -> Result<sync::Arc<CachedPage>> {
         if let Some(cached_page) = self
             .pages
             .read()
-            .map_err(|_e| {
-                io::Error::new(
-                    io::ErrorKind::PermissionDenied,
-                    "failed to request read lock on pager state",
-                )
-            })?
+            .map_err(|_| StorageError::LockPoisoned)?
             .get(&page_id)
             .cloned()
         {
@@ -895,12 +861,7 @@ impl Pager {
             let pages = self
                 .pages
                 .read()
-                .map_err(|_e| {
-                    io::Error::new(
-                        io::ErrorKind::PermissionDenied,
-                        "failed to request read lock on pager state",
-                    )
-                })?;
+                .map_err(|_| StorageError::LockPoisoned)?;
 
             if let Some(cached_page) = pages.get(&page_id).cloned() {
                 cached_page
@@ -921,12 +882,7 @@ impl Pager {
             let mut inner = self
                 .inner
                 .lock()
-                .map_err(|e| {
-                    io::Error::new(
-                        io::ErrorKind::PermissionDenied,
-                        format!("failed to lock pager state: {e}"),
-                    )
-                })?;
+                .map_err(|_| StorageError::LockPoisoned)?;
             load_page(page_id, self.page_size as usize, &mut *inner)?
         };
         info!("loaded page {page_id}: {page}");
@@ -949,27 +905,17 @@ impl Pager {
         id: usize,
         page: Page,
         dirty: bool,
-    ) -> io::Result<sync::Arc<CachedPage>> {
+    ) -> Result<sync::Arc<CachedPage>> {
         trace!("page start tracking: page={id}, dirty={dirty}");
 
         let mut clock = self
             .clock
             .lock()
-            .map_err(|_e| {
-                io::Error::new(
-                    io::ErrorKind::PermissionDenied,
-                    "failed to acquire clock state lock",
-                )
-            })?;
+            .map_err(|_| StorageError::LockPoisoned)?;
         let mut pages = self
             .pages
             .write()
-            .map_err(|_e| {
-                io::Error::new(
-                    io::ErrorKind::PermissionDenied,
-                    "failed to retrieve write lock",
-                )
-            })?;
+            .map_err(|_| StorageError::LockPoisoned)?;
 
         // Another thread may have loaded and tracked this page while we were
         // reading it from the backing store. Prefer the existing entry so all
@@ -990,19 +936,16 @@ impl Pager {
     /// Evicts a single page from the page cache using a variant of
     /// the Clock Page Replacement algorithm:
     ///   <https://en.wikipedia.org/wiki/Page_replacement_algorithm#Clock>.
-    fn evict_one(&self) -> io::Result<()> {
+    fn evict_one(&self) -> Result<()> {
         let mut clock = self
             .clock
             .lock()
-            .map_err(|_e| {
-                io::Error::new(
-                    io::ErrorKind::PermissionDenied,
-                    "failed to acquire clock state lock",
-                )
-            })?;
+            .map_err(|_| StorageError::LockPoisoned)?;
 
         if clock.ring.is_empty() {
-            return Err(io::Error::other("can not evict from empty cache"));
+            return Err(StorageError::NotAllowed(
+                "can not evict from empty cache",
+            ));
         }
         info!("page evict: candidate=\n\t{:?}", clock.ring);
 
@@ -1026,17 +969,13 @@ impl Pager {
             // try to re-acquire the clock lock, causing a deadlock). Ring
             // cleanup is our responsibility here.
             match self.flush_page_maps_only(page_id, true) {
-                Err(e)
-                    if matches!(
-                        e.kind(),
-                        io::ErrorKind::ResourceBusy
-                            | io::ErrorKind::PermissionDenied
-                    ) =>
-                {
+                Err(StorageError::PagePinned | StorageError::LockPoisoned) => {
                     clock.hand += 1;
                     continue;
                 }
-                Err(e) if e.kind() == io::ErrorKind::Other => {
+                Err(
+                    StorageError::CacheMiss(..) | StorageError::InvalidPage(..),
+                ) => {
                     clock.ring.swap_remove(hand);
                     if clock.hand >= clock.ring.len() && !clock.ring.is_empty()
                     {
@@ -1060,10 +999,7 @@ impl Pager {
         }
 
         debug!("page evict fail: all pages are currently pinned");
-        Err(io::Error::new(
-            io::ErrorKind::WouldBlock,
-            "all cached pages are pinned",
-        ))
+        Err(StorageError::AllInUse)
     }
 }
 
@@ -1134,7 +1070,7 @@ mod tests {
         (dir, pager, ids)
     }
 
-    fn persisted_page(pager: &Pager, page_id: usize) -> io::Result<Page> {
+    fn persisted_page(pager: &Pager, page_id: usize) -> Result<Page> {
         let mut inner = pager
             .inner
             .lock()
@@ -1187,7 +1123,7 @@ mod tests {
     }
 
     #[test]
-    fn accessing_page_not_in_backing_store_returns_unexpected_eof() {
+    fn accessing_page_not_in_backing_store_returns_io_error() {
         let (_dir, pager, ids) = pager_with_pages([(1, b'a')]);
         let missing = ids[0] + 1;
 
@@ -1195,19 +1131,22 @@ mod tests {
             .page(missing, AccessContext::anonymous(), |_| ())
             .expect_err("missing page should not load");
 
-        assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
+        assert!(matches!(err, StorageError::Io(..)));
         assert!(pager.info().is_empty());
     }
 
     #[test]
-    fn flushing_untracked_page_returns_other() {
+    fn flushing_untracked_page_returns_cache_miss() {
         let (_dir, pager, ids) = pager_with_pages([(1, b'a')]);
 
         let err = pager
             .flush_page(ids[0], false)
             .expect_err("uncached page should not flush");
 
-        assert_eq!(err.kind(), io::ErrorKind::Other);
+        assert!(
+            matches!(err, StorageError::CacheMiss(..)),
+            "should be cache miss"
+        );
     }
 
     #[test]
@@ -1253,7 +1192,7 @@ mod tests {
             .expect_err(
                 "recently accessed dirty page should get a second chance",
             );
-        assert_eq!(err.kind(), io::ErrorKind::ResourceBusy);
+        assert!(matches!(err, StorageError::PagePinned));
 
         let info = pager.info();
         assert_eq!(info.len(), 1);
@@ -1347,7 +1286,7 @@ mod tests {
             .expect_err("pinned dirty page should not flush");
 
         cached.unpin();
-        assert_eq!(err.kind(), io::ErrorKind::ResourceBusy);
+        assert!(matches!(err, StorageError::PagePinned));
         assert!(pager.info()[0].dirty);
     }
 
@@ -1384,7 +1323,7 @@ mod tests {
             .flush_page(ids[0], false)
             .expect_err("failing guard should block flush");
 
-        assert_eq!(err.kind(), io::ErrorKind::Other);
+        assert!(matches!(err, StorageError::Io(..)));
         assert!(pager.info()[0].dirty);
 
         let persisted =
@@ -1613,7 +1552,7 @@ mod tests {
         let err = pager
             .flush_all(false)
             .expect_err("recently accessed dirty page should not flush");
-        assert_eq!(err.kind(), io::ErrorKind::ResourceBusy);
+        assert!(matches!(err, StorageError::PagePinned));
 
         let info = pager.info();
         assert_eq!(info.len(), 1);
@@ -1649,6 +1588,6 @@ mod tests {
             .page(0, AccessContext::anonymous(), |_| ())
             .expect_err("page id zero is invalid");
 
-        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert!(matches!(err, StorageError::InvalidPage(..)));
     }
 }
