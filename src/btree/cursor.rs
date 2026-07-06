@@ -3,8 +3,9 @@ use std::{io, sync::Arc};
 use log::trace;
 
 use crate::{
-    AccessContext, KEYCELL_SIZE, Key, KeyCell, Page, PageFlags, ValueCell,
-    btree::TreeInner, storage::constants::page::HEADER_SIZE,
+    AccessContext, KEYCELL_SIZE, Key, KeyCell, PageFlags, ValueCell,
+    btree::TreeInner,
+    storage::{constants::page::HEADER_SIZE, page::PageView},
 };
 
 pub struct Cursor {
@@ -30,7 +31,7 @@ impl From<(usize, ValueCell)> for CursorValue {
 
 impl Cursor {
     /// Initialize a [`Cursor`] at `root` position of [`super::Tree`]
-    pub fn from_root(tree: &Arc<TreeInner>) -> io::Result<Self> {
+    pub(crate) fn from_root(tree: &Arc<TreeInner>) -> io::Result<Self> {
         Ok(Self {
             breadcrumbs: vec![],
             current_page: tree.root()?,
@@ -110,10 +111,9 @@ impl Cursor {
         cell: &ValueCell,
     ) -> io::Result<()> {
         self.tree
-            .pager
-            .mut_page(self.current_page, ctx, |page| {
+            .mut_table_page(ctx, self.current_page, |mut page| {
                 let key_count = page.num_keys() as usize;
-                let keys = self.key_range(0, key_count, page)?;
+                let keys = self.key_range(0, key_count, &page)?;
                 let new_count = key_count + 1;
 
                 let free_space = page.free_space() as usize;
@@ -181,10 +181,9 @@ impl Cursor {
         updated: &ValueCell,
     ) -> io::Result<()> {
         self.tree
-            .pager
-            .mut_page(self.current_page, ctx, |page| {
+            .mut_table_page(ctx, self.current_page, |mut page| {
                 let mut key = self
-                    .key_range(old.idx, old.idx + 1, page)?
+                    .key_range(old.idx, old.idx + 1, &page)?
                     .pop()
                     .expect("should have old key");
 
@@ -236,15 +235,8 @@ impl Cursor {
         key: &Key,
     ) -> io::Result<Option<CursorValue>> {
         self.tree
-            .pager
-            .page(self.current_page, ctx, |page| {
-                let Some(flags) = PageFlags::from_bits(page.flags()) else {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!("corrupted page {} flags", self.current_page),
-                    ));
-                };
-
+            .table_page(ctx, self.current_page, |page| {
+                let flags = page.flags();
                 if !flags.contains(PageFlags::IsLeaf) {
                     return Err(io::Error::new(
                         io::ErrorKind::Unsupported,
@@ -256,7 +248,7 @@ impl Cursor {
                 }
 
                 let count = page.num_keys() as usize;
-                let keys = self.key_range(0, count, page)?;
+                let keys = self.key_range(0, count, &page)?;
 
                 match keys.binary_search(&KeyCell::with_key(key)) {
                     Ok(pos) => {
@@ -277,43 +269,40 @@ impl Cursor {
     ///
     /// This function will return `true` once a `Leaf` page is located.
     fn find(&mut self, ctx: AccessContext, key: &Key) -> io::Result<bool> {
-        let next_location =
-            self.tree
-                .pager
-                .page(self.current_page, ctx, |page| {
-                    let Some(flags) = PageFlags::from_bits(page.flags()) else {
-                        return Err(io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            format!(
-                                "corrupted page {} flags",
-                                self.current_page
-                            ),
-                        ));
-                    };
+        let next_location = self.tree.table_page(
+            ctx,
+            self.current_page,
+            |page| -> io::Result<Option<KeyCell>> {
+                let flags = page.flags();
+                if flags.contains(PageFlags::IsLeaf) {
+                    return Ok(None);
+                }
 
-                    if flags.contains(PageFlags::IsLeaf) {
-                        return Ok(None);
-                    }
+                let count = page.num_keys() as usize;
+                let keys = self.key_range(0, count, &page)?;
 
-                    let count = page.num_keys() as usize;
-                    let keys = self.key_range(0, count, page)?;
-
-                    let next_page =
-                        match keys.binary_search(&KeyCell::with_key(key)) {
-                            Ok(pos) => keys[pos].clone(),
-                            Err(pos) => {
-                                if pos >= keys.len() {
-                                    KeyCell {
-                                        key: page.high_key() as u32,
-                                        offset: page.right_pointer(),
-                                    }
-                                } else {
-                                    keys[pos - 1].clone()
+                let next_page =
+                    match keys.binary_search(&KeyCell::with_key(key)) {
+                        Ok(pos) => keys[pos].clone(),
+                        Err(pos) => {
+                            if pos >= keys.len() {
+                                KeyCell {
+                                    key: page.high_key() as u32,
+                                    offset: page.right_pointer().ok_or(
+                                        io::Error::new(
+                                            io::ErrorKind::InvalidData,
+                                            "key position unknown",
+                                        ),
+                                    )?,
                                 }
+                            } else {
+                                keys[pos - 1].clone()
                             }
-                        };
-                    Ok(Some(next_page))
-                })??;
+                        }
+                    };
+                Ok(Some(next_page))
+            },
+        )??;
 
         if let Some(page) = next_location {
             self.breadcrumbs
@@ -335,7 +324,7 @@ impl Cursor {
         &self,
         start_index: usize,
         end_index: usize,
-        page: &Page,
+        page: &impl PageView,
     ) -> io::Result<Vec<KeyCell>> {
         let start_offset = HEADER_SIZE + (start_index * KEYCELL_SIZE);
         let end_offset = HEADER_SIZE + (end_index * KEYCELL_SIZE);
@@ -361,7 +350,10 @@ impl Cursor {
 mod test {
     use tempfile::TempDir;
 
-    use crate::{AccessContext, KEYCELL_SIZE, KeyCell, ValueCell, btree::Tree};
+    use crate::{
+        AccessContext, KEYCELL_SIZE, KeyCell, ValueCell, btree::Tree,
+        storage::page::AnyPageMut,
+    };
 
     fn temp_tree() -> (TempDir, Tree) {
         let dir = TempDir::new().expect("can create tempdir");
@@ -384,45 +376,51 @@ mod test {
             .mut_page(
                 root,
                 AccessContext::maintenance("test leaf split"),
-                |p| {
-                    let mut initial_start = p.free_space_start() as usize;
-                    let mut initial_end = p.free_space_end() as usize;
+                |p| match p {
+                    AnyPageMut::Table(mut p) => {
+                        let mut initial_start = p.free_space_start() as usize;
+                        let mut initial_end = p.free_space_end() as usize;
 
-                    p.set_free_space(0);
-                    p.set_num_keys(4);
+                        p.set_free_space(0);
+                        p.set_num_keys(4);
 
-                    let sample = [
-                        (5, "asb"),
-                        (20, "230"),
-                        (50, "sdafjl"),
-                        (90, "assdfj"),
-                    ];
-                    let sample = sample
-                        .iter()
-                        .map(|s| ValueCell {
-                            key: s.0,
-                            value: s.1.as_bytes().into(),
-                        })
-                        .map(|r| (r.key, Into::<Box<[u8]>>::into(&r)))
-                        .collect::<Vec<_>>();
+                        let sample = [
+                            (5, "asb"),
+                            (20, "230"),
+                            (50, "sdafjl"),
+                            (90, "assdfj"),
+                        ];
+                        let sample = sample
+                            .iter()
+                            .map(|s| ValueCell {
+                                key: s.0,
+                                value: s.1.as_bytes().into(),
+                            })
+                            .map(|r| (r.key, Into::<Box<[u8]>>::into(&r)))
+                            .collect::<Vec<_>>();
 
-                    for (key, v) in sample {
-                        p.mut_cell(initial_end - v.len(), initial_end)
-                            .copy_from_slice(&v);
-                        initial_end = initial_end - v.len();
+                        for (key, v) in sample {
+                            p.mut_cell(initial_end - v.len(), initial_end)
+                                .copy_from_slice(&v);
+                            initial_end = initial_end - v.len();
 
-                        let key = KeyCell {
-                            key: key,
-                            offset: initial_end as u32,
-                        };
-                        p.mut_cell(initial_start, initial_start + KEYCELL_SIZE)
+                            let key = KeyCell {
+                                key: key,
+                                offset: initial_end as u32,
+                            };
+                            p.mut_cell(
+                                initial_start,
+                                initial_start + KEYCELL_SIZE,
+                            )
                             .copy_from_slice(
                                 Into::<[u8; KEYCELL_SIZE]>::into(&key).as_ref(),
                             );
-                        initial_start += KEYCELL_SIZE;
-                    }
+                            initial_start += KEYCELL_SIZE;
+                        }
 
-                    p.set_free_space_end(initial_start as u16);
+                        p.set_free_space_end(initial_start as u16);
+                    }
+                    _ => panic!("expected a table page"),
                 },
             )
             .expect("can mutate page");
