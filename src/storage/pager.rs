@@ -1,3 +1,5 @@
+use crate::storage::page::{AnyPage, AnyPageMut};
+
 use super::{
     Page, PageFlags,
     constants::{
@@ -408,30 +410,32 @@ impl Pager {
                 META_PAGE_ID,
                 AccessContext::maintenance("startup"),
                 |p| -> io::Result<u16> {
-                    if !PageFlags::from_bits(p.flags())
-                        .expect("is valid flag bits")
-                        .contains(PageFlags::IsMeta)
-                    {
-                        return Err(io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            "unable to locate database meta page",
-                        ));
+                    match p {
+                        AnyPage::Meta(p) => {
+                            if p.format_version() != FORMAT_VERSION {
+                                return Err(io::Error::new(
+                                    io::ErrorKind::InvalidData,
+                                    "unsupported format version",
+                                ));
+                            }
+                            Ok(p.page_size())
+                        }
+                        _ => {
+                            Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "unable to locate database meta page",
+                            ))
+                        }
                     }
-
-                    if p.format_version() != FORMAT_VERSION {
-                        return Err(io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            "unsupported format version",
-                        ));
-                    }
-
-                    Ok(p.page_size())
                 },
             )??;
         } else {
-            let mut meta = Page::new(out.page_size, PageFlags::IsMeta);
+            let mut page = Page::new(out.page_size, PageFlags::IsMeta);
+            let AnyPageMut::Meta(ref mut meta) = page.as_variant_mut() else {
+                panic!("meta page was not created with flags set")
+            };
             meta.set_next_page((META_PAGE_ID + 1) as u16);
-            out.flush(META_PAGE_ID, &mut meta)?;
+            out.flush(META_PAGE_ID, meta)?;
         }
         Ok(out)
     }
@@ -443,13 +447,16 @@ impl Pager {
         ctx: AccessContext,
         flags: PageFlags,
     ) -> io::Result<usize> {
-        let page_id = self.mut_page(META_PAGE_ID, ctx, |p| {
-            let page_id = p.next_page();
-            p.set_next_page(page_id + 1);
-            if let Some(lsn) = ctx.lsn {
-                p.set_lsn(lsn);
+        let page_id = self.mut_page(META_PAGE_ID, ctx, |p| match p {
+            AnyPageMut::Meta(mut p) => {
+                let page_id = p.next_page();
+                p.set_next_page(page_id + 1);
+                if let Some(lsn) = ctx.lsn {
+                    p.set_lsn(lsn);
+                }
+                page_id
             }
-            page_id
+            _ => panic!("meta page id returned a non meta page"),
         })? as usize;
 
         let page_size = self.page_size as usize;
@@ -486,7 +493,7 @@ impl Pager {
         &self,
         page_id: usize,
         ctx: AccessContext,
-        f: impl FnOnce(&Page) -> R,
+        f: impl FnOnce(AnyPage<'_>) -> R,
     ) -> io::Result<R> {
         trace!(
             "page {page_id} access start: mode={:?} txn={:?} lsn={:?} reason={:?}",
@@ -518,7 +525,7 @@ impl Pager {
                         "failed to acquire read lock on page",
                     )
                 })?;
-            f(&page)
+            f(page.as_variant())
         };
         handle.remove(&page)?;
         page.unpin();
@@ -539,7 +546,7 @@ impl Pager {
         &self,
         page_id: usize,
         ctx: AccessContext,
-        f: impl FnOnce(&mut Page) -> R,
+        f: impl FnOnce(AnyPageMut) -> R,
     ) -> io::Result<R> {
         if ctx.txn_id.is_none() && ctx.reason.is_none() {
             warn!(
@@ -577,7 +584,7 @@ impl Pager {
                         "failed to acquire write lock on page",
                     )
                 })?;
-            let out = f(&mut page);
+            let out = f(page.as_variant_mut());
             cached
                 .dirty
                 .store(true, Ordering::Release);
@@ -848,8 +855,7 @@ impl Pager {
                 )
             })?;
         write_page(page_id, self.page_size as usize, &mut inner, page)?;
-        let flags =
-            PageFlags::from_bits(page.flags()).expect("flags is parseable");
+        let flags = page.flags();
         info!(
             "page flushed: page_id={page_id} page_lsn={page_lsn} meta={} leaf={} internal={}",
             flags.contains(PageFlags::IsMeta),
@@ -1102,10 +1108,13 @@ mod tests {
                 .mut_page(
                     page_id,
                     AccessContext::maintenance("test setup"),
-                    |page| {
-                        let start = page.free_space_start() as usize;
-                        page.set_num_keys(num_keys);
-                        page.mut_cell(start, start + 1)[0] = marker;
+                    |page| match page {
+                        AnyPageMut::Table(mut page) => {
+                            let start = page.free_space_start() as usize;
+                            page.set_num_keys(num_keys);
+                            page.mut_cell(start, start + 1)[0] = marker;
+                        }
+                        _ => assert!(false, "setup failed: pager with pages"),
                     },
                 )
                 .expect("test page can be initialized");
@@ -1152,14 +1161,17 @@ mod tests {
             [(ids[0], 10, b'a'), (ids[1], 20, b'b'), (ids[2], 30, b'c')]
         {
             let (num_keys, marker) = pager
-                .page(id, AccessContext::anonymous(), |page| {
-                    (
-                        page.num_keys(),
-                        page.cell(
-                            page.free_space_start() as usize,
-                            page.free_space_start() as usize + 1,
+                .page(id, AccessContext::anonymous(), |page| match page {
+                    AnyPage::Meta(_) => {
+                        panic!("values should not be in meta page")
+                    }
+                    AnyPage::Table(p) => (
+                        p.num_keys(),
+                        p.cell(
+                            p.free_space_start() as usize,
+                            p.free_space_start() as usize + 1,
                         )[0],
-                    )
+                    ),
                 })
                 .expect("page exists in backing store");
 
@@ -1225,12 +1237,15 @@ mod tests {
             .mut_page(
                 ids[0],
                 AccessContext::maintenance("test mutation"),
-                |page| {
-                    page.set_num_keys(42);
-                    page.mut_cell(
-                        page.free_space_start() as usize,
-                        page.free_space_start() as usize + 1,
-                    )[0] = b'z';
+                |page| match page {
+                    AnyPageMut::Table(mut page) => {
+                        let start = page.free_space_start() as usize;
+                        let end = start + 1;
+
+                        page.set_num_keys(42);
+                        page.mut_cell(start, end)[0] = b'z';
+                    }
+                    _ => panic!("values should be inserted into table"),
                 },
             )
             .expect("page can be mutated");
@@ -1257,6 +1272,9 @@ mod tests {
 
         let persisted =
             persisted_page(&pager, ids[0]).expect("flushed page is valid");
+        let AnyPage::Table(persisted) = persisted.as_variant() else {
+            panic!("should be a table")
+        };
         assert_eq!(persisted.num_keys(), 42);
         assert_eq!(
             persisted.cell(
@@ -1275,12 +1293,15 @@ mod tests {
             .mut_page(
                 ids[0],
                 AccessContext::maintenance("test mutation"),
-                |page| {
-                    page.set_num_keys(7);
-                    page.mut_cell(
-                        page.free_space_start() as usize,
-                        page.free_space_start() as usize + 1,
-                    )[0] = b'x';
+                |page| match page {
+                    AnyPageMut::Table(mut page) => {
+                        let start = page.free_space_start() as usize;
+                        let end = start + 1;
+
+                        page.set_num_keys(7);
+                        page.mut_cell(start, end)[0] = b'x';
+                    }
+                    _ => panic!("values should be inserted into table"),
                 },
             )
             .expect("page can be mutated");
@@ -1296,6 +1317,9 @@ mod tests {
 
         let persisted =
             persisted_page(&pager, ids[0]).expect("flushed page is valid");
+        let AnyPage::Table(persisted) = persisted.as_variant() else {
+            panic!("should be a table")
+        };
         assert_eq!(persisted.num_keys(), 7);
         assert_eq!(
             persisted.cell(
@@ -1338,12 +1362,15 @@ mod tests {
             .mut_page(
                 ids[0],
                 AccessContext::maintenance("test mutation"),
-                |page| {
-                    page.set_num_keys(99);
-                    page.mut_cell(
-                        page.free_space_start() as usize,
-                        page.free_space_start() as usize + 1,
-                    )[0] = b'q';
+                |page| match page {
+                    AnyPageMut::Table(mut page) => {
+                        let start = page.free_space_start() as usize;
+                        let end = start + 1;
+
+                        page.set_num_keys(99);
+                        page.mut_cell(start, end)[0] = b'1';
+                    }
+                    _ => panic!("values should be inserted into table"),
                 },
             )
             .expect("page can be mutated");
@@ -1364,6 +1391,9 @@ mod tests {
 
         let persisted =
             persisted_page(&pager, ids[0]).expect("original page is valid");
+        let AnyPage::Table(persisted) = persisted.as_variant() else {
+            panic!("should be a table")
+        };
         assert_eq!(persisted.num_keys(), 1);
         assert_eq!(
             persisted.cell(
@@ -1382,12 +1412,15 @@ mod tests {
             .mut_page(
                 ids[0],
                 AccessContext::maintenance("test mutation"),
-                |page| {
-                    page.set_num_keys(11);
-                    page.mut_cell(
-                        page.free_space_start() as usize,
-                        page.free_space_start() as usize + 1,
-                    )[0] = b'x';
+                |page| match page {
+                    AnyPageMut::Table(mut page) => {
+                        let start = page.free_space_start() as usize;
+                        let end = start + 1;
+
+                        page.set_num_keys(11);
+                        page.mut_cell(start, end)[0] = b'x';
+                    }
+                    _ => panic!("values should be inserted into table"),
                 },
             )
             .expect("page 1 can be mutated");
@@ -1395,12 +1428,15 @@ mod tests {
             .mut_page(
                 ids[1],
                 AccessContext::maintenance("test mutation"),
-                |page| {
-                    page.set_num_keys(22);
-                    page.mut_cell(
-                        page.free_space_start() as usize,
-                        page.free_space_start() as usize + 1,
-                    )[0] = b'y';
+                |page| match page {
+                    AnyPageMut::Table(mut page) => {
+                        let start = page.free_space_start() as usize;
+                        let end = start + 1;
+
+                        page.set_num_keys(22);
+                        page.mut_cell(start, end)[0] = b'y';
+                    }
+                    _ => panic!("values should be inserted into table"),
                 },
             )
             .expect("page 2 can be mutated");
@@ -1427,6 +1463,9 @@ mod tests {
 
         let persisted =
             persisted_page(&pager, ids[0]).expect("page 1 was flushed");
+        let AnyPage::Table(persisted) = persisted.as_variant() else {
+            panic!("should be a table")
+        };
         assert_eq!(persisted.num_keys(), 11);
         assert_eq!(
             persisted.cell(
@@ -1438,6 +1477,9 @@ mod tests {
 
         let persisted =
             persisted_page(&pager, ids[1]).expect("page 2 was flushed");
+        let AnyPage::Table(persisted) = persisted.as_variant() else {
+            panic!("should be a table")
+        };
         assert_eq!(persisted.num_keys(), 22);
         assert_eq!(
             persisted.cell(
@@ -1477,12 +1519,15 @@ mod tests {
             .mut_page(
                 ids[0],
                 AccessContext::maintenance("test mutation"),
-                |page| {
-                    page.set_num_keys(31);
-                    page.mut_cell(
-                        page.free_space_start() as usize,
-                        page.free_space_start() as usize + 1,
-                    )[0] = b'm';
+                |page| match page {
+                    AnyPageMut::Table(mut page) => {
+                        let start = page.free_space_start() as usize;
+                        let end = start + 1;
+
+                        page.set_num_keys(31);
+                        page.mut_cell(start, end)[0] = b'm';
+                    }
+                    _ => panic!("values should be inserted into table"),
                 },
             )
             .expect("page 1 can be mutated");
@@ -1490,12 +1535,15 @@ mod tests {
             .mut_page(
                 ids[1],
                 AccessContext::maintenance("test mutation"),
-                |page| {
-                    page.set_num_keys(32);
-                    page.mut_cell(
-                        page.free_space_start() as usize,
-                        page.free_space_start() as usize + 1,
-                    )[0] = b'n';
+                |page| match page {
+                    AnyPageMut::Table(mut page) => {
+                        let start = page.free_space_start() as usize;
+                        let end = start + 1;
+
+                        page.set_num_keys(32);
+                        page.mut_cell(start, end)[0] = b'n';
+                    }
+                    _ => panic!("values should be inserted into table"),
                 },
             )
             .expect("page 2 can be mutated");
@@ -1516,6 +1564,9 @@ mod tests {
 
         let persisted =
             persisted_page(&pager, ids[0]).expect("page 1 was flushed");
+        let AnyPage::Table(persisted) = persisted.as_variant() else {
+            panic!("should be a table")
+        };
         assert_eq!(persisted.num_keys(), 31);
         assert_eq!(
             persisted.cell(
@@ -1527,6 +1578,9 @@ mod tests {
 
         let persisted =
             persisted_page(&pager, ids[1]).expect("page 2 was flushed");
+        let AnyPage::Table(persisted) = persisted.as_variant() else {
+            panic!("should be a table")
+        };
         assert_eq!(persisted.num_keys(), 32);
         assert_eq!(
             persisted.cell(
@@ -1545,12 +1599,15 @@ mod tests {
             .mut_page(
                 ids[0],
                 AccessContext::maintenance("test mutation"),
-                |page| {
-                    page.set_num_keys(44);
-                    page.mut_cell(
-                        page.free_space_start() as usize,
-                        page.free_space_start() as usize + 1,
-                    )[0] = b'r';
+                |page| match page {
+                    AnyPageMut::Table(mut page) => {
+                        let start = page.free_space_start() as usize;
+                        let end = start + 1;
+
+                        page.set_num_keys(44);
+                        page.mut_cell(start, end)[0] = b'r';
+                    }
+                    _ => panic!("values should be inserted into table"),
                 },
             )
             .expect("page can be mutated");
@@ -1573,6 +1630,9 @@ mod tests {
 
         let persisted =
             persisted_page(&pager, ids[0]).expect("flushed page is valid");
+        let AnyPage::Table(persisted) = persisted.as_variant() else {
+            panic!("should be a table")
+        };
         assert_eq!(persisted.num_keys(), 44);
         assert_eq!(
             persisted.cell(
