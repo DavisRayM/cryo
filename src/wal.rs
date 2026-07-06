@@ -267,6 +267,9 @@ impl From<(Lsn, Record)> for RecordEntry {
 /// `[`20..`]`       bytes        payload
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Record {
+    /// Marks the beginning of log.
+    StartSentinel,
+
     /// Marks the beginning of a transaction.
     Begin { txn_id: u64, prev_lsn: Option<u64> },
 
@@ -397,7 +400,9 @@ impl Record {
             | Self::Abort { txn_id, .. }
             | Self::Compensation { txn_id, .. }
             | Self::End { txn_id, .. } => Some(*txn_id),
-            Self::BeginCheckpoint | Self::EndCheckpoint => None,
+            Self::BeginCheckpoint
+            | Self::EndCheckpoint
+            | Self::StartSentinel => None,
         }
     }
 
@@ -417,7 +422,9 @@ impl Record {
             | Self::Abort { prev_lsn, .. }
             | Self::Compensation { prev_lsn, .. }
             | Self::End { prev_lsn, .. } => *prev_lsn,
-            Self::BeginCheckpoint | Self::EndCheckpoint => None,
+            Self::BeginCheckpoint
+            | Self::EndCheckpoint
+            | Self::StartSentinel => None,
         }
     }
 
@@ -431,6 +438,7 @@ impl Record {
             Self::End { .. } => "end",
             Self::BeginCheckpoint => "begin_checkpoint",
             Self::EndCheckpoint => "end_checkpoint",
+            Self::StartSentinel => "log_start",
         }
     }
 
@@ -583,11 +591,24 @@ impl Logger {
             .truncate(false)
             .open(generation_path(&dir, current_generation))?;
 
-        let (next_lsn, records) =
+        let (mut next_lsn, records) =
             scan_records_from(&mut writer, current_generation, 0)?;
         let flushed_lsn = records
             .last()
             .map(|entry| entry.lsn);
+        let mut buffer = VecDeque::new();
+
+        let lsn: u64 = next_lsn.into();
+        if lsn == 0 {
+            let lsn = next_lsn;
+            next_lsn = lsn
+                .advanced_by(Record::StartSentinel.len() as u32)
+                .expect("can advance lsn");
+            buffer.push_back(RecordEntry {
+                lsn,
+                record: Record::StartSentinel,
+            });
+        }
 
         // Position the append handle at the end of the valid prefix so a
         // trailing partial frame is overwritten by the next append.
@@ -604,7 +625,7 @@ impl Logger {
                 dir,
                 writer,
                 current_generation,
-                buffer: VecDeque::new(),
+                buffer,
                 next_lsn,
                 flushed_lsn,
             }),
@@ -986,7 +1007,8 @@ mod tests {
             txn_id: 1,
             prev_lsn: None,
         };
-        let expected_begin_lsn = Lsn::new(0, 0);
+        let expected_begin_lsn =
+            Lsn::new(0, Record::StartSentinel.len() as u32);
         let expected_update_lsn = expected_begin_lsn
             .advanced_by(begin.len() as u32)
             .unwrap();
@@ -1006,7 +1028,7 @@ mod tests {
                 .unwrap()
                 .buffer
                 .len(),
-            2
+            3
         );
 
         logger
@@ -1026,9 +1048,9 @@ mod tests {
         let records = logger
             .read_all()
             .expect("flushed WAL records can be read");
-        assert_eq!(records.len(), 1);
-        assert_eq!(records[0].lsn, begin_lsn);
-        assert_eq!(records[0].record.kind(), "begin");
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[1].lsn, begin_lsn);
+        assert_eq!(records[1].record.kind(), "begin");
 
         logger
             .flush_through(update_lsn)
@@ -1046,11 +1068,11 @@ mod tests {
         let records = logger
             .read_all()
             .expect("all flushed WAL records can be read");
-        assert_eq!(records.len(), 2);
-        assert_eq!(records[0].lsn, begin_lsn);
-        assert_eq!(records[1].lsn, update_lsn);
-        assert_eq!(records[1].record.kind(), "update");
-        assert_eq!(records[1].record.prev_lsn(), Some(begin_lsn.into()));
+        assert_eq!(records.len(), 3);
+        assert_eq!(records[1].lsn, begin_lsn);
+        assert_eq!(records[2].lsn, update_lsn);
+        assert_eq!(records[2].record.kind(), "update");
+        assert_eq!(records[2].record.prev_lsn(), Some(begin_lsn.into()));
     }
 
     #[test]
@@ -1156,7 +1178,9 @@ mod tests {
                 .expect("record can be synced");
         }
 
-        let mut bytes = std::fs::read(&path).expect("wal file can be read");
+        let mut bytes = std::fs::read(&path).expect("wal file can be read")
+            [Record::StartSentinel.len()..]
+            .to_vec();
         let last = bytes.len() - 1;
         bytes[last] ^= 0xff;
 
@@ -1605,7 +1629,7 @@ mod tests {
                 .iter()
                 .map(|e| e.lsn())
                 .collect::<Vec<_>>(),
-            vec![begin, update]
+            vec![Lsn::new(0, 0), begin, update]
         );
     }
 }
