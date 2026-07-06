@@ -337,7 +337,7 @@ impl fmt::Debug for CachedPage {
 pub struct Pager {
     capacity: usize,
     inner: sync::Mutex<File>,
-    page_size: u16,
+    pub page_size: u16,
     flush_guard: sync::Arc<dyn FlushGuard>,
 
     clock: sync::Mutex<ClockState>,

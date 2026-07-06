@@ -180,20 +180,25 @@ impl Page {
     pub fn new(size: u16, flags: PageFlags) -> Self {
         let inner = vec![0; size as usize];
         let mut out = Self::build(inner);
+        out.reset(size, flags);
+        out
+    }
 
-        out.set_flags(flags.bits());
-        out.set_free_space_start(HEADER_SIZE as u16);
-        out.set_free_space_end(size);
-        out.set_free_space(size - HEADER_SIZE as u16);
-        out.set_magic();
-        out.set_checksum(out.compute_checksum());
+    pub fn reset(&mut self, size: u16, flags: PageFlags) {
+        self.mut_cell(0, size as usize)
+            .copy_from_slice(vec![0; size as usize].as_ref());
+
+        self.set_flags(flags.bits());
+        self.set_free_space_start(HEADER_SIZE as u16);
+        self.set_free_space_end(size);
+        self.set_free_space(size - HEADER_SIZE as u16);
+        self.set_magic();
+        self.set_checksum(self.compute_checksum());
 
         if flags.contains(PageFlags::IsMeta) {
-            out.set_page_size(size);
-            out.set_format_version(FORMAT_VERSION);
+            self.set_page_size(size);
+            self.set_format_version(FORMAT_VERSION);
         }
-
-        out
     }
 
     /// Immutable view into the held [`Page`]
