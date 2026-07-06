@@ -641,7 +641,8 @@ mod test {
     }
 
     #[test]
-    fn cursor_insert_splits_tree_if_needed() {
+    #[should_panic(expected = "WouldSplit")]
+    fn cursor_insert_on_split_errors() {
         let (_dir, tree) = filled_leaf_root();
         let record: (u32, &str) = (10, "abc");
 
@@ -652,6 +653,6 @@ mod test {
                 &record.0,
                 record.1.as_bytes().to_vec(),
             )
-            .expect("can insert into filled leaf");
+            .unwrap();
     }
 }
