@@ -1,11 +1,15 @@
 use std::{io, sync::Arc};
 
-use log::trace;
+use log::{trace, warn};
 
 use crate::{
-    AccessContext, KEYCELL_SIZE, Key, KeyCell, PageFlags, ValueCell,
+    AccessContext, KEYCELL_SIZE, Key, KeyCell, Page, PageFlags,
+    VALUECELL_KEY_SIZE, VALUECELL_VALUE_LEN_SIZE, ValueCell,
     btree::TreeInner,
-    storage::{constants::page::HEADER_SIZE, page::PageView},
+    storage::{
+        constants::page::HEADER_SIZE,
+        page::{PageView, TablePage},
+    },
 };
 
 pub struct Cursor {
@@ -104,6 +108,55 @@ impl Cursor {
 }
 
 impl Cursor {
+    /// Locates the next hop to `key` from `Self::current_page`, updating
+    /// current page and pushing breadcrumb.
+    ///
+    /// This function will return `true` once a `Leaf` page is located.
+    fn find(&mut self, ctx: AccessContext, key: &Key) -> io::Result<bool> {
+        let next_location = self.tree.table_page(
+            ctx,
+            self.current_page,
+            |page| -> io::Result<Option<KeyCell>> {
+                let flags = page.flags();
+                if flags.contains(PageFlags::IsLeaf) {
+                    return Ok(None);
+                }
+
+                let count = page.num_keys() as usize;
+                let keys = self.key_range(0, count, &page)?;
+
+                let next_page =
+                    match keys.binary_search(&KeyCell::with_key(key)) {
+                        Ok(pos) => keys[pos].clone(),
+                        Err(pos) => {
+                            if pos >= keys.len() {
+                                KeyCell {
+                                    key: page.high_key() as u32,
+                                    offset: page.right_pointer().ok_or(
+                                        io::Error::new(
+                                            io::ErrorKind::InvalidData,
+                                            "key position unknown",
+                                        ),
+                                    )?,
+                                }
+                            } else {
+                                keys[pos - 1].clone()
+                            }
+                        }
+                    };
+                Ok(Some(next_page))
+            },
+        )??;
+
+        if let Some(page) = next_location {
+            self.breadcrumbs
+                .push((self.current_page, page.clone()));
+            self.current_page = page.offset as usize;
+            return Ok(false);
+        }
+        Ok(true)
+    }
+
     /// Inserts new value cell in the page cursor is currently in
     fn insert_new(
         &self,
@@ -180,47 +233,32 @@ impl Cursor {
         old: &CursorValue,
         updated: &ValueCell,
     ) -> io::Result<()> {
-        self.tree
-            .mut_table_page(ctx, self.current_page, |mut page| {
-                let mut key = self
+        let inserted = self.tree
+            .mut_table_page(ctx, self.current_page, |mut page| -> io::Result<bool> {
+                let key = self
                     .key_range(old.idx, old.idx + 1, &page)?
                     .pop()
                     .expect("should have old key");
 
-                let free_space = page.free_space() as usize;
-                let free_space_start = page.free_space_start() as usize;
-                let free_space_end = page.free_space_end() as usize;
-
-                let mut new_space = free_space + old.val_cell.len();
-                let new_space_end = free_space_end - updated.len();
-
-                if updated.len() > new_space {
-                    return Err(io::Error::new(
-                        io::ErrorKind::StorageFull,
-                        "cursor insert to page would overflow",
-                    ));
+                if old.val_cell.len() >= updated.len() {
+                    self.reclaim_existing(&mut page, &key, &old.val_cell, updated);
+                    Ok(true)
+                } else {
+                    warn!(
+                        "cursor insert existing: page={} unreclaimed={} allocated={}",
+                        self.current_page,
+                        old.val_cell.len(),
+                        updated.len(),
+                    );
+                    self.format_value(&mut page, &key)?;
+                    Ok(false)
                 }
+            })??;
 
-                if new_space_end < free_space_start {
-                    return Err(io::Error::other("page is heavily fragmented"));
-                }
-
-                key.offset = new_space_end as u32;
-                let key_bytes: [u8; KEYCELL_SIZE] = (&key).into();
-                let value_bytes: Box<[u8]> = updated.into();
-                let key_offset = HEADER_SIZE + (old.idx * KEYCELL_SIZE);
-                new_space -= value_bytes.len();
-
-                page.mut_cell(new_space_end, free_space_end)
-                    .copy_from_slice(&value_bytes);
-                page.mut_cell(key_offset, key_offset + KEYCELL_SIZE)
-                    .copy_from_slice(&key_bytes);
-
-                page.set_free_space_end(new_space_end as u16);
-                page.set_free_space(new_space as u16);
-
-                Ok(())
-            })?
+        if !inserted {
+            self.insert_new(ctx, updated)?;
+        }
+        Ok(())
     }
 
     /// Attempts to read [`CursorValue`] of associated `key` in page.
@@ -264,55 +302,6 @@ impl Cursor {
             })?
     }
 
-    /// Locates the next hop to `key` from `Self::current_page`, updating
-    /// current page and pushing breadcrumb.
-    ///
-    /// This function will return `true` once a `Leaf` page is located.
-    fn find(&mut self, ctx: AccessContext, key: &Key) -> io::Result<bool> {
-        let next_location = self.tree.table_page(
-            ctx,
-            self.current_page,
-            |page| -> io::Result<Option<KeyCell>> {
-                let flags = page.flags();
-                if flags.contains(PageFlags::IsLeaf) {
-                    return Ok(None);
-                }
-
-                let count = page.num_keys() as usize;
-                let keys = self.key_range(0, count, &page)?;
-
-                let next_page =
-                    match keys.binary_search(&KeyCell::with_key(key)) {
-                        Ok(pos) => keys[pos].clone(),
-                        Err(pos) => {
-                            if pos >= keys.len() {
-                                KeyCell {
-                                    key: page.high_key() as u32,
-                                    offset: page.right_pointer().ok_or(
-                                        io::Error::new(
-                                            io::ErrorKind::InvalidData,
-                                            "key position unknown",
-                                        ),
-                                    )?,
-                                }
-                            } else {
-                                keys[pos - 1].clone()
-                            }
-                        }
-                    };
-                Ok(Some(next_page))
-            },
-        )??;
-
-        if let Some(page) = next_location {
-            self.breadcrumbs
-                .push((self.current_page, page.clone()));
-            self.current_page = page.offset as usize;
-            return Ok(false);
-        }
-        Ok(true)
-    }
-
     /// Retrieves list of [`KeyCell`] starting from logical `start_index` up till
     /// `end_index`. This function returns [R_start..R_end).
     ///
@@ -343,6 +332,102 @@ impl Cursor {
         }
 
         Ok(out)
+    }
+
+    /// Wipes the [`ValueCell`] pointed to by `key`, removing `key` from page in
+    /// the process.
+    fn format_value(
+        &self,
+        page: &mut TablePage<&mut Page>,
+        key: &KeyCell,
+    ) -> io::Result<()> {
+        if !page
+            .flags()
+            .contains(PageFlags::IsLeaf)
+        {
+            panic!("attempt to format internal page key");
+        }
+
+        self.remove_key(page, key)?;
+
+        let start = key.offset as usize;
+        let value_len = ValueCell::value(page.cell_from(start))?.len();
+        let value_len =
+            VALUECELL_KEY_SIZE + VALUECELL_VALUE_LEN_SIZE + value_len;
+        let initial_free_space = page.free_space();
+
+        page.mut_cell(start, start + value_len)
+            .copy_from_slice(vec![0; value_len].as_ref());
+        page.set_free_space(initial_free_space + value_len as u16);
+
+        if start == page.free_space_end() as usize {
+            page.set_free_space_end((start + value_len) as u16);
+        }
+        Ok(())
+    }
+
+    /// Removes `key` in the table, updating table information as necessary
+    fn remove_key(
+        &self,
+        page: &mut TablePage<&mut Page>,
+        key: &KeyCell,
+    ) -> io::Result<()> {
+        let mut keys = self.key_range(0, page.num_keys() as usize, page)?;
+
+        match keys.binary_search(key) {
+            Ok(pos) => {
+                keys.remove(pos);
+                let key_bytes = keys
+                    .iter()
+                    .flat_map(Into::<[u8; KEYCELL_SIZE]>::into)
+                    .collect::<Vec<_>>();
+                let end = HEADER_SIZE + (keys.len() * KEYCELL_SIZE);
+                let initial_space = page.free_space();
+
+                page.set_num_keys(keys.len() as u16);
+                page.mut_cell(HEADER_SIZE, end)
+                    .clone_from_slice(&key_bytes);
+                page.set_free_space_start(end as u16);
+                page.set_free_space(initial_space - KEYCELL_SIZE as u16);
+
+                Ok(())
+            }
+            Err(_) => Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "attempt to remove non-existent key",
+            )),
+        }
+    }
+
+    /// Reclaim the space previously held by `old` at `key`. This function will
+    /// overwrite the `old` bytes with `updated` bytes, updating free_space when
+    /// necessary.
+    ///
+    /// ## Panics
+    ///
+    /// This function requires that `old` is of greater len or equal to
+    /// `updated`. This check must be done by the caller.
+    fn reclaim_existing(
+        &self,
+        page: &mut TablePage<&mut Page>,
+        key: &KeyCell,
+        old: &ValueCell,
+        updated: &ValueCell,
+    ) {
+        let diff = old.len() - updated.len();
+        let new_space = page.free_space() as usize + diff;
+        let free_space_end = page.free_space_end() as usize;
+        let value_bytes: Box<[u8]> = updated.into();
+        let mut offset = key.offset as usize;
+
+        if offset == free_space_end && diff > 0 {
+            offset += diff;
+            page.set_free_space_end(offset as u16);
+        }
+
+        page.mut_cell(offset, offset + value_bytes.len())
+            .clone_from_slice(&value_bytes);
+        page.set_free_space(new_space as u16);
     }
 }
 

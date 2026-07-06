@@ -420,12 +420,10 @@ impl Pager {
                             }
                             Ok(p.page_size())
                         }
-                        _ => {
-                            Err(io::Error::new(
-                                io::ErrorKind::InvalidData,
-                                "unable to locate database meta page",
-                            ))
-                        }
+                        _ => Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "unable to locate database meta page",
+                        )),
                     }
                 },
             )??;
