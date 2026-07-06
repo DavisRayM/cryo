@@ -1,6 +1,9 @@
 use std::{io, sync::Arc};
 
-use log::{trace, warn};
+use log::{debug, trace, warn};
+
+/// Maximum hops allowed
+const MAX_HOPS: usize = 64;
 
 use crate::{
     AccessContext, KEYCELL_SIZE, Key, KeyCell, Page, PageFlags,
@@ -52,14 +55,10 @@ impl Cursor {
         key: &Key,
         value: Vec<u8>,
     ) -> io::Result<Option<ValueCell>> {
-        while !self.find(ctx, key)? {
-            trace!(
-                "tree cursor search: key={key} current_page={} depth={}",
-                self.current_page,
-                self.breadcrumbs.len()
-            );
-        }
-
+        self.find(
+            AccessContext::maintenance("tree cursor locate insert location"),
+            key,
+        )?;
         let new_cell = ValueCell {
             key: *key,
             value: value.into(),
@@ -80,19 +79,13 @@ impl Cursor {
     /// Locate the `Leaf` page that would hold `key` and return `key`
     /// bytes if present. This action will leave the cursor at the leaf node.
     pub fn search(&mut self, key: &Key) -> io::Result<Option<ValueCell>> {
-        while !self.find(
-            AccessContext::maintenance("tree cursor search locate leaf node"),
+        self.find(
+            AccessContext::maintenance("tree cursor locate key position"),
             key,
-        )? {
-            trace!(
-                "tree cursor search: key={key} current_page={} depth={}",
-                self.current_page,
-                self.breadcrumbs.len()
-            );
-        }
+        )?;
 
         let out = self.read_value(
-            AccessContext::maintenance("tree cursor search read value"),
+            AccessContext::maintenance("tree cursor read key value"),
             key,
         )?;
         trace!(
@@ -105,6 +98,28 @@ impl Cursor {
 
         Ok(out.map(|cv| cv.val_cell))
     }
+
+    /// Attempts to locate `key` in tree. Navigating to `key` position while
+    /// validating that `MAX_HOPS` is not exceeded.
+    pub fn find(&mut self, ctx: AccessContext, key: &Key) -> io::Result<()> {
+        for attempt in 0..MAX_HOPS {
+            if attempt >= MAX_HOPS {
+                return Err(io::Error::other("cursor reached maximum hops"));
+            }
+
+            trace!(
+                "tree cursor search: key={key} current_page={} depth={}",
+                self.current_page,
+                self.breadcrumbs.len()
+            );
+
+            if !self.find_inner(ctx, key)? {
+                break;
+            }
+        }
+
+        Ok(())
+    }
 }
 
 impl Cursor {
@@ -112,7 +127,11 @@ impl Cursor {
     /// current page and pushing breadcrumb.
     ///
     /// This function will return `true` once a `Leaf` page is located.
-    fn find(&mut self, ctx: AccessContext, key: &Key) -> io::Result<bool> {
+    fn find_inner(
+        &mut self,
+        ctx: AccessContext,
+        key: &Key,
+    ) -> io::Result<bool> {
         let next_location = self.tree.table_page(
             ctx,
             self.current_page,
@@ -147,6 +166,11 @@ impl Cursor {
                 Ok(Some(next_page))
             },
         )??;
+
+        trace!(
+            "cursor find next positon: key={} next={:?}",
+            key, next_location
+        );
 
         if let Some(page) = next_location {
             self.breadcrumbs
@@ -192,6 +216,15 @@ impl Cursor {
                     key: cell.key,
                     offset: new_space_end as u32,
                 };
+
+                trace!(
+                    "cursor insert: page={} key={:?} new_space={} space=(start={}, end={})",
+                    self.current_page,
+                    key,
+                    new_space,
+                    new_space_start,
+                    new_space_end,
+                );
 
                 match keys.binary_search(&key) {
                     Err(pos) => {
@@ -287,6 +320,7 @@ impl Cursor {
 
                 let count = page.num_keys() as usize;
                 let keys = self.key_range(0, count, &page)?;
+                trace!("cursor read: key={} page={}", key, self.current_page);
 
                 match keys.binary_search(&KeyCell::with_key(key)) {
                     Ok(pos) => {
@@ -295,6 +329,10 @@ impl Cursor {
                             page.cell_from(key.offset as usize),
                         )?;
 
+                        debug!(
+                            "cursor read success: key={:?} page={}",
+                            key, self.current_page
+                        );
                         Ok(Some((pos, value).into()))
                     }
                     Err(_) => Ok(None),
@@ -327,6 +365,11 @@ impl Cursor {
             .map(KeyCell::from_bytes)
             .collect::<Vec<io::Result<_>>>();
 
+        debug!(
+            "cursor key range: start={}:{} end={}:{}",
+            start_index, start_offset, end_index, end_offset
+        );
+
         for r in keys.drain(..) {
             out.push(r?);
         }
@@ -356,6 +399,11 @@ impl Cursor {
             VALUECELL_KEY_SIZE + VALUECELL_VALUE_LEN_SIZE + value_len;
         let initial_free_space = page.free_space();
 
+        trace!(
+            "cursor format value: key={} offset={} initial_space={} value_len={}",
+            key.key, start, initial_free_space, value_len
+        );
+
         page.mut_cell(start, start + value_len)
             .copy_from_slice(vec![0; value_len].as_ref());
         page.set_free_space(initial_free_space + value_len as u16);
@@ -383,12 +431,20 @@ impl Cursor {
                     .collect::<Vec<_>>();
                 let end = HEADER_SIZE + (keys.len() * KEYCELL_SIZE);
                 let initial_space = page.free_space();
+                let new_space = initial_space - KEYCELL_SIZE as u16;
+
+                trace!(
+                    "cursor remove key: key={} count_after={} space_after={}",
+                    key.key,
+                    keys.len(),
+                    new_space
+                );
 
                 page.set_num_keys(keys.len() as u16);
                 page.mut_cell(HEADER_SIZE, end)
                     .clone_from_slice(&key_bytes);
                 page.set_free_space_start(end as u16);
-                page.set_free_space(initial_space - KEYCELL_SIZE as u16);
+                page.set_free_space(new_space);
 
                 Ok(())
             }
@@ -416,14 +472,15 @@ impl Cursor {
     ) {
         let diff = old.len() - updated.len();
         let new_space = page.free_space() as usize + diff;
-        let free_space_end = page.free_space_end() as usize;
         let value_bytes: Box<[u8]> = updated.into();
-        let mut offset = key.offset as usize;
-
-        if offset == free_space_end && diff > 0 {
-            offset += diff;
-            page.set_free_space_end(offset as u16);
-        }
+        let offset = key.offset as usize;
+        trace!(
+            "cursor reclaim: key={} initial_space={} new_space={} diff={}",
+            key.key,
+            page.free_space(),
+            new_space,
+            diff
+        );
 
         page.mut_cell(offset, offset + value_bytes.len())
             .clone_from_slice(&value_bytes);
