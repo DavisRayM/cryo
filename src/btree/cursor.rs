@@ -4,7 +4,7 @@ use log::trace;
 
 use crate::{
     AccessContext, KEYCELL_SIZE, Key, KeyCell, Page, PageFlags, ValueCell,
-    btree::TreeInner, page::HEADER_SIZE,
+    btree::TreeInner, storage::constants::page::HEADER_SIZE,
 };
 
 pub struct Cursor {

@@ -1,6 +1,10 @@
-//! Pager and page-cache support for on-disk pages.
-//!
-use crate::{Page, PageFlags, page::FORMAT_VERSION};
+use super::{
+    Page, PageFlags,
+    constants::{
+        O_DIRECT,
+        page::{FORMAT_VERSION, META_PAGE_ID},
+    },
+};
 use log::{debug, info, trace, warn};
 use std::{
     collections::HashMap,
@@ -16,15 +20,8 @@ use std::{
     thread::ThreadId,
 };
 
-const O_DIRECT: i32 = 0o40000;
-
 /// Default size, in bytes, used when creating a new database file.
 pub const DEFAULT_PAGE_SIZE: u16 = 4096;
-
-/// Page identifier reserved for the root page.
-///
-/// Page identifiers are one-based; page id `0` is invalid.
-pub const META_PAGE_ID: usize = 1;
 
 /// Loads a [`Page`] of `size` bytes from `reader`.
 ///

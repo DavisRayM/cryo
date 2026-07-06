@@ -3,13 +3,11 @@ use std::io;
 use crc::Crc;
 
 pub mod btree;
-pub mod page;
-pub mod pager;
 pub mod recovery;
+pub mod storage;
 pub mod wal;
 
-pub use page::{Page, PageFlags};
-pub use pager::{AccessContext, Pager};
+pub use storage::{AccessContext, FlushGuard, Page, PageFlags, Pager};
 pub use wal::{Logger, Lsn, Record, RecordEntry, RecordFlags, WalFlushGuard};
 
 /// https://reveng.sourceforge.io/crc-catalogue/all.htm

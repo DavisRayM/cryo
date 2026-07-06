@@ -10,8 +10,7 @@ use std::{
 
 use log::{info, trace, warn};
 
-use crate::pager::FlushGuard;
-use crate::read_be;
+use crate::{FlushGuard, read_be};
 
 const MAGIC: &str = "PD";
 const MAGIC_SIZE: usize = MAGIC.len();

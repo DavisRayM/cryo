@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use clap::Parser;
-use cryo::pager::{AccessContext, Pager};
+use cryo::{AccessContext, Pager};
 use env_logger::Env;
 
 #[derive(Parser, Debug, Clone)]
