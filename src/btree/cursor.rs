@@ -361,12 +361,71 @@ impl Cursor {
 mod test {
     use tempfile::TempDir;
 
-    use crate::{AccessContext, btree::Tree};
+    use crate::{AccessContext, KEYCELL_SIZE, KeyCell, ValueCell, btree::Tree};
 
     fn temp_tree() -> (TempDir, Tree) {
         let dir = TempDir::new().expect("can create tempdir");
         let path = dir.path().join("store.db");
         let tree = Tree::load(path, 8).expect("can load tree");
+
+        (dir, tree)
+    }
+
+    fn filled_leaf_root() -> (TempDir, Tree) {
+        let (dir, tree) = temp_tree();
+
+        let root = tree
+            .inner
+            .root()
+            .expect("can retrieve tree root");
+        assert!(root != 0, "root should be a valid page ID");
+        tree.inner
+            .pager
+            .mut_page(
+                root,
+                AccessContext::maintenance("test leaf split"),
+                |p| {
+                    let mut initial_start = p.free_space_start() as usize;
+                    let mut initial_end = p.free_space_end() as usize;
+
+                    p.set_free_space(0);
+                    p.set_num_keys(4);
+
+                    let sample = [
+                        (5, "asb"),
+                        (20, "230"),
+                        (50, "sdafjl"),
+                        (90, "assdfj"),
+                    ];
+                    let sample = sample
+                        .iter()
+                        .map(|s| ValueCell {
+                            key: s.0,
+                            value: s.1.as_bytes().into(),
+                        })
+                        .map(|r| (r.key, Into::<Box<[u8]>>::into(&r)))
+                        .collect::<Vec<_>>();
+
+                    for (key, v) in sample {
+                        p.mut_cell(initial_end - v.len(), initial_end)
+                            .copy_from_slice(&v);
+                        initial_end = initial_end - v.len();
+
+                        let key = KeyCell {
+                            key: key,
+                            offset: initial_end as u32,
+                        };
+                        p.mut_cell(initial_start, initial_start + KEYCELL_SIZE)
+                            .copy_from_slice(
+                                Into::<[u8; KEYCELL_SIZE]>::into(&key).as_ref(),
+                            );
+                        initial_start += KEYCELL_SIZE;
+                    }
+
+                    p.set_free_space_end(initial_start as u16);
+                },
+            )
+            .expect("can mutate page");
 
         (dir, tree)
     }
@@ -462,5 +521,20 @@ mod test {
         let actual = updated.unwrap();
         assert_eq!(actual.key, record_2.0);
         assert_eq!(actual.value.as_ref(), record_2.1.as_bytes());
+    }
+
+    #[test]
+    fn cursor_insert_splits_tree_if_needed() {
+        let (_dir, tree) = filled_leaf_root();
+        let record: (u32, &str) = (10, "abc");
+
+        tree.cursor()
+            .expect("can init cursor")
+            .insert(
+                AccessContext::maintenance("cursor insert test"),
+                &record.0,
+                record.1.as_bytes().to_vec(),
+            )
+            .expect("can insert into filled leaf");
     }
 }
