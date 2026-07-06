@@ -178,6 +178,7 @@ dependencies = [
  "clap",
  "crc",
  "env_logger",
+ "libc",
  "log",
  "postcard",
  "serde",

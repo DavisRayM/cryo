@@ -1,6 +1,3 @@
-/// O_DIRECT: https://man7.org/linux/man-pages/man2/open.2.html
-pub const O_DIRECT: i32 = 0o40000;
-
 pub mod page {
     //! Constant values utilized in page layout.
     //!

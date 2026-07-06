@@ -1,9 +1,6 @@
 use super::{
     Page, PageFlags, StorageError,
-    constants::{
-        O_DIRECT,
-        page::{FORMAT_VERSION, META_PAGE_ID},
-    },
+    constants::page::{FORMAT_VERSION, META_PAGE_ID},
     error::Result,
     page::{AnyPage, AnyPageMut},
 };
@@ -387,7 +384,8 @@ impl Pager {
             .read(true)
             .write(true)
             .create(true)
-            .custom_flags(O_DIRECT)
+            // NOTE: This has some weird caveats that I need to research more about
+            .custom_flags(libc::O_DIRECT | libc::O_SYNC)
             .open(path.into())?;
         let len = inner.metadata()?.len();
 
