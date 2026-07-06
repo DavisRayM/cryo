@@ -5,14 +5,14 @@ use log::{debug, trace, warn};
 /// Maximum hops allowed
 const MAX_HOPS: usize = 64;
 
+use super::{
+    AccessContext, Page, PageFlags, PageView, TablePage, btree::TreeInner,
+    constants::page::HEADER_SIZE,
+};
+
 use crate::{
-    AccessContext, KEYCELL_SIZE, Key, KeyCell, Page, PageFlags,
-    VALUECELL_KEY_SIZE, VALUECELL_VALUE_LEN_SIZE, ValueCell,
-    btree::TreeInner,
-    storage::{
-        constants::page::HEADER_SIZE,
-        page::{PageView, TablePage},
-    },
+    KEYCELL_SIZE, Key, KeyCell, VALUECELL_KEY_SIZE, VALUECELL_VALUE_LEN_SIZE,
+    ValueCell,
 };
 
 pub struct Cursor {
@@ -493,8 +493,7 @@ mod test {
     use tempfile::TempDir;
 
     use crate::{
-        AccessContext, KEYCELL_SIZE, KeyCell, ValueCell, btree::Tree,
-        storage::page::AnyPageMut,
+        AccessContext, KEYCELL_SIZE, KeyCell, ValueCell, storage::Tree,
     };
 
     fn temp_tree() -> (TempDir, Tree) {
@@ -514,55 +513,48 @@ mod test {
             .expect("can retrieve tree root");
         assert!(root != 0, "root should be a valid page ID");
         tree.inner
-            .pager
-            .mut_page(
-                root,
+            .mut_table_page(
                 AccessContext::maintenance("test leaf split"),
-                |p| match p {
-                    AnyPageMut::Table(mut p) => {
-                        let mut initial_start = p.free_space_start() as usize;
-                        let mut initial_end = p.free_space_end() as usize;
+                root,
+                |mut p| {
+                    let mut initial_start = p.free_space_start() as usize;
+                    let mut initial_end = p.free_space_end() as usize;
 
-                        p.set_free_space(0);
-                        p.set_num_keys(4);
+                    p.set_free_space(0);
+                    p.set_num_keys(4);
 
-                        let sample = [
-                            (5, "asb"),
-                            (20, "230"),
-                            (50, "sdafjl"),
-                            (90, "assdfj"),
-                        ];
-                        let sample = sample
-                            .iter()
-                            .map(|s| ValueCell {
-                                key: s.0,
-                                value: s.1.as_bytes().into(),
-                            })
-                            .map(|r| (r.key, Into::<Box<[u8]>>::into(&r)))
-                            .collect::<Vec<_>>();
+                    let sample = [
+                        (5, "asb"),
+                        (20, "230"),
+                        (50, "sdafjl"),
+                        (90, "assdfj"),
+                    ];
+                    let sample = sample
+                        .iter()
+                        .map(|s| ValueCell {
+                            key: s.0,
+                            value: s.1.as_bytes().into(),
+                        })
+                        .map(|r| (r.key, Into::<Box<[u8]>>::into(&r)))
+                        .collect::<Vec<_>>();
 
-                        for (key, v) in sample {
-                            p.mut_cell(initial_end - v.len(), initial_end)
-                                .copy_from_slice(&v);
-                            initial_end = initial_end - v.len();
+                    for (key, v) in sample {
+                        p.mut_cell(initial_end - v.len(), initial_end)
+                            .copy_from_slice(&v);
+                        initial_end = initial_end - v.len();
 
-                            let key = KeyCell {
-                                key: key,
-                                offset: initial_end as u32,
-                            };
-                            p.mut_cell(
-                                initial_start,
-                                initial_start + KEYCELL_SIZE,
-                            )
+                        let key = KeyCell {
+                            key: key,
+                            offset: initial_end as u32,
+                        };
+                        p.mut_cell(initial_start, initial_start + KEYCELL_SIZE)
                             .copy_from_slice(
                                 Into::<[u8; KEYCELL_SIZE]>::into(&key).as_ref(),
                             );
-                            initial_start += KEYCELL_SIZE;
-                        }
-
-                        p.set_free_space_end(initial_start as u16);
+                        initial_start += KEYCELL_SIZE;
                     }
-                    _ => panic!("expected a table page"),
+
+                    p.set_free_space_end(initial_start as u16);
                 },
             )
             .expect("can mutate page");

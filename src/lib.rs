@@ -2,7 +2,6 @@ use std::io;
 
 use crc::Crc;
 
-pub mod btree;
 pub mod recovery;
 pub mod storage;
 pub mod wal;

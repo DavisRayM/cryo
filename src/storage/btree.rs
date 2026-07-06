@@ -1,22 +1,15 @@
-//! TODO: Move into storage module
-pub mod cursor;
-
 use std::{io, path::PathBuf, sync::Arc};
 
-pub use cursor::Cursor;
-
-use crate::{
-    AccessContext, Page, PageFlags, Pager,
-    storage::{
-        constants::page::META_PAGE_ID,
-        page::{AnyPage, AnyPageMut, MetaPage, TablePage},
-    },
+use super::{
+    AccessContext, Cursor, MetaPage, Page, PageFlags, Pager, TablePage,
+    constants::page::META_PAGE_ID,
+    page::{AnyPage, AnyPageMut},
 };
 
 /// [Tree] is a wrapping structure that signifies a `Blink-Tree` index-organized
 /// table that can be traversed by [`Cursor`].
 pub struct Tree {
-    inner: Arc<TreeInner>,
+    pub(crate) inner: Arc<TreeInner>,
 }
 
 /// Provides standardized access for [`Cursor`] to navigate the [`Tree`]
