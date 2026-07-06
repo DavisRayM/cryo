@@ -162,7 +162,7 @@ impl Page {
     ///
     /// ## Note
     ///
-    /// Suggest utilizing a Vec<u8>, Box<[u8]> or a [u8; N] to avoid
+    /// Suggest utilizing a `Vec<u8>`, `Box<[u8]>` or a `[u8; N]` to avoid
     /// any copying that might be done.
     pub fn build<T>(bytes: T) -> Self
     where

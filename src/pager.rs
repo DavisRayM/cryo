@@ -331,9 +331,6 @@ impl fmt::Debug for CachedPage {
 /// clock  >  pages  >  CachedPage::page  >  inner
 /// ```
 ///
-/// [`CachedPage::handles`] is only ever taken on its own (never while another
-/// pager lock is held), so it sits outside this hierarchy. A lock later in the
-/// chain must never be held while acquiring one earlier in the chain.
 pub struct Pager {
     capacity: usize,
     inner: sync::Mutex<File>,

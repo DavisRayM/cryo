@@ -259,13 +259,13 @@ impl From<(Lsn, Record)> for RecordEntry {
 ///
 /// Record Layout:
 ///
-/// [0..2]       bytes[2]     magic
-/// [2..3]       u8           format
-/// [3..4]       u8           flags
-/// [4..12]      u64          lsn
-/// [12..16]     u32          crc
-/// [16..20]     u32          payload_len
-/// [20..]       bytes        payload
+/// `[`0..2`]`       bytes`[`2`]`     magic
+/// `[`2..3`]`       u8           format
+/// `[`3..4`]`       u8           flags
+/// `[`4..12`]`      u64          lsn
+/// `[`12..16`]`     u32          crc
+/// `[`16..20`]`     u32          payload_len
+/// `[`20..`]`       bytes        payload
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Record {
     /// Marks the beginning of a transaction.

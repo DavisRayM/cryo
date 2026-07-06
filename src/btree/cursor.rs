@@ -29,7 +29,7 @@ impl From<(usize, ValueCell)> for CursorValue {
 }
 
 impl Cursor {
-    /// Initialize a [`Cursor`] at `root` position of [`Tree`]
+    /// Initialize a [`Cursor`] at `root` position of [`super::Tree`]
     pub fn from_root(tree: &Arc<TreeInner>) -> io::Result<Self> {
         Ok(Self {
             breadcrumbs: vec![],
