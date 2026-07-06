@@ -144,7 +144,7 @@ impl ValueCell {
             ));
         }
 
-        let len = u32::from_be_bytes(
+        let len = u16::from_be_bytes(
             bytes[VALUECELL_VALUE_LEN_OFFSET..VALUECELL_HEADER_SIZE]
                 .try_into()
                 .expect("is len sized bytes"),
