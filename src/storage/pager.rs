@@ -423,6 +423,8 @@ impl Pager {
                 panic!("meta page was not created with flags set")
             };
             meta.set_next_page((META_PAGE_ID + 1) as u16);
+            meta.set_format_version(FORMAT_VERSION);
+            meta.set_page_size(DEFAULT_PAGE_SIZE);
             out.flush(META_PAGE_ID, meta)?;
         }
         Ok(out)
@@ -883,7 +885,6 @@ impl Pager {
                 .map_err(|_| StorageError::LockPoisoned)?;
             load_page(page_id, self.page_size as usize, &mut *inner)?
         };
-        info!("loaded page {page_id}: {page}");
 
         self.track(page_id, page, false)
     }
@@ -904,7 +905,7 @@ impl Pager {
         page: Page,
         dirty: bool,
     ) -> Result<sync::Arc<CachedPage>> {
-        trace!("page start tracking: page={id}, dirty={dirty}");
+        trace!("page request tracking: page={id}, dirty={dirty}");
 
         let mut clock = self
             .clock
@@ -922,12 +923,14 @@ impl Pager {
             existing
                 .accessed
                 .store(true, Ordering::Release);
+            trace!("page already tracked: page={id} dirty={dirty}");
             return Ok(existing);
         }
 
         let cached = sync::Arc::new(CachedPage::new(id, page, dirty));
         pages.insert(id, cached.clone());
         clock.ring.push(id);
+        trace!("page tracking: page={id} dirty={dirty}");
         Ok(cached)
     }
 
