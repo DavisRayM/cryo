@@ -1,3 +1,8 @@
+use crate::{
+    Lsn,
+    storage::page::{Mutation, MutationScope},
+};
+
 use super::{
     Page, PageFlags, StorageError,
     constants::page::{FORMAT_VERSION, META_PAGE_ID},
@@ -26,10 +31,23 @@ pub const DEFAULT_PAGE_SIZE: u16 = 4096;
 /// before a page is committed/flushed to disk. A page is only
 /// allowed to flush to disk if `before_flush` is successful.
 pub trait FlushGuard: Send + Sync {
-    fn before_flush(&self, page_id: u64, page: &Page) -> io::Result<()>;
+    fn before_flush(&self, page_id: u64, page: &Page) -> Result<()>;
 }
 
 pub struct NoopFlushGuard;
+
+/// [`ChangeGuard`] defines a guarded function that should be run before a page
+/// change is applied to log the change. The guard will return a [`Lsn`] that is
+/// then used to update the [`Page`] metadata.
+pub trait ChangeGuard: Send + Sync {
+    fn before_change(
+        &self,
+        page_id: u64,
+        changes: Vec<Mutation>,
+    ) -> Result<Option<Lsn>>;
+}
+
+pub struct NoopChangeGuard;
 
 /// Describes how a thread is currently accessing a cached page.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -158,6 +176,7 @@ pub struct Pager {
     inner: sync::Mutex<File>,
     pub page_size: u16,
     flush_guard: sync::Arc<dyn FlushGuard>,
+    change_guard: sync::Arc<dyn ChangeGuard>,
 
     clock: sync::Mutex<ClockState>,
     pages: sync::RwLock<HashMap<usize, sync::Arc<CachedPage>>>,
@@ -188,6 +207,7 @@ impl Pager {
 
         let mut out = Self {
             capacity,
+            change_guard: sync::Arc::new(NoopChangeGuard),
             clock: sync::Mutex::new(ClockState {
                 hand: 0,
                 ring: vec![],
@@ -271,8 +291,15 @@ impl Pager {
     /// Set the [`FlushGuard`] for the [`Pager`]. Ensuring the set
     /// guards [`FlushGuard::before_flush`] is called before any data is synced
     /// to disk.
-    pub fn set_guard(&mut self, guard: sync::Arc<dyn FlushGuard>) {
+    pub fn set_flush_guard(&mut self, guard: sync::Arc<dyn FlushGuard>) {
         self.flush_guard = guard;
+    }
+
+    /// Set the [`ChangeGuard`] for the [`Pager`]. Ensuring the set guards
+    /// [`ChangeGuard::before_change`] is called before any data is synced to
+    /// disk.
+    pub fn set_change_guard(&mut self, guard: sync::Arc<dyn ChangeGuard>) {
+        self.change_guard = guard;
     }
 
     /// Access a [`Page`] with read access.
@@ -374,12 +401,18 @@ impl Pager {
                         "failed to acquire write lock on page",
                     )
                 })?;
-            let out = f(page.as_variant_mut());
+            let mut scope = MutationScope::init(&page);
+            let out = f(scope.as_variant_mut());
+            let lsn = self
+                .change_guard
+                .before_change(page_id as u64, scope.diff(None))?;
+            scope.replay(&mut page);
+
             cached
                 .dirty
                 .store(true, Ordering::Release);
-            if let Some(lsn) = ctx.lsn {
-                page.set_lsn(lsn)
+            if let Some(lsn) = lsn {
+                page.set_lsn(lsn.into());
             }
 
             out
@@ -387,9 +420,11 @@ impl Pager {
         handle.remove(&cached)?;
         cached.unpin();
         trace!(
-            "page {page_id} access end: mode={:?} txn={:?}",
+            "page {page_id} access end: mode={:?} txn={:?} lsn={:?} reason={:?}",
             AccessMode::Write,
             ctx.txn_id,
+            ctx.lsn,
+            ctx.reason,
         );
 
         Ok(out)
@@ -937,8 +972,18 @@ fn write_page(
 }
 
 impl FlushGuard for NoopFlushGuard {
-    fn before_flush(&self, _page_id: u64, _page: &Page) -> io::Result<()> {
+    fn before_flush(&self, _page_id: u64, _page: &Page) -> Result<()> {
         Ok(())
+    }
+}
+
+impl ChangeGuard for NoopChangeGuard {
+    fn before_change(
+        &self,
+        _page_id: u64,
+        _changes: Vec<Mutation>,
+    ) -> Result<Option<Lsn>> {
+        Ok(None)
     }
 }
 
@@ -1086,8 +1131,8 @@ mod tests {
     struct FailingFlushGuard;
 
     impl FlushGuard for FailingFlushGuard {
-        fn before_flush(&self, _page_id: u64, _page: &Page) -> io::Result<()> {
-            Err(io::Error::other("blocked by test guard"))
+        fn before_flush(&self, _page_id: u64, _page: &Page) -> Result<()> {
+            Err(StorageError::NotAllowed("blocked by test guard"))
         }
     }
 
@@ -1298,7 +1343,7 @@ mod tests {
     #[test]
     fn flush_guard_error_prevents_write_and_keeps_page_dirty() {
         let (_dir, mut pager, ids) = pager_with_pages([(1, b'a')]);
-        pager.set_guard(sync::Arc::new(FailingFlushGuard));
+        pager.set_flush_guard(sync::Arc::new(FailingFlushGuard));
 
         pager
             .mut_page(
@@ -1328,7 +1373,10 @@ mod tests {
             .flush_page(ids[0], false)
             .expect_err("failing guard should block flush");
 
-        assert!(matches!(err, StorageError::Io(..)));
+        assert!(
+            matches!(err, StorageError::NotAllowed(..)),
+            "actual {err:?}"
+        );
         assert!(pager.info()[0].dirty);
 
         let persisted =
@@ -1455,7 +1503,6 @@ mod tests {
     #[test]
     fn flush_all_evicts_dirty_pages_after_flush() {
         let (_dir, pager, ids) = pager_with_pages([(1, b'a'), (2, b'b')]);
-        eprintln!("pager: {pager} ids: {ids:?}");
 
         pager
             .mut_page(
