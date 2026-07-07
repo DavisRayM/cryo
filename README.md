@@ -9,6 +9,16 @@ prioritize most is configurability, so I can experiment with different
 mechanics, and observability, so I can see what's happening under the hood and
 debug effectively. Performance and storage efficiency take a back seat to both.
 
+## Documentation
+
+Most of the component design and choices are documented within the code itself. If you'd
+like to dive into how a component works feel free to open the [cargo](https://doc.rust-lang.org/cargo/) documentation
+or explore the source code.
+
+``` sh
+cargo doc --open
+```
+
 ## Progress
 
 ### Storage
