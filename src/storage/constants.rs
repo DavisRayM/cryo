@@ -7,6 +7,9 @@ pub mod page {
     /// Page identifiers are one-based; page id `0` is invalid.
     pub const META_PAGE_ID: usize = 1;
 
+    /// The default maximum allowed gap during page diff.
+    pub const DEFAULT_MERGE_MUTATION_GAP: usize = 4;
+
     pub const MAGIC: [u8; MAGIC_SIZE] = [25, 3, 20, 26, 7, 4, 8, 0];
     pub const MAGIC_SIZE: usize = 8;
     pub const MAGIC_OFFSET: usize = 0;

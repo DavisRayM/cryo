@@ -1,6 +1,7 @@
 use std::{fmt, ops};
 
 use bitflags::bitflags;
+use log::trace;
 
 use crate::CRC32C;
 
@@ -462,6 +463,241 @@ impl<P: PageViewMut> TablePage<P> {
     setter!(set_high_key, u64, NODE_HIGH_KEY_OFFSET);
 }
 
+/// MutationScope is used to track the mutations made to an initial page and
+/// report back the changed byte offsets as well as before and after byte
+/// snapshots
+#[derive(Debug, Clone)]
+pub struct MutationScope {
+    page: Page,
+    initial: Box<[u8]>,
+    diff: Option<Vec<Mutation>>,
+}
+
+/// Mutation provides information on a change that has occurred in a [`Page`].
+/// It tracks the offset, starting bytes and after bytes of the mutation.
+#[derive(Debug, Clone)]
+pub struct Mutation {
+    /// Start and end offset range of the mutation
+    pub offset: MutationOffset,
+    /// Bytes stored at offset before change
+    pub before: Box<[u8]>,
+    /// Bytes stored at offset after change
+    pub after: Box<[u8]>,
+}
+
+#[derive(Debug, Clone)]
+pub struct MutationOffset {
+    pub start: usize,
+    pub end: usize,
+}
+
+impl Mutation {
+    /// Create a new [`Mutation`]
+    pub fn new(
+        start: usize,
+        end: usize,
+        before: impl Into<Box<[u8]>>,
+        after: impl Into<Box<[u8]>>,
+    ) -> Self {
+        Self {
+            offset: MutationOffset { start, end },
+            before: before.into(),
+            after: after.into(),
+        }
+    }
+
+    /// Replay the mutation on the [`Page`]
+    pub fn replay(&self, page: &mut impl PageViewMut) {
+        page.mut_cell(self.offset.start, self.offset.end)
+            .copy_from_slice(&self.after);
+    }
+}
+
+impl MutationScope {
+    /// Initialize a new mutation scope
+    pub fn init(page: &Page) -> Self {
+        Self {
+            page: page.clone(),
+            initial: page.bytes.clone(),
+            diff: None,
+        }
+    }
+
+    /// Replays the actions taken within the [`MutationScope`] onto the `page`.
+    /// This function requires [`MutationScope::diff`] be called before it
+    ///
+    pub fn replay(&self, page: &mut impl PageViewMut) {
+        if let Some(d) = &self.diff {
+            d.iter()
+                .for_each(|m| m.replay(page));
+        }
+    }
+
+    /// Calculates the difference between the initial [`Page`] contents and the
+    /// current [`Page`] contents.
+    pub fn diff(&mut self, max_gap: Option<usize>) -> Vec<Mutation> {
+        if let Some(d) = &self.diff {
+            return d.clone();
+        }
+
+        let after_bytes = &self.page.bytes;
+        let initial_bytes = &self.initial;
+        let mut out = Vec::new();
+        let max_gap = max_gap.unwrap_or(DEFAULT_MERGE_MUTATION_GAP);
+
+        let mut start = 0;
+        let mut end = 0;
+        let mut spotted = false;
+        trace!("page diff start");
+
+        for (i, (after, initial)) in after_bytes
+            .iter()
+            .zip(initial_bytes.iter())
+            .enumerate()
+        {
+            if initial != after {
+                end = i;
+
+                if !spotted {
+                    spotted = true;
+                    start = i;
+                }
+
+                continue;
+            }
+
+            if spotted {
+                end += 1;
+                trace!("page diff spotted: start={start} end={end}");
+                out.push(Mutation::new(
+                    start,
+                    end,
+                    self.initial[start..end].to_vec(),
+                    self.cell(start, end).to_vec(),
+                ));
+            }
+            spotted = false;
+        }
+
+        if spotted {
+            end += 1;
+            trace!("page diff spotted: start={start} end={end}");
+            out.push(Mutation::new(
+                start,
+                end,
+                self.initial[start..end].to_vec(),
+                self.cell(start, end).to_vec(),
+            ));
+        }
+        trace!("page diff end: changes={}", out.len());
+
+        let out = self.coalesce(out, max_gap);
+        self.diff = Some(out.clone());
+        out
+    }
+
+    /// Merges adjacent mutations whose unchanged gap is `<= max_gap` bytes.
+    /// `mutations` must be sorted by offset (as produced by [`MutationScope::diff`]).
+    fn coalesce(
+        &self,
+        mut mutations: Vec<Mutation>,
+        max_gap: usize,
+    ) -> Vec<Mutation> {
+        let mut out: Vec<Mutation> = Vec::with_capacity(mutations.len());
+        let initial_count = mutations.len();
+
+        for m in mutations.drain(..) {
+            let should_merge = match out.last() {
+                Some(last) => {
+                    m.offset
+                        .start
+                        .saturating_sub(last.offset.end)
+                        <= max_gap
+                }
+                None => false,
+            };
+
+            if should_merge {
+                let prev = out.pop().unwrap();
+                out.push(self.merge(prev, m))
+            } else {
+                out.push(m);
+            }
+        }
+
+        trace!(
+            "merge mutations: initial={initial_count} after_merge={}",
+            out.len()
+        );
+
+        out
+    }
+
+    /// Merges two [`Mutation`] together into a single mutation, filling the gap
+    /// between their offsets with current page contents.
+    fn merge(&self, first: Mutation, second: Mutation) -> Mutation {
+        let (left, right) = {
+            if first.offset.start > second.offset.start {
+                (second, first)
+            } else {
+                (first, second)
+            }
+        };
+
+        let mut after = left.after.to_vec();
+        let mut before = left.before.to_vec();
+
+        let fill_bytes = self.cell(left.offset.end, right.offset.start);
+        after.extend(fill_bytes.iter());
+        before.extend(fill_bytes.iter());
+
+        after.extend(right.after.iter());
+        before.extend(right.before.iter());
+
+        trace!(
+            "mutation merge: left=(start={} end={}) right=(start={} end={})",
+            left.offset.start,
+            left.offset.end,
+            right.offset.start,
+            right.offset.end
+        );
+
+        Mutation::new(left.offset.start, right.offset.end, before, after)
+    }
+}
+
+impl MutationScope {
+    /// Convert the basic [`Page`] into a specific variant
+    /// based on its `flags` header.
+    pub fn as_variant(&self) -> AnyPage<'_> {
+        if self
+            .flags()
+            .contains(PageFlags::IsMeta)
+        {
+            AnyPage::Meta(MetaPage { page: &self.page })
+        } else {
+            AnyPage::Table(TablePage { page: &self.page })
+        }
+    }
+
+    /// Convert the basic [`Page`] into a mutable specific variant
+    /// based on its `flags` header.
+    pub fn as_variant_mut(&mut self) -> AnyPageMut<'_> {
+        if self
+            .flags()
+            .contains(PageFlags::IsMeta)
+        {
+            AnyPageMut::Meta(MetaPage {
+                page: &mut self.page,
+            })
+        } else {
+            AnyPageMut::Table(TablePage {
+                page: &mut self.page,
+            })
+        }
+    }
+}
+
 impl ops::DerefMut for Page {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.bytes
@@ -523,6 +759,20 @@ impl<P: PageViewMut> ops::DerefMut for TablePage<P> {
     }
 }
 
+impl ops::Deref for MutationScope {
+    type Target = Page;
+
+    fn deref(&self) -> &Self::Target {
+        &self.page
+    }
+}
+
+impl ops::DerefMut for MutationScope {
+    fn deref_mut(&mut self) -> &mut Page {
+        &mut self.page
+    }
+}
+
 #[cfg(test)]
 mod test {
     use super::*;
@@ -536,5 +786,67 @@ mod test {
         assert_eq!(page.flags(), PageFlags::empty());
         assert_eq!(page.free_space(), 4096);
         assert_ne!(page.bytes[..], vec![0; 4096][..])
+    }
+
+    #[test]
+    fn mutation_scope_diff_actual_changes() {
+        let page = Page::new(512, PageFlags::IsLeaf);
+        let mut scope = MutationScope::init(&page);
+
+        let changes: Vec<(usize, [u8; 3])> =
+            vec![(90, [23, 34, 29]), (120, [12, 10, 0])];
+        let expected: Vec<(usize, Vec<u8>)> =
+            vec![(90, vec![23, 34, 29]), (120, vec![12, 10])];
+
+        match scope.as_variant_mut() {
+            AnyPageMut::Table(mut p) => {
+                for (start, bytes) in changes {
+                    p.mut_cell(start, start + bytes.len())
+                        .copy_from_slice(&bytes);
+                }
+            }
+            _ => assert!(false, "expected page to be leaf variant"),
+        }
+
+        let diff = scope.diff(None);
+        let actual = diff
+            .iter()
+            .map(|m| (m.offset.start, m.after.to_vec()))
+            .collect::<Vec<_>>();
+
+        assert_eq!(diff.len(), 2);
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn mutation_scope_diff_coalesce_gaps() {
+        let page = Page::new(512, PageFlags::IsLeaf);
+        let mut scope = MutationScope::init(&page);
+
+        let changes: Vec<(usize, [u8; 3])> =
+            vec![(90, [23, 34, 29]), (96, [12, 10, 10]), (120, [8, 0, 10])];
+        let expected: Vec<(usize, Vec<u8>)> = vec![
+            (90, vec![23, 34, 29, 0, 0, 0, 12, 10, 10]),
+            (120, vec![8, 0, 10]),
+        ];
+
+        match scope.as_variant_mut() {
+            AnyPageMut::Table(mut p) => {
+                for (start, bytes) in changes {
+                    p.mut_cell(start, start + bytes.len())
+                        .copy_from_slice(&bytes);
+                }
+            }
+            _ => assert!(false, "expected page to be leaf variant"),
+        }
+
+        let diff = scope.diff(None);
+        let actual = diff
+            .iter()
+            .map(|m| (m.offset.start, m.after.to_vec()))
+            .collect::<Vec<_>>();
+
+        assert_eq!(diff.len(), 2);
+        assert_eq!(actual, expected);
     }
 }
