@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{collections::VecDeque, sync::Arc};
 
 use log::{debug, trace, warn};
 
@@ -470,6 +470,128 @@ impl Cursor {
         page.mut_cell(offset, offset + value_bytes.len())
             .clone_from_slice(&value_bytes);
         page.set_free_space(new_space as u16);
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct DebugOpt {
+    /// Stop descent after `max_depth` level
+    pub max_depth: usize,
+    /// Maximum children to show per internal
+    pub max_children: usize,
+    /// Maximum keys to show per leaf
+    pub max_leaf_keys: usize,
+}
+
+impl Default for DebugOpt {
+    fn default() -> Self {
+        Self {
+            max_depth: 3,
+            max_children: 10,
+            max_leaf_keys: 10,
+        }
+    }
+}
+
+impl Cursor {
+    pub fn debug_print(&self, opt: DebugOpt) -> Result<()> {
+        let mut queue = VecDeque::new();
+        queue.push_front((self.tree.root()?, 0, 0));
+
+        let depth_marker = |depth: usize, key: usize| -> String {
+            if depth >= 1 {
+                format!("┗{}(<={})", "━".repeat(depth), key)
+            } else {
+                String::default()
+            }
+        };
+
+        while !queue.is_empty() {
+            let (page, depth, key) = queue
+                .pop_front()
+                .expect("queue isn't empty");
+
+            if depth > opt.max_depth {
+                println!("      <...pruned depth...>        ");
+            }
+            self.tree.table_page(
+                AccessContext::maintenance("debug print"),
+                page,
+                |p| -> Result<()> {
+                    let root = if p
+                        .flags()
+                        .contains(PageFlags::IsRoot)
+                    {
+                        "root"
+                    } else {
+                        ""
+                    };
+
+                    print!("[{}{}#{page} ", depth_marker(depth, key), root);
+                    let key_count = p.num_keys() as usize;
+
+                    match p
+                        .flags()
+                        .contains(PageFlags::IsLeaf)
+                    {
+                        true => {
+                            let end_index = key_count.min(opt.max_leaf_keys);
+                            let keys = self
+                                .key_range(0, end_index, &p)?
+                                .iter()
+                                .map(|k| k.key)
+                                .collect::<Vec<_>>();
+                            let pruned = if end_index < key_count {
+                                format!(
+                                    " (+{} keys hidden)",
+                                    key_count - end_index
+                                )
+                            } else {
+                                String::default()
+                            };
+
+                            print!(
+                                "LEAF n={} lsn={} hi={}]    keys: {keys:?}{pruned}",
+                                p.num_keys(),
+                                p.latest_lsn(),
+                                p.high_key()
+                            );
+                        }
+                        _ => {
+                            let end_index = key_count.min(opt.max_children);
+                            self.key_range(0, end_index, &p)?.iter().for_each(|k| {
+                                queue.push_back((
+                                    k.offset as usize,
+                                    depth + 1,
+                                    k.key as usize,
+                                ))
+                            });
+                            let pruned = if end_index < key_count {
+                                format!(
+                                    " (+{} children pruned)",
+                                    key_count - end_index
+                                )
+                            } else {
+                                String::default()
+                            };
+
+                            print!(
+                                "INTERNAL n={} lsn={} hi={}] {pruned}",
+                                p.num_keys(),
+                                p.latest_lsn(),
+                                p.high_key()
+                            );
+                        }
+                    }
+                    if let Some(right) = p.right_pointer() {
+                        print!("  --right→ #{right}")
+                    }
+                    Ok(())
+                },
+            )??;
+        }
+
+        Ok(())
     }
 }
 
