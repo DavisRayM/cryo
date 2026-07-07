@@ -22,75 +22,6 @@ use std::{
 /// Default size, in bytes, used when creating a new database file.
 pub const DEFAULT_PAGE_SIZE: u16 = 4096;
 
-/// Loads a [`Page`] of `size` bytes from `reader`.
-///
-/// A [`Page`] is valid when the `MAGIC` bytes are present in its
-/// trailer and the stored checksum matches the checksum computed
-/// when the page is loaded.
-fn load_page(
-    page_id: usize,
-    size: usize,
-    reader: &mut (impl Read + Seek),
-) -> Result<Page> {
-    info!("loading page {page_id} (size: {size})");
-    if page_id == 0 {
-        return Err(StorageError::InvalidPage(
-            "page ID zero is not allowed".into(),
-        ));
-    }
-
-    let offset = (page_id - 1) * size;
-    reader.seek(SeekFrom::Start(offset as u64))?;
-
-    let mut buf = vec![0; size];
-    reader.read_exact(&mut buf)?;
-
-    let page = Page::build(buf);
-    if let (_, Some(reason)) = page.valid() {
-        return Err(StorageError::InvalidPage(reason.into()));
-    }
-
-    Ok(page)
-}
-
-/// Durably persists a [`Page`] to the given `writer` file, guaranteeing that
-/// the written bytes are safely flushed and stored on disk.
-///
-/// Prior to writing, this refreshes the [`Page`]'s magic bytes and recomputes
-/// its checksum, ensuring the persisted [`Page`] can be verified during
-/// durability checks.
-fn write_page(
-    page_id: usize,
-    size: usize,
-    writer: &mut File,
-    page: &mut Page,
-) -> Result<()> {
-    info!("writing page {page_id} (size: {size})");
-    if page_id == 0 {
-        return Err(StorageError::InvalidPage(
-            "page ID zero is not allowed".into(),
-        ));
-    }
-
-    page.set_magic();
-    page.set_checksum(page.compute_checksum());
-
-    let offset = (page_id - 1) * size;
-    let size = writer.metadata()?.len();
-
-    if offset > size as usize {
-        // If offset is past the written size, resize the file till offset
-        // and write page.
-        writer.set_len(offset as u64)?;
-    }
-
-    writer.seek(SeekFrom::Start(offset as u64))?;
-    writer.write_all(&page[..])?;
-    writer.sync_all()?;
-
-    Ok(())
-}
-
 /// [`FlushGuard`] defines a guarded function that should be run
 /// before a page is committed/flushed to disk. A page is only
 /// allowed to flush to disk if `before_flush` is successful.
@@ -99,12 +30,6 @@ pub trait FlushGuard: Send + Sync {
 }
 
 pub struct NoopFlushGuard;
-
-impl FlushGuard for NoopFlushGuard {
-    fn before_flush(&self, _page_id: u64, _page: &Page) -> io::Result<()> {
-        Ok(())
-    }
-}
 
 /// Describes how a thread is currently accessing a cached page.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -153,78 +78,6 @@ impl AccessContext {
             lsn: None,
             reason: Some(reason),
         }
-    }
-}
-
-/// Records one active access to a cached page.
-///
-/// Handles are used for cache diagnostics only; pin counts are the source of truth
-/// for eviction safety.
-#[derive(Clone)]
-pub struct PageHandle {
-    pub lsn: Option<u64>,
-    pub mode: AccessMode,
-    pub page_id: usize,
-    pub reason: Option<&'static str>,
-    pub thread_id: ThreadId,
-    pub txn_id: Option<u64>,
-}
-
-impl PageHandle {
-    /// Adds this handle to a cached page's diagnostic handle list.
-    pub fn add(&self, page: &CachedPage) -> Result<()> {
-        page.handles
-            .lock()
-            .map_err(|_e| {
-                io::Error::new(
-                    io::ErrorKind::PermissionDenied,
-                    "failed to acquire lock on cached page handles list",
-                )
-            })?
-            .push(self.clone());
-        Ok(())
-    }
-
-    /// Removes this handle from a cached page's diagnostic handle list.
-    pub fn remove(&self, page: &CachedPage) -> Result<()> {
-        let mut handles = page
-            .handles
-            .lock()
-            .map_err(|_e| {
-                io::Error::new(
-                    io::ErrorKind::PermissionDenied,
-                    "failed to acquire lock on cached page handles list",
-                )
-            })?;
-
-        if let Some(pos) = handles
-            .iter()
-            .position(|h| h.thread_id == self.thread_id && h.mode == self.mode)
-        {
-            handles.swap_remove(pos);
-        }
-        Ok(())
-    }
-}
-
-impl fmt::Display for PageHandle {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "{:?}(page={}, txn={:?}, lsn={:?}, thread={:?}",
-            self.mode, self.page_id, self.txn_id, self.lsn, self.thread_id
-        )?;
-
-        if let Some(reason) = self.reason {
-            write!(f, ", reason={reason}")?;
-        }
-        write!(f, ")")
-    }
-}
-
-impl fmt::Debug for PageHandle {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self)
     }
 }
 
@@ -284,31 +137,6 @@ impl CachedPage {
     }
 }
 
-impl fmt::Display for CachedPage {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "[CACHED")?;
-        if self
-            .dirty
-            .load(Ordering::Acquire)
-        {
-            write!(f, "|DIRTY")?;
-        }
-        write!(
-            f,
-            "]{}",
-            self.page
-                .read()
-                .expect("failed to retrieve read lock")
-        )
-    }
-}
-
-impl fmt::Debug for CachedPage {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self)
-    }
-}
-
 /// A fixed-size page manager backed by a readable, writable, seekable store.
 ///
 /// The pager lazily loads pages from the backing store, caches them in memory,
@@ -340,37 +168,6 @@ pub struct Pager {
 struct ClockState {
     hand: usize,
     ring: Vec<usize>,
-}
-
-/// Snapshot of cache metadata for one cached page.
-#[derive(Clone)]
-pub struct CacheInfo {
-    pub page_id: usize,
-    pub dirty: bool,
-    pub accessed: bool,
-    pub latest_lsn: u64,
-    pub pin_count: usize,
-    pub handles: Vec<PageHandle>,
-}
-
-impl fmt::Display for CacheInfo {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "page {}: dirty={} accessed={} pins={} handles=[",
-            self.page_id, self.dirty, self.accessed, self.pin_count,
-        )?;
-        for h in self.handles.iter() {
-            write!(f, "\n\t{}", h)?;
-        }
-        write!(f, "]")
-    }
-}
-
-impl fmt::Debug for CacheInfo {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self)
-    }
 }
 
 impl Pager {
@@ -598,40 +395,6 @@ impl Pager {
         Ok(out)
     }
 
-    /// Returns a snapshot of metadata for all currently cached pages.
-    pub fn info(&self) -> Vec<CacheInfo> {
-        let pages = self
-            .pages
-            .read()
-            .expect("failed to acquire read lock on pages map");
-
-        pages
-            .values()
-            .map(|p| CacheInfo {
-                page_id: p.page_id,
-                latest_lsn: p
-                    .page
-                    .read()
-                    .expect("able to acquire read lock")
-                    .latest_lsn(),
-                dirty: p
-                    .dirty
-                    .load(Ordering::Acquire),
-                accessed: p
-                    .accessed
-                    .load(Ordering::Acquire),
-                pin_count: p
-                    .pin_count
-                    .load(Ordering::Acquire),
-                handles: p
-                    .handles
-                    .lock()
-                    .expect("can lock cached page handles")
-                    .clone(),
-            })
-            .collect()
-    }
-
     /// Attempts to flush every page currently tracked by the cache.
     ///
     /// If `evict` is `false`, each dirty page is written to the backing store and
@@ -719,7 +482,107 @@ impl Pager {
         }
         Ok(())
     }
+}
 
+/// Records one active access to a cached page.
+///
+/// Handles are used for cache diagnostics only; pin counts are the source of truth
+/// for eviction safety.
+#[derive(Clone)]
+pub struct PageHandle {
+    pub lsn: Option<u64>,
+    pub mode: AccessMode,
+    pub page_id: usize,
+    pub reason: Option<&'static str>,
+    pub thread_id: ThreadId,
+    pub txn_id: Option<u64>,
+}
+
+impl PageHandle {
+    /// Adds this handle to a cached page's diagnostic handle list.
+    pub fn add(&self, page: &CachedPage) -> Result<()> {
+        page.handles
+            .lock()
+            .map_err(|_e| {
+                io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "failed to acquire lock on cached page handles list",
+                )
+            })?
+            .push(self.clone());
+        Ok(())
+    }
+
+    /// Removes this handle from a cached page's diagnostic handle list.
+    pub fn remove(&self, page: &CachedPage) -> Result<()> {
+        let mut handles = page
+            .handles
+            .lock()
+            .map_err(|_e| {
+                io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "failed to acquire lock on cached page handles list",
+                )
+            })?;
+
+        if let Some(pos) = handles
+            .iter()
+            .position(|h| h.thread_id == self.thread_id && h.mode == self.mode)
+        {
+            handles.swap_remove(pos);
+        }
+        Ok(())
+    }
+}
+
+/// Snapshot of cache metadata for one cached page.
+#[derive(Clone)]
+pub struct CacheInfo {
+    pub page_id: usize,
+    pub dirty: bool,
+    pub accessed: bool,
+    pub latest_lsn: u64,
+    pub pin_count: usize,
+    pub handles: Vec<PageHandle>,
+}
+
+impl Pager {
+    /// Returns a snapshot of metadata for all currently cached pages.
+    pub fn info(&self) -> Vec<CacheInfo> {
+        let pages = self
+            .pages
+            .read()
+            .expect("failed to acquire read lock on pages map");
+
+        pages
+            .values()
+            .map(|p| CacheInfo {
+                page_id: p.page_id,
+                latest_lsn: p
+                    .page
+                    .read()
+                    .expect("able to acquire read lock")
+                    .latest_lsn(),
+                dirty: p
+                    .dirty
+                    .load(Ordering::Acquire),
+                accessed: p
+                    .accessed
+                    .load(Ordering::Acquire),
+                pin_count: p
+                    .pin_count
+                    .load(Ordering::Acquire),
+                handles: p
+                    .handles
+                    .lock()
+                    .expect("can lock cached page handles")
+                    .clone(),
+            })
+            .collect()
+    }
+}
+
+impl Pager {
     /// Flush and optionally evict `page_id` from the `pages` map only.
     ///
     /// Returns `true` when the page was removed from the map so the caller can
@@ -1004,6 +867,81 @@ impl Pager {
     }
 }
 
+/// Loads a [`Page`] of `size` bytes from `reader`.
+///
+/// A [`Page`] is valid when the `MAGIC` bytes are present in its
+/// trailer and the stored checksum matches the checksum computed
+/// when the page is loaded.
+fn load_page(
+    page_id: usize,
+    size: usize,
+    reader: &mut (impl Read + Seek),
+) -> Result<Page> {
+    info!("loading page {page_id} (size: {size})");
+    if page_id == 0 {
+        return Err(StorageError::InvalidPage(
+            "page ID zero is not allowed".into(),
+        ));
+    }
+
+    let offset = (page_id - 1) * size;
+    reader.seek(SeekFrom::Start(offset as u64))?;
+
+    let mut buf = vec![0; size];
+    reader.read_exact(&mut buf)?;
+
+    let page = Page::build(buf);
+    if let (_, Some(reason)) = page.valid() {
+        return Err(StorageError::InvalidPage(reason.into()));
+    }
+
+    Ok(page)
+}
+
+/// Durably persists a [`Page`] to the given `writer` file, guaranteeing that
+/// the written bytes are safely flushed and stored on disk.
+///
+/// Prior to writing, this refreshes the [`Page`]'s magic bytes and recomputes
+/// its checksum, ensuring the persisted [`Page`] can be verified during
+/// durability checks.
+fn write_page(
+    page_id: usize,
+    size: usize,
+    writer: &mut File,
+    page: &mut Page,
+) -> Result<()> {
+    info!("writing page {page_id} (size: {size})");
+    if page_id == 0 {
+        return Err(StorageError::InvalidPage(
+            "page ID zero is not allowed".into(),
+        ));
+    }
+
+    page.set_magic();
+    page.set_checksum(page.compute_checksum());
+
+    let offset = (page_id - 1) * size;
+    let size = writer.metadata()?.len();
+
+    if offset > size as usize {
+        // If offset is past the written size, resize the file till offset
+        // and write page.
+        writer.set_len(offset as u64)?;
+    }
+
+    writer.seek(SeekFrom::Start(offset as u64))?;
+    writer.write_all(&page[..])?;
+    writer.sync_all()?;
+
+    Ok(())
+}
+
+impl FlushGuard for NoopFlushGuard {
+    fn before_flush(&self, _page_id: u64, _page: &Page) -> io::Result<()> {
+        Ok(())
+    }
+}
+
 impl fmt::Display for Pager {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         writeln!(f, "pager contents:")?;
@@ -1011,6 +949,72 @@ impl fmt::Display for Pager {
             write!(f, "\t{i}")?;
         }
         Ok(())
+    }
+}
+
+impl fmt::Display for PageHandle {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{:?}(page={}, txn={:?}, lsn={:?}, thread={:?}",
+            self.mode, self.page_id, self.txn_id, self.lsn, self.thread_id
+        )?;
+
+        if let Some(reason) = self.reason {
+            write!(f, ", reason={reason}")?;
+        }
+        write!(f, ")")
+    }
+}
+
+impl fmt::Debug for PageHandle {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self)
+    }
+}
+
+impl fmt::Display for CacheInfo {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "page {}: dirty={} accessed={} pins={} handles=[",
+            self.page_id, self.dirty, self.accessed, self.pin_count,
+        )?;
+        for h in self.handles.iter() {
+            write!(f, "\n\t{}", h)?;
+        }
+        write!(f, "]")
+    }
+}
+
+impl fmt::Debug for CacheInfo {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self)
+    }
+}
+
+impl fmt::Display for CachedPage {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "[CACHED")?;
+        if self
+            .dirty
+            .load(Ordering::Acquire)
+        {
+            write!(f, "|DIRTY")?;
+        }
+        write!(
+            f,
+            "]{}",
+            self.page
+                .read()
+                .expect("failed to retrieve read lock")
+        )
+    }
+}
+
+impl fmt::Debug for CachedPage {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self)
     }
 }
 
