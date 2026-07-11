@@ -495,6 +495,7 @@ impl Default for DebugOpt {
 
 impl Cursor {
     pub fn debug_print(&self, opt: DebugOpt) -> Result<()> {
+        // NOTE: Test with multi node tree
         let mut queue = VecDeque::new();
         queue.push_front((self.tree.root()?, 0, 0));
 
@@ -514,6 +515,7 @@ impl Cursor {
             if depth > opt.max_depth {
                 println!("      <...pruned depth...>        ");
             }
+
             self.tree.table_page(
                 AccessContext::maintenance("debug print"),
                 page,
@@ -528,6 +530,7 @@ impl Cursor {
                     };
 
                     print!("[{}{}#{page} ", depth_marker(depth, key), root);
+
                     let key_count = p.num_keys() as usize;
 
                     match p
@@ -566,6 +569,7 @@ impl Cursor {
                                     k.key as usize,
                                 ))
                             });
+
                             let pruned = if end_index < key_count {
                                 format!(
                                     " (+{} children pruned)",
