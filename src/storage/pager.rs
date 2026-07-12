@@ -1,5 +1,5 @@
 use crate::{
-    Lsn,
+    recovery::Lsn,
     storage::page::{Mutation, MutationScope},
 };
 

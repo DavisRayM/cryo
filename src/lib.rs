@@ -4,10 +4,8 @@ use crc::Crc;
 
 pub mod recovery;
 pub mod storage;
-pub mod wal;
 
 pub use storage::{AccessContext, FlushGuard, Page, PageFlags, Pager};
-pub use wal::{Logger, Lsn, Record, RecordEntry, RecordFlags, WalFlushGuard};
 
 /// <https://reveng.sourceforge.io/crc-catalogue/all.htm>
 pub(crate) const CRC32C: Crc<u32> = Crc::<u32>::new(&crc::CRC_32_ISCSI);
