@@ -38,6 +38,12 @@ bitflags! {
     pub struct RecordFlags: u8 {}
 }
 
+/// Attempts to read `buf` bytes or an eof
+///
+/// ## Errors
+///
+/// If the function partially fills `buf` an [`io::ErrorKind::UnexpectedEof`]
+/// will be returned.
 fn read_exact_or_eof(
     reader: &mut impl Read,
     buf: &mut [u8],
