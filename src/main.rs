@@ -19,6 +19,7 @@ fn main() {
     let cli = Cli::parse();
 
     let tree = Arc::new(Tree::load(cli.database, 10).unwrap());
+    let mut ctx = AccessContext::maintenance("main test");
     let start = Arc::new(std::sync::Barrier::new(11));
 
     let mut handles = Vec::with_capacity(10);
@@ -35,7 +36,7 @@ fn main() {
                 tree.cursor()
                     .unwrap()
                     .insert(
-                        AccessContext::maintenance("main test"),
+                        &mut ctx,
                         &k,
                         "so much data"
                             .as_bytes()

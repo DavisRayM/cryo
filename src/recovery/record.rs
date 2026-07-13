@@ -3,7 +3,7 @@ use bitflags::bitflags;
 use serde::{Deserialize, Serialize};
 use std::io::{self, Read};
 
-use crate::read_be;
+use crate::{read_be, storage::page::Mutation};
 
 pub const MAGIC: &str = "PO";
 pub const MAGIC_SIZE: usize = MAGIC.len();
@@ -100,9 +100,7 @@ pub enum Record {
     Update {
         txn_id: u64,
         page_id: u64,
-        offset: u16,
-        before: Vec<u8>,
-        after: Vec<u8>,
+        mutations: Vec<Mutation>,
         prev_lsn: Option<u64>,
     },
 
@@ -295,21 +293,24 @@ impl Record {
         };
 
         match self {
-            Self::Update {
-                offset,
-                before,
-                after,
-                ..
-            } => {
-                if before.len() != after.len() {
-                    return Err(invalid(
-                        "WAL Update before/after length mismatch",
-                    ));
+            Self::Update { mutations, .. } => {
+                for mutation in mutations.iter() {
+                    if mutation.before.len() != mutation.after.len() {
+                        return Err(invalid(
+                            "WAL Update before/after length mismatch",
+                        ));
+                    }
+
+                    if mutation.after.is_empty() {
+                        return Err(invalid("WAL Update carries no bytes"));
+                    }
+
+                    Self::check_range(
+                        mutation.offset.start as u16,
+                        mutation.after.len(),
+                        page_size,
+                    )?;
                 }
-                if after.is_empty() {
-                    return Err(invalid("WAL Update carries no bytes"));
-                }
-                Self::check_range(*offset, after.len(), page_size)?;
             }
             Self::Compensation {
                 offset,
@@ -423,15 +424,19 @@ impl From<(Lsn, Record)> for RecordEntry {
 
 #[cfg(test)]
 mod test {
+    use crate::storage::page::MutationOffset;
+
     use super::*;
 
     fn update_record(prev_lsn: Option<u64>) -> Record {
         Record::Update {
             txn_id: 10,
             page_id: 7,
-            offset: 42,
-            before: vec![b'a', b'b', b'c'],
-            after: vec![b'x', b'y', b'z'],
+            mutations: vec![Mutation {
+                offset: MutationOffset { start: 42, end: 45 },
+                before: vec![0; 3].into_boxed_slice(),
+                after: vec![b'x', b'y', b'z'].into_boxed_slice(),
+            }],
             prev_lsn,
         }
     }
@@ -462,5 +467,28 @@ mod test {
         assert_eq!(checkpoint.page_id(), None);
         assert_eq!(checkpoint.prev_lsn(), None);
         assert_eq!(checkpoint.kind(), "begin_checkpoint");
+    }
+
+    #[test]
+    fn validate_rejects_byte_range_beyond_page_size() {
+        let update = Record::Update {
+            txn_id: 1,
+            page_id: 1,
+            mutations: vec![Mutation {
+                offset: MutationOffset {
+                    start: 4094,
+                    end: 4098,
+                },
+                before: vec![0; 4].into_boxed_slice(),
+                after: vec![1, 1, 1, 1].into_boxed_slice(),
+            }],
+            prev_lsn: None,
+        };
+
+        assert!(update.validate(None).is_ok());
+        let err = update
+            .validate(Some(4096))
+            .expect_err("range past page size must be rejected");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
     }
 }

@@ -15,6 +15,9 @@ use crate::{
     ValueCell,
 };
 
+const CURSOR_CONTEXT: AccessContext =
+    AccessContext::maintenance("cursor operation");
+
 pub struct Cursor {
     breadcrumbs: Vec<(usize, KeyCell)>,
     current_page: usize,
@@ -51,14 +54,11 @@ impl Cursor {
     /// TODO: Decide on self-split or user-initiated...
     pub fn insert(
         &mut self,
-        ctx: AccessContext,
+        ctx: &mut AccessContext,
         key: &Key,
         value: Vec<u8>,
     ) -> Result<Option<ValueCell>> {
-        self.find(
-            AccessContext::maintenance("tree cursor locate insert location"),
-            key,
-        )?;
+        self.find(&CURSOR_CONTEXT, key)?;
         let new_cell = ValueCell {
             key: *key,
             value: value.into(),
@@ -79,15 +79,9 @@ impl Cursor {
     /// Locate the `Leaf` page that would hold `key` and return `key`
     /// bytes if present. This action will leave the cursor at the leaf node.
     pub fn search(&mut self, key: &Key) -> Result<Option<ValueCell>> {
-        self.find(
-            AccessContext::maintenance("tree cursor locate key position"),
-            key,
-        )?;
+        self.find(&CURSOR_CONTEXT, key)?;
 
-        let out = self.read_value(
-            AccessContext::maintenance("tree cursor read key value"),
-            key,
-        )?;
+        let out = self.read_value(&CURSOR_CONTEXT, key)?;
         trace!(
             "tree cursor search complete: page={} key={} found={} depth={}",
             self.current_page,
@@ -101,7 +95,7 @@ impl Cursor {
 
     /// Attempts to locate `key` in tree. Navigating to `key` position while
     /// validating that `MAX_HOPS` is not exceeded.
-    pub fn find(&mut self, ctx: AccessContext, key: &Key) -> Result<()> {
+    pub fn find(&mut self, ctx: &AccessContext, key: &Key) -> Result<()> {
         for attempt in 0..MAX_HOPS {
             if attempt >= MAX_HOPS {
                 return Err(StorageError::RecursionDetected(
@@ -115,7 +109,7 @@ impl Cursor {
                 self.breadcrumbs.len()
             );
 
-            if !self.find_inner(ctx, key)? {
+            if !self.find_inner(&ctx, key)? {
                 break;
             }
         }
@@ -129,7 +123,7 @@ impl Cursor {
     /// current page and pushing breadcrumb.
     ///
     /// This function will return `true` once a `Leaf` page is located.
-    fn find_inner(&mut self, ctx: AccessContext, key: &Key) -> Result<bool> {
+    fn find_inner(&mut self, ctx: &AccessContext, key: &Key) -> Result<bool> {
         let next_location = self.tree.table_page(
             ctx,
             self.current_page,
@@ -179,7 +173,11 @@ impl Cursor {
     }
 
     /// Inserts new value cell in the page cursor is currently in
-    fn insert_new(&self, ctx: AccessContext, cell: &ValueCell) -> Result<()> {
+    fn insert_new(
+        &self,
+        ctx: &mut AccessContext,
+        cell: &ValueCell,
+    ) -> Result<()> {
         self.tree
             .mut_table_page(ctx, self.current_page, |mut page| {
                 let key_count = page.num_keys() as usize;
@@ -252,7 +250,7 @@ impl Cursor {
     /// Update `old` in the page [`Cursor`] is in with `updated`.
     fn insert_existing(
         &self,
-        ctx: AccessContext,
+        ctx: &mut AccessContext,
         old: &CursorValue,
         updated: &ValueCell,
     ) -> Result<()> {
@@ -292,7 +290,7 @@ impl Cursor {
     /// [`Page`]. Utilize `Self::key_range` instead.
     fn read_value(
         &self,
-        ctx: AccessContext,
+        ctx: &AccessContext,
         key: &Key,
     ) -> Result<Option<CursorValue>> {
         self.tree
@@ -517,7 +515,7 @@ impl Cursor {
             }
 
             self.tree.table_page(
-                AccessContext::maintenance("debug print"),
+                &CURSOR_CONTEXT,
                 page,
                 |p| -> Result<()> {
                     let root = if p
@@ -622,52 +620,45 @@ mod test {
             .inner
             .root()
             .expect("can retrieve tree root");
+        let mut ctx = AccessContext::maintenance("test leaf split");
         assert!(root != 0, "root should be a valid page ID");
         tree.inner
-            .mut_table_page(
-                AccessContext::maintenance("test leaf split"),
-                root,
-                |mut p| {
-                    let mut initial_start = p.free_space_start() as usize;
-                    let mut initial_end = p.free_space_end() as usize;
+            .mut_table_page(&mut ctx, root, |mut p| {
+                let mut initial_start = p.free_space_start() as usize;
+                let mut initial_end = p.free_space_end() as usize;
 
-                    p.set_free_space(0);
-                    p.set_num_keys(4);
+                p.set_free_space(0);
+                p.set_num_keys(4);
 
-                    let sample = [
-                        (5, "asb"),
-                        (20, "230"),
-                        (50, "sdafjl"),
-                        (90, "assdfj"),
-                    ];
-                    let sample = sample
-                        .iter()
-                        .map(|s| ValueCell {
-                            key: s.0,
-                            value: s.1.as_bytes().into(),
-                        })
-                        .map(|r| (r.key, Into::<Box<[u8]>>::into(&r)))
-                        .collect::<Vec<_>>();
+                let sample =
+                    [(5, "asb"), (20, "230"), (50, "sdafjl"), (90, "assdfj")];
+                let sample = sample
+                    .iter()
+                    .map(|s| ValueCell {
+                        key: s.0,
+                        value: s.1.as_bytes().into(),
+                    })
+                    .map(|r| (r.key, Into::<Box<[u8]>>::into(&r)))
+                    .collect::<Vec<_>>();
 
-                    for (key, v) in sample {
-                        p.mut_cell(initial_end - v.len(), initial_end)
-                            .copy_from_slice(&v);
-                        initial_end = initial_end - v.len();
+                for (key, v) in sample {
+                    p.mut_cell(initial_end - v.len(), initial_end)
+                        .copy_from_slice(&v);
+                    initial_end = initial_end - v.len();
 
-                        let key = KeyCell {
-                            key: key,
-                            offset: initial_end as u32,
-                        };
-                        p.mut_cell(initial_start, initial_start + KEYCELL_SIZE)
-                            .copy_from_slice(
-                                Into::<[u8; KEYCELL_SIZE]>::into(&key).as_ref(),
-                            );
-                        initial_start += KEYCELL_SIZE;
-                    }
+                    let key = KeyCell {
+                        key: key,
+                        offset: initial_end as u32,
+                    };
+                    p.mut_cell(initial_start, initial_start + KEYCELL_SIZE)
+                        .copy_from_slice(
+                            Into::<[u8; KEYCELL_SIZE]>::into(&key).as_ref(),
+                        );
+                    initial_start += KEYCELL_SIZE;
+                }
 
-                    p.set_free_space_end(initial_start as u16);
-                },
-            )
+                p.set_free_space_end(initial_start as u16);
+            })
             .expect("can mutate page");
 
         (dir, tree)
@@ -690,6 +681,7 @@ mod test {
     #[test]
     fn cursor_insert_can_insert_into_new() {
         let (_dir, tree) = temp_tree();
+        let mut ctx = AccessContext::maintenance("cursor insert test");
 
         let records: [(u32, &str); 3] = [(10, "abc"), (20, "nas"), (5, "mna")];
         for r in records {
@@ -697,11 +689,7 @@ mod test {
                 .cursor()
                 .expect("can initialize cursor");
             cursor
-                .insert(
-                    AccessContext::maintenance("cursor insert test"),
-                    &r.0,
-                    r.1.as_bytes().to_vec(),
-                )
+                .insert(&mut ctx, &r.0, r.1.as_bytes().to_vec())
                 .expect("can insert record");
         }
 
@@ -723,6 +711,7 @@ mod test {
     #[test]
     fn cursor_insert_overrides_on_existing() {
         let (_dir, tree) = temp_tree();
+        let mut ctx = AccessContext::maintenance("cursor insert overwrite");
 
         let record_1: (u32, &str) = (10, "abc");
         let record_2: (u32, &str) = (10, "lorem ipsum");
@@ -730,11 +719,7 @@ mod test {
         let out = tree
             .cursor()
             .expect("can init cursor")
-            .insert(
-                AccessContext::maintenance("cursor insert overwrite"),
-                &record_1.0,
-                record_1.1.as_bytes().to_vec(),
-            )
+            .insert(&mut ctx, &record_1.0, record_1.1.as_bytes().to_vec())
             .expect("can insert");
 
         assert!(out.is_none());
@@ -742,11 +727,7 @@ mod test {
         let replaced = tree
             .cursor()
             .expect("can init cursor")
-            .insert(
-                AccessContext::maintenance("cursor insert overwrite"),
-                &record_2.0,
-                record_2.1.as_bytes().to_vec(),
-            )
+            .insert(&mut ctx, &record_2.0, record_2.1.as_bytes().to_vec())
             .expect("can insert");
 
         assert!(replaced.is_some());
@@ -770,15 +751,12 @@ mod test {
     #[should_panic(expected = "WouldSplit")]
     fn cursor_insert_on_split_errors() {
         let (_dir, tree) = filled_leaf_root();
+        let mut ctx = AccessContext::maintenance("cursor insert test");
         let record: (u32, &str) = (10, "abc");
 
         tree.cursor()
             .expect("can init cursor")
-            .insert(
-                AccessContext::maintenance("cursor insert test"),
-                &record.0,
-                record.1.as_bytes().to_vec(),
-            )
+            .insert(&mut ctx, &record.0, record.1.as_bytes().to_vec())
             .unwrap();
     }
 }

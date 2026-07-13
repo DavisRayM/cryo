@@ -1,5 +1,7 @@
 use std::{path::PathBuf, sync::Arc};
 
+use log::trace;
+
 use super::{
     AccessContext, Cursor, MetaPage, Page, PageFlags, Pager, StorageError,
     TablePage,
@@ -7,6 +9,9 @@ use super::{
     error::Result,
     page::{AnyPage, AnyPageMut},
 };
+
+const TREE_CONTEXT: AccessContext =
+    AccessContext::maintenance("tree operation");
 
 /// [Tree] is a wrapping structure that signifies a `Blink-Tree` index-organized
 /// table that can be traversed by [`Cursor`].
@@ -22,14 +27,11 @@ pub(crate) struct TreeInner {
 impl TreeInner {
     /// Returns the root of the [`Tree`]
     pub fn root(&self) -> Result<usize> {
-        self.meta_page(
-            AccessContext::maintenance("tree locate root page id"),
-            |p| p.tree_root() as usize,
-        )
+        self.meta_page(&TREE_CONTEXT, |p| p.tree_root() as usize)
     }
 
     /// Set current tree root to `root`
-    pub fn set_root(&self, ctx: AccessContext, root: u32) -> Result<()> {
+    pub fn set_root(&self, ctx: &mut AccessContext, root: u32) -> Result<()> {
         self.mut_meta_page(ctx, |mut p| {
             p.set_tree_root(root);
         })
@@ -41,7 +43,7 @@ impl TreeInner {
     /// the caller to do so.
     pub fn create_root(
         &self,
-        ctx: AccessContext,
+        ctx: &mut AccessContext,
         flags: PageFlags,
     ) -> Result<()> {
         let new_root = self
@@ -55,7 +57,7 @@ impl TreeInner {
 impl TreeInner {
     pub fn meta_page<R>(
         &self,
-        ctx: AccessContext,
+        ctx: &AccessContext,
         f: impl FnOnce(MetaPage<&Page>) -> R,
     ) -> Result<R> {
         self.pager
@@ -70,7 +72,7 @@ impl TreeInner {
 
     pub fn mut_meta_page<R>(
         &self,
-        ctx: AccessContext,
+        ctx: &mut AccessContext,
         f: impl FnOnce(MetaPage<&mut Page>) -> R,
     ) -> Result<R> {
         self.pager
@@ -85,7 +87,7 @@ impl TreeInner {
 
     pub fn table_page<R>(
         &self,
-        ctx: AccessContext,
+        ctx: &AccessContext,
         page_id: usize,
         f: impl FnOnce(TablePage<&Page>) -> R,
     ) -> Result<R> {
@@ -101,7 +103,7 @@ impl TreeInner {
 
     pub fn mut_table_page<R>(
         &self,
-        ctx: AccessContext,
+        ctx: &mut AccessContext,
         page_id: usize,
         f: impl FnOnce(TablePage<&mut Page>) -> R,
     ) -> Result<R> {
@@ -128,10 +130,10 @@ impl Tree {
 
         let root = tree.inner.root()?;
         if root == 0 {
-            tree.inner.create_root(
-                AccessContext::maintenance("initialize tree"),
-                PageFlags::IsLeaf,
-            )?;
+            let mut ctx = AccessContext::maintenance("initialize tree");
+            tree.inner
+                .create_root(&mut ctx, PageFlags::IsLeaf)?;
+            trace!("tree root initialize: context={ctx:?}");
         }
 
         Ok(tree)

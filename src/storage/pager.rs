@@ -27,6 +27,8 @@ use std::{
 /// Default size, in bytes, used when creating a new database file.
 pub const DEFAULT_PAGE_SIZE: u16 = 4096;
 
+const STARTUP_CONTEXT: AccessContext = AccessContext::maintenance("startup");
+
 /// [`FlushGuard`] defines a guarded function that should be run
 /// before a page is committed/flushed to disk. A page is only
 /// allowed to flush to disk if `before_flush` is successful.
@@ -42,8 +44,9 @@ pub struct NoopFlushGuard;
 pub trait ChangeGuard: Send + Sync {
     fn before_change(
         &self,
+        ctx: &mut AccessContext,
         page_id: u64,
-        changes: Vec<Mutation>,
+        mutations: Vec<Mutation>,
     ) -> Result<Option<Lsn>>;
 }
 
@@ -219,10 +222,8 @@ impl Pager {
         };
 
         if len >= DEFAULT_PAGE_SIZE as u64 {
-            out.page_size = out.page(
-                META_PAGE_ID,
-                AccessContext::maintenance("startup"),
-                |p| match p {
+            out.page_size =
+                out.page(META_PAGE_ID, &STARTUP_CONTEXT, |p| match p {
                     AnyPage::Meta(p) => {
                         if p.format_version() != FORMAT_VERSION {
                             return Err(StorageError::FormatVersion);
@@ -232,8 +233,7 @@ impl Pager {
                     _ => Err(StorageError::CorruptedData(
                         "unable to locate database meta page".into(),
                     )),
-                },
-            )??;
+                })??;
         } else {
             let mut page = Page::new(out.page_size, PageFlags::IsMeta);
             let AnyPageMut::Meta(ref mut meta) = page.as_variant_mut() else {
@@ -251,16 +251,13 @@ impl Pager {
     /// new page_id.
     pub fn allocate_page(
         &self,
-        ctx: AccessContext,
+        ctx: &mut AccessContext,
         flags: PageFlags,
     ) -> Result<usize> {
         let page_id = self.mut_page(META_PAGE_ID, ctx, |p| match p {
             AnyPageMut::Meta(mut p) => {
                 let page_id = p.next_page();
                 p.set_next_page(page_id + 1);
-                if let Some(lsn) = ctx.lsn {
-                    p.set_lsn(lsn);
-                }
 
                 Ok(page_id as usize)
             }
@@ -309,7 +306,7 @@ impl Pager {
     pub fn page<R>(
         &self,
         page_id: usize,
-        ctx: AccessContext,
+        ctx: &AccessContext,
         f: impl FnOnce(AnyPage<'_>) -> R,
     ) -> Result<R> {
         trace!(
@@ -362,7 +359,7 @@ impl Pager {
     pub fn mut_page<R>(
         &self,
         page_id: usize,
-        ctx: AccessContext,
+        ctx: &mut AccessContext,
         f: impl FnOnce(AnyPageMut) -> R,
     ) -> Result<R> {
         if ctx.txn_id.is_none() && ctx.reason.is_none() {
@@ -405,7 +402,7 @@ impl Pager {
             let out = f(scope.as_variant_mut());
             let lsn = self
                 .change_guard
-                .before_change(page_id as u64, scope.diff(None))?;
+                .before_change(ctx, page_id as u64, scope.diff(None))?;
             scope.replay(&mut page);
 
             cached
@@ -980,6 +977,7 @@ impl FlushGuard for NoopFlushGuard {
 impl ChangeGuard for NoopChangeGuard {
     fn before_change(
         &self,
+        _ctx: &mut AccessContext,
         _page_id: u64,
         _changes: Vec<Mutation>,
     ) -> Result<Option<Lsn>> {
@@ -1068,6 +1066,8 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
+    const TEST_CONTEXT: AccessContext = AccessContext::maintenance("test");
+
     fn temp_pager(capacity: usize) -> (TempDir, Pager) {
         let dir = TempDir::new().expect("temp dir can be created");
         let path = dir.path().join("cryo.db");
@@ -1080,27 +1080,21 @@ mod tests {
     ) -> (TempDir, Pager, Vec<usize>) {
         let (dir, pager) = temp_pager(8);
         let mut ids = Vec::new();
+        let mut ctx = AccessContext::maintenance("pager with pages");
 
         for (num_keys, marker) in pages {
             let page_id = pager
-                .allocate_page(
-                    AccessContext::maintenance("pager with pages"),
-                    PageFlags::IsLeaf,
-                )
+                .allocate_page(&mut ctx, PageFlags::IsLeaf)
                 .expect("test page can be allocated");
             pager
-                .mut_page(
-                    page_id,
-                    AccessContext::maintenance("test setup"),
-                    |page| match page {
-                        AnyPageMut::Table(mut page) => {
-                            let start = page.free_space_start() as usize;
-                            page.set_num_keys(num_keys);
-                            page.mut_cell(start, start + 1)[0] = marker;
-                        }
-                        _ => assert!(false, "setup failed: pager with pages"),
-                    },
-                )
+                .mut_page(page_id, &mut ctx, |page| match page {
+                    AnyPageMut::Table(mut page) => {
+                        let start = page.free_space_start() as usize;
+                        page.set_num_keys(num_keys);
+                        page.mut_cell(start, start + 1)[0] = marker;
+                    }
+                    _ => assert!(false, "setup failed: pager with pages"),
+                })
                 .expect("test page can be initialized");
             pager
                 .flush_page(page_id, false)
@@ -1145,7 +1139,7 @@ mod tests {
             [(ids[0], 10, b'a'), (ids[1], 20, b'b'), (ids[2], 30, b'c')]
         {
             let (num_keys, marker) = pager
-                .page(id, AccessContext::anonymous(), |page| match page {
+                .page(id, &TEST_CONTEXT, |page| match page {
                     AnyPage::Meta(_) => {
                         panic!("values should not be in meta page")
                     }
@@ -1178,7 +1172,7 @@ mod tests {
         let missing = ids[0] + 1;
 
         let err = pager
-            .page(missing, AccessContext::anonymous(), |_| ())
+            .page(missing, &TEST_CONTEXT, |_| ())
             .expect_err("missing page should not load");
 
         assert!(matches!(err, StorageError::Io(..)));
@@ -1204,7 +1198,7 @@ mod tests {
         let (_dir, pager, ids) = pager_with_pages([(1, b'a')]);
 
         pager
-            .page(ids[0], AccessContext::anonymous(), |_| ())
+            .page(ids[0], &TEST_CONTEXT, |_| ())
             .expect("page can be loaded into cache");
 
         assert_eq!(pager.info().len(), 1);
@@ -1219,22 +1213,19 @@ mod tests {
     #[test]
     fn dirty_page_gets_second_chance_before_flush() {
         let (_dir, pager, ids) = pager_with_pages([(1, b'a')]);
+        let mut ctx = AccessContext::maintenance("test mutation");
 
         pager
-            .mut_page(
-                ids[0],
-                AccessContext::maintenance("test mutation"),
-                |page| match page {
-                    AnyPageMut::Table(mut page) => {
-                        let start = page.free_space_start() as usize;
-                        let end = start + 1;
+            .mut_page(ids[0], &mut ctx, |page| match page {
+                AnyPageMut::Table(mut page) => {
+                    let start = page.free_space_start() as usize;
+                    let end = start + 1;
 
-                        page.set_num_keys(42);
-                        page.mut_cell(start, end)[0] = b'z';
-                    }
-                    _ => panic!("values should be inserted into table"),
-                },
-            )
+                    page.set_num_keys(42);
+                    page.mut_cell(start, end)[0] = b'z';
+                }
+                _ => panic!("values should be inserted into table"),
+            })
             .expect("page can be mutated");
 
         let err = pager
@@ -1275,22 +1266,19 @@ mod tests {
     #[test]
     fn dirty_page_can_be_flushed_and_evicted() {
         let (_dir, pager, ids) = pager_with_pages([(1, b'a')]);
+        let mut ctx = AccessContext::maintenance("test mutation");
 
         pager
-            .mut_page(
-                ids[0],
-                AccessContext::maintenance("test mutation"),
-                |page| match page {
-                    AnyPageMut::Table(mut page) => {
-                        let start = page.free_space_start() as usize;
-                        let end = start + 1;
+            .mut_page(ids[0], &mut ctx, |page| match page {
+                AnyPageMut::Table(mut page) => {
+                    let start = page.free_space_start() as usize;
+                    let end = start + 1;
 
-                        page.set_num_keys(7);
-                        page.mut_cell(start, end)[0] = b'x';
-                    }
-                    _ => panic!("values should be inserted into table"),
-                },
-            )
+                    page.set_num_keys(7);
+                    page.mut_cell(start, end)[0] = b'x';
+                }
+                _ => panic!("values should be inserted into table"),
+            })
             .expect("page can be mutated");
 
         pager
@@ -1343,23 +1331,20 @@ mod tests {
     #[test]
     fn flush_guard_error_prevents_write_and_keeps_page_dirty() {
         let (_dir, mut pager, ids) = pager_with_pages([(1, b'a')]);
+        let mut ctx = AccessContext::maintenance("test mutation");
         pager.set_flush_guard(sync::Arc::new(FailingFlushGuard));
 
         pager
-            .mut_page(
-                ids[0],
-                AccessContext::maintenance("test mutation"),
-                |page| match page {
-                    AnyPageMut::Table(mut page) => {
-                        let start = page.free_space_start() as usize;
-                        let end = start + 1;
+            .mut_page(ids[0], &mut ctx, |page| match page {
+                AnyPageMut::Table(mut page) => {
+                    let start = page.free_space_start() as usize;
+                    let end = start + 1;
 
-                        page.set_num_keys(99);
-                        page.mut_cell(start, end)[0] = b'1';
-                    }
-                    _ => panic!("values should be inserted into table"),
-                },
-            )
+                    page.set_num_keys(99);
+                    page.mut_cell(start, end)[0] = b'1';
+                }
+                _ => panic!("values should be inserted into table"),
+            })
             .expect("page can be mutated");
 
         let cached = pager
@@ -1397,38 +1382,31 @@ mod tests {
     #[test]
     fn flush_all_flushes_dirty_pages_and_keeps_them_cached() {
         let (_dir, pager, ids) = pager_with_pages([(1, b'a'), (2, b'b')]);
+        let mut ctx = AccessContext::maintenance("test mutation");
 
         pager
-            .mut_page(
-                ids[0],
-                AccessContext::maintenance("test mutation"),
-                |page| match page {
-                    AnyPageMut::Table(mut page) => {
-                        let start = page.free_space_start() as usize;
-                        let end = start + 1;
+            .mut_page(ids[0], &mut ctx, |page| match page {
+                AnyPageMut::Table(mut page) => {
+                    let start = page.free_space_start() as usize;
+                    let end = start + 1;
 
-                        page.set_num_keys(11);
-                        page.mut_cell(start, end)[0] = b'x';
-                    }
-                    _ => panic!("values should be inserted into table"),
-                },
-            )
+                    page.set_num_keys(11);
+                    page.mut_cell(start, end)[0] = b'x';
+                }
+                _ => panic!("values should be inserted into table"),
+            })
             .expect("page 1 can be mutated");
         pager
-            .mut_page(
-                ids[1],
-                AccessContext::maintenance("test mutation"),
-                |page| match page {
-                    AnyPageMut::Table(mut page) => {
-                        let start = page.free_space_start() as usize;
-                        let end = start + 1;
+            .mut_page(ids[1], &mut ctx, |page| match page {
+                AnyPageMut::Table(mut page) => {
+                    let start = page.free_space_start() as usize;
+                    let end = start + 1;
 
-                        page.set_num_keys(22);
-                        page.mut_cell(start, end)[0] = b'y';
-                    }
-                    _ => panic!("values should be inserted into table"),
-                },
-            )
+                    page.set_num_keys(22);
+                    page.mut_cell(start, end)[0] = b'y';
+                }
+                _ => panic!("values should be inserted into table"),
+            })
             .expect("page 2 can be mutated");
 
         for page_id in &ids {
@@ -1485,10 +1463,10 @@ mod tests {
         let (_dir, pager, ids) = pager_with_pages([(1, b'a'), (2, b'b')]);
 
         pager
-            .page(ids[0], AccessContext::anonymous(), |_| ())
+            .page(ids[0], &TEST_CONTEXT, |_| ())
             .expect("page 1 can be loaded");
         pager
-            .page(ids[1], AccessContext::anonymous(), |_| ())
+            .page(ids[1], &TEST_CONTEXT, |_| ())
             .expect("page 2 can be loaded");
 
         assert_eq!(pager.info().len(), 2);
@@ -1503,38 +1481,31 @@ mod tests {
     #[test]
     fn flush_all_evicts_dirty_pages_after_flush() {
         let (_dir, pager, ids) = pager_with_pages([(1, b'a'), (2, b'b')]);
+        let mut ctx = AccessContext::maintenance("test mutation");
 
         pager
-            .mut_page(
-                ids[0],
-                AccessContext::maintenance("test mutation"),
-                |page| match page {
-                    AnyPageMut::Table(mut page) => {
-                        let start = page.free_space_start() as usize;
-                        let end = start + 1;
+            .mut_page(ids[0], &mut ctx, |page| match page {
+                AnyPageMut::Table(mut page) => {
+                    let start = page.free_space_start() as usize;
+                    let end = start + 1;
 
-                        page.set_num_keys(31);
-                        page.mut_cell(start, end)[0] = b'm';
-                    }
-                    _ => panic!("values should be inserted into table"),
-                },
-            )
+                    page.set_num_keys(31);
+                    page.mut_cell(start, end)[0] = b'm';
+                }
+                _ => panic!("values should be inserted into table"),
+            })
             .expect("page 1 can be mutated");
         pager
-            .mut_page(
-                ids[1],
-                AccessContext::maintenance("test mutation"),
-                |page| match page {
-                    AnyPageMut::Table(mut page) => {
-                        let start = page.free_space_start() as usize;
-                        let end = start + 1;
+            .mut_page(ids[1], &mut ctx, |page| match page {
+                AnyPageMut::Table(mut page) => {
+                    let start = page.free_space_start() as usize;
+                    let end = start + 1;
 
-                        page.set_num_keys(32);
-                        page.mut_cell(start, end)[0] = b'n';
-                    }
-                    _ => panic!("values should be inserted into table"),
-                },
-            )
+                    page.set_num_keys(32);
+                    page.mut_cell(start, end)[0] = b'n';
+                }
+                _ => panic!("values should be inserted into table"),
+            })
             .expect("page 2 can be mutated");
 
         for page_id in &ids {
@@ -1583,22 +1554,19 @@ mod tests {
     #[test]
     fn flush_all_returns_resource_busy_for_recently_accessed_dirty_page() {
         let (_dir, pager, ids) = pager_with_pages([(1, b'a')]);
+        let mut ctx = AccessContext::maintenance("test mutation");
 
         pager
-            .mut_page(
-                ids[0],
-                AccessContext::maintenance("test mutation"),
-                |page| match page {
-                    AnyPageMut::Table(mut page) => {
-                        let start = page.free_space_start() as usize;
-                        let end = start + 1;
+            .mut_page(ids[0], &mut ctx, |page| match page {
+                AnyPageMut::Table(mut page) => {
+                    let start = page.free_space_start() as usize;
+                    let end = start + 1;
 
-                        page.set_num_keys(44);
-                        page.mut_cell(start, end)[0] = b'r';
-                    }
-                    _ => panic!("values should be inserted into table"),
-                },
-            )
+                    page.set_num_keys(44);
+                    page.mut_cell(start, end)[0] = b'r';
+                }
+                _ => panic!("values should be inserted into table"),
+            })
             .expect("page can be mutated");
 
         let err = pager
@@ -1637,7 +1605,7 @@ mod tests {
         let (_dir, pager, _ids) = pager_with_pages([(1, b'a')]);
 
         let err = pager
-            .page(0, AccessContext::anonymous(), |_| ())
+            .page(0, &TEST_CONTEXT, |_| ())
             .expect_err("page id zero is invalid");
 
         assert!(matches!(err, StorageError::InvalidPage(..)));

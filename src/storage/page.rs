@@ -2,6 +2,7 @@ use std::{fmt, ops};
 
 use bitflags::bitflags;
 use log::trace;
+use serde::{Deserialize, Serialize};
 
 use crate::CRC32C;
 
@@ -475,7 +476,7 @@ pub struct MutationScope {
 
 /// Mutation provides information on a change that has occurred in a [`Page`].
 /// It tracks the offset, starting bytes and after bytes of the mutation.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Mutation {
     /// Start and end offset range of the mutation
     pub offset: MutationOffset,
@@ -485,7 +486,7 @@ pub struct Mutation {
     pub after: Box<[u8]>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct MutationOffset {
     pub start: usize,
     pub end: usize,

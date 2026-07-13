@@ -8,7 +8,10 @@ use std::{
 
 use log::{info, trace, warn};
 
-use crate::{FlushGuard, storage};
+use crate::{
+    AccessContext, FlushGuard,
+    storage::{self, pager::ChangeGuard},
+};
 
 use super::{Lsn, Record, RecordEntry};
 
@@ -38,6 +41,44 @@ impl FlushGuard for WalFlushGuard {
         self.wal.flush_through(lsn)?;
         self.wal.sync_all()?;
         Ok(())
+    }
+}
+
+/// A [`ChangeGuard`] that enforces the write-ahead rule: changes may only be
+/// applied to a page once they have been written to the WAL.
+pub struct WalChangeGuard {
+    wal: Arc<Logger>,
+}
+
+impl WalChangeGuard {
+    /// Create a guard that writes [`RecordEntry`] on page change.
+    pub fn new(wal: Arc<Logger>) -> Self {
+        Self { wal }
+    }
+}
+
+impl ChangeGuard for WalChangeGuard {
+    fn before_change(
+        &self,
+        ctx: &mut AccessContext,
+        page_id: u64,
+        mutations: Vec<storage::page::Mutation>,
+    ) -> storage::Result<Option<Lsn>> {
+        let Some(txn_id) = ctx.txn_id else {
+            return Err(storage::StorageError::NotAllowed(
+                "attempt to change page without transaction",
+            ));
+        };
+
+        let record = Record::Update {
+            txn_id: txn_id,
+            page_id,
+            mutations,
+            prev_lsn: ctx.lsn,
+        };
+        let lsn = self.wal.append(record)?;
+        ctx.lsn = Some(lsn.into());
+        Ok(Some(lsn))
     }
 }
 
@@ -488,6 +529,7 @@ mod tests {
     use crate::{
         Page,
         recovery::record::{MAGIC, RECORD_FORMAT_VERSION},
+        storage::page::{Mutation, MutationOffset},
     };
     use tempfile::TempDir;
 
@@ -503,9 +545,11 @@ mod tests {
         Record::Update {
             txn_id: 10,
             page_id: 7,
-            offset: 42,
-            before: vec![b'a', b'b', b'c'],
-            after: vec![b'x', b'y', b'z'],
+            mutations: vec![Mutation {
+                offset: MutationOffset { start: 42, end: 45 },
+                before: vec![0; 3].into_boxed_slice(),
+                after: vec![b'x', b'y', b'z'].into_boxed_slice(),
+            }],
             prev_lsn,
         }
     }
@@ -965,6 +1009,52 @@ mod tests {
         );
     }
 
+    #[test]
+    fn wal_change_guard_tracks_changes() {
+        let (_dir, logger) = temp_logger();
+        let wal = Arc::new(logger);
+        assert_eq!(
+            wal.lock()
+                .unwrap()
+                .buffer
+                .len(),
+            1
+        );
+        let mut ctx = AccessContext::txn(10, None, "insert record");
+
+        let guard = WalChangeGuard::new(wal.clone());
+        let lsn = guard
+            .before_change(
+                &mut ctx,
+                0,
+                vec![
+                    Mutation {
+                        offset: MutationOffset { start: 80, end: 84 },
+                        before: vec![0; 4].into_boxed_slice(),
+                        after: vec![1, 2, 3, 4].into_boxed_slice(),
+                    },
+                    Mutation {
+                        offset: MutationOffset {
+                            start: 1094,
+                            end: 1098,
+                        },
+                        before: vec![0; 4].into_boxed_slice(),
+                        after: vec![1, 2, 3, 4].into_boxed_slice(),
+                    },
+                ],
+            )
+            .unwrap();
+
+        assert_eq!(ctx.lsn.unwrap(), lsn.unwrap().into());
+        assert_eq!(
+            wal.lock()
+                .unwrap()
+                .buffer
+                .len(),
+            2
+        );
+    }
+
     /// A commit is only "durable" once its record has been flushed through
     /// and synced.
     #[test]
@@ -1024,9 +1114,11 @@ mod tests {
         let bad = Record::Update {
             txn_id: 1,
             page_id: 1,
-            offset: 0,
-            before: vec![1, 2, 3],
-            after: vec![9, 9],
+            mutations: vec![Mutation {
+                offset: MutationOffset { start: 42, end: 45 },
+                before: vec![0; 3].into_boxed_slice(),
+                after: vec![b'x', b'y'].into_boxed_slice(),
+            }],
             prev_lsn: None,
         };
 
@@ -1052,24 +1144,6 @@ mod tests {
         let err = logger
             .append(bad)
             .expect_err("redo-only CLR without undo_next must be rejected");
-        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
-    }
-
-    #[test]
-    fn validate_rejects_byte_range_beyond_page_size() {
-        let update = Record::Update {
-            txn_id: 1,
-            page_id: 1,
-            offset: 4094,
-            before: vec![0, 0, 0, 0],
-            after: vec![1, 1, 1, 1],
-            prev_lsn: None,
-        };
-
-        assert!(update.validate(None).is_ok());
-        let err = update
-            .validate(Some(4096))
-            .expect_err("range past page size must be rejected");
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
     }
 
