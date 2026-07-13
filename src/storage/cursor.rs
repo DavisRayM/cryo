@@ -150,7 +150,7 @@ impl Cursor {
                                     )?
                                 }
                             } else {
-                                keys[pos - 1].clone()
+                                keys[pos].clone()
                             }
                         }
                     };
