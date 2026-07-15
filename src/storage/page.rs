@@ -396,7 +396,7 @@ impl<P: PageViewMut> MetaPage<P> {
 /// };
 ///
 /// println!(
-///     "no. of keys: {}, sibling: (l: {}, r: {}), right pointer: {:?}, high key: {}",
+///     "no. of keys: {}, sibling: (l: {:?}, r: {:?}), right pointer: {:?}, high key: {}",
 ///     table.num_keys(),
 ///     table.left_sibling_offset(),
 ///     table.right_sibling_offset(),
@@ -427,14 +427,14 @@ impl<P: PageView> TablePage<P> {
         num_keys,
          u16, NUM_KEY_OFFSET);
     getter!(
-        /// The offset of the left sibling
-        left_sibling_offset,
+        /// The offset of the left sibling; may not be valid
+        left_sibling_offset_raw,
         u32,
         LEFT_SIBLING_OFFSET
     );
     getter!(
-        /// The offset of the right sibling
-        right_sibling_offset,
+        /// The offset of the right sibling; may not be valid
+        right_sibling_offset_raw,
         u32,
         RIGHT_SIBLING_OFFSET
     );
@@ -453,6 +453,20 @@ impl<P: PageView> TablePage<P> {
         self.flags()
             .contains(PageFlags::IsInternal)
             .then(|| self.right_pointer_raw())
+    }
+
+    pub fn right_sibling_offset(&self) -> Option<u32> {
+        match self.right_sibling_offset_raw() {
+            0 => None,
+            page => Some(page),
+        }
+    }
+
+    pub fn left_sibling_offset(&self) -> Option<u32> {
+        match self.left_sibling_offset_raw() {
+            0 => None,
+            page => Some(page),
+        }
     }
 }
 

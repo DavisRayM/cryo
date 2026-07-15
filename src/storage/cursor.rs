@@ -1,9 +1,5 @@
-use std::{collections::VecDeque, sync::Arc};
-
 use log::{debug, trace, warn};
-
-/// Maximum hops allowed
-const MAX_HOPS: usize = 64;
+use std::{collections::VecDeque, sync::Arc};
 
 use super::{
     AccessContext, Page, PageFlags, PageView, StorageError, TablePage,
@@ -14,6 +10,9 @@ use crate::{
     KEYCELL_SIZE, Key, KeyCell, VALUECELL_KEY_SIZE, VALUECELL_VALUE_LEN_SIZE,
     ValueCell,
 };
+
+/// Maximum hops allowed
+const MAX_HOPS: usize = 64;
 
 const CURSOR_CONTEXT: AccessContext =
     AccessContext::maintenance("cursor operation");
@@ -129,6 +128,15 @@ impl Cursor {
             self.current_page,
             |page| -> Result<Option<KeyCell>> {
                 let flags = page.flags();
+
+                let high_key = page.high_key() as u32;
+
+                if let Some(right_sibling) = page.right_sibling_offset() && *key > high_key {
+                    return Ok(Some(
+                        KeyCell { key: high_key, offset: right_sibling }
+                    ));
+                }
+
                 if flags.contains(PageFlags::IsLeaf) {
                     return Ok(None);
                 }
