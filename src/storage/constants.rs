@@ -7,6 +7,9 @@ pub mod page {
     /// Page identifiers are one-based; page id `0` is invalid.
     pub const META_PAGE_ID: usize = 1;
 
+    /// Default size, in bytes, used when creating a new database file.
+    pub const DEFAULT_PAGE_SIZE: u16 = 4096;
+
     /// The default maximum allowed gap during page diff.
     pub const DEFAULT_MERGE_MUTATION_GAP: usize = 4;
 

@@ -1,14 +1,3 @@
-use crate::{
-    recovery::Lsn,
-    storage::page::{Mutation, MutationScope},
-};
-
-use super::{
-    Page, PageFlags, StorageError,
-    constants::page::{FORMAT_VERSION, META_PAGE_ID},
-    error::Result,
-    page::{AnyPage, AnyPageMut},
-};
 use log::{debug, info, trace, warn};
 use std::{
     collections::HashMap,
@@ -24,9 +13,19 @@ use std::{
     thread::ThreadId,
 };
 
-/// Default size, in bytes, used when creating a new database file.
-pub const DEFAULT_PAGE_SIZE: u16 = 4096;
+use crate::recovery::Lsn;
 
+use super::{
+    AccessContext, AccessMode, Mutation, MutationScope, Page, PageFlags,
+    StorageError,
+    constants::page::{DEFAULT_PAGE_SIZE, FORMAT_VERSION, META_PAGE_ID},
+    error::Result,
+    page::{AnyPage, AnyPageMut},
+};
+
+// TODO: This sucks... need a better way to handle maintenance access.
+//       Allowing Optional context seems more straightforward ? Presence = Transaction ?
+//       No Presence = Maintenance ? Less verbose but I may forget...
 const STARTUP_CONTEXT: AccessContext = AccessContext::maintenance("startup");
 
 /// [`FlushGuard`] defines a guarded function that should be run
@@ -51,47 +50,6 @@ pub trait ChangeGuard: Send + Sync {
 }
 
 pub struct NoopChangeGuard;
-
-/// Describes how a thread is currently accessing a cached page.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AccessMode {
-    /// The page is being read.
-    Read,
-    /// The page is being mutated and will be marked dirty.
-    Write,
-}
-
-/// Describes the context by the which the thread is accessing a cached page
-#[derive(Debug, Clone, Copy)]
-pub struct AccessContext {
-    pub txn_id: Option<u64>,
-    pub lsn: Option<u64>,
-    pub reason: &'static str,
-}
-
-impl AccessContext {
-    /// Access [`Page`] as part of a user-initiated transaction.
-    pub const fn txn(
-        txn_id: u64,
-        lsn: Option<u64>,
-        reason: &'static str,
-    ) -> Self {
-        Self {
-            txn_id: Some(txn_id),
-            lsn,
-            reason: reason,
-        }
-    }
-
-    /// Access [`Page`] as part of a maintenance process.
-    pub const fn maintenance(reason: &'static str) -> Self {
-        Self {
-            txn_id: None,
-            lsn: None,
-            reason: reason,
-        }
-    }
-}
 
 /// A [`CachedPage`] is a [`Page`] that has been loaded into memory.
 ///
