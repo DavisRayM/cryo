@@ -1,0 +1,770 @@
+use log::{debug, trace, warn};
+use std::{collections::VecDeque, sync::Arc};
+
+use super::{
+    AccessContext, Page, PageFlags, PageView, StorageError, TablePage,
+    btree::TreeInner, constants::page::HEADER_SIZE, error::Result,
+};
+
+use crate::{
+    KEYCELL_SIZE, Key, KeyCell, VALUECELL_KEY_SIZE, VALUECELL_VALUE_LEN_SIZE,
+    ValueCell,
+};
+
+/// Maximum hops allowed
+const MAX_HOPS: usize = 64;
+
+const CURSOR_CONTEXT: AccessContext =
+    AccessContext::maintenance("cursor operation");
+
+pub struct Cursor {
+    breadcrumbs: Vec<(usize, KeyCell)>,
+    current_page: usize,
+    tree: Arc<TreeInner>,
+}
+
+#[derive(Debug, Clone)]
+struct CursorValue {
+    pub idx: usize,
+    pub val_cell: ValueCell,
+}
+
+impl From<(usize, ValueCell)> for CursorValue {
+    fn from(value: (usize, ValueCell)) -> Self {
+        Self {
+            idx: value.0,
+            val_cell: value.1,
+        }
+    }
+}
+
+impl Cursor {
+    /// Initialize a [`Cursor`] at `root` position of [`super::Tree`]
+    pub(crate) fn from_root(tree: &Arc<TreeInner>) -> Result<Self> {
+        Ok(Self {
+            breadcrumbs: vec![],
+            current_page: tree.root()?,
+            tree: tree.clone(),
+        })
+    }
+
+    /// Inserts a new `key` & `value` into the tree.
+    ///
+    /// TODO: Decide on self-split or user-initiated...
+    pub fn insert(
+        &mut self,
+        ctx: &mut AccessContext,
+        key: &Key,
+        value: Vec<u8>,
+    ) -> Result<Option<ValueCell>> {
+        self.find(&CURSOR_CONTEXT, key)?;
+        let new_cell = ValueCell {
+            key: *key,
+            value: value.into(),
+        };
+
+        match self.read_value(ctx, key)? {
+            Some(old_cell) => {
+                self.insert_existing(ctx, &old_cell, &new_cell)?;
+                Ok(Some(old_cell.val_cell))
+            }
+            None => {
+                self.insert_new(ctx, &new_cell)?;
+                Ok(None)
+            }
+        }
+    }
+
+    /// Locate the `Leaf` page that would hold `key` and return `key`
+    /// bytes if present. This action will leave the cursor at the leaf node.
+    pub fn search(&mut self, key: &Key) -> Result<Option<ValueCell>> {
+        self.find(&CURSOR_CONTEXT, key)?;
+
+        let out = self.read_value(&CURSOR_CONTEXT, key)?;
+        trace!(
+            "tree cursor search complete: page={} key={} found={} depth={}",
+            self.current_page,
+            key,
+            out.is_some(),
+            self.breadcrumbs.len()
+        );
+
+        Ok(out.map(|cv| cv.val_cell))
+    }
+
+    /// Attempts to locate `key` in tree. Navigating to `key` position while
+    /// validating that `MAX_HOPS` is not exceeded.
+    pub fn find(&mut self, ctx: &AccessContext, key: &Key) -> Result<()> {
+        for attempt in 0..MAX_HOPS {
+            if attempt >= MAX_HOPS {
+                return Err(StorageError::RecursionDetected(
+                    "cursor reached maximum hops",
+                ));
+            }
+
+            trace!(
+                "tree cursor search: key={key} current_page={} depth={}",
+                self.current_page,
+                self.breadcrumbs.len()
+            );
+
+            if !self.find_inner(&ctx, key)? {
+                break;
+            }
+        }
+
+        Ok(())
+    }
+}
+
+impl Cursor {
+    /// Locates the next hop to `key` from `Self::current_page`, updating
+    /// current page and pushing breadcrumb.
+    ///
+    /// This function will return `true` once a `Leaf` page is located.
+    fn find_inner(&mut self, ctx: &AccessContext, key: &Key) -> Result<bool> {
+        let next_location = self.tree.table_page(
+            ctx,
+            self.current_page,
+            |page| -> Result<Option<KeyCell>> {
+                let flags = page.flags();
+
+                let high_key = page.high_key() as u32;
+
+                if let Some(right_sibling) = page.right_sibling_offset() && *key > high_key {
+                    return Ok(Some(
+                        KeyCell { key: high_key, offset: right_sibling }
+                    ));
+                }
+
+                if flags.contains(PageFlags::IsLeaf) {
+                    return Ok(None);
+                }
+
+                let count = page.num_keys() as usize;
+                let keys = self.key_range(0, count, &page)?;
+
+                let next_page =
+                    match keys.binary_search(&KeyCell::with_key(key)) {
+                        Ok(pos) => keys[pos].clone(),
+                        Err(pos) => {
+                            if pos >= keys.len() {
+                                KeyCell {
+                                    key: page.high_key() as u32,
+                                    offset: page.right_pointer().ok_or(
+                                        StorageError::CorruptedData(
+                                            format!(
+                                                "unable to locate pointer for high key {} in page {}", page.high_key(), self.current_page))
+                                    )?
+                                }
+                            } else {
+                                keys[pos].clone()
+                            }
+                        }
+                    };
+                Ok(Some(next_page))
+            },
+        )??;
+
+        trace!(
+            "cursor find next positon: key={} next={:?}",
+            key, next_location
+        );
+
+        if let Some(page) = next_location {
+            self.breadcrumbs
+                .push((self.current_page, page.clone()));
+            self.current_page = page.offset as usize;
+            return Ok(false);
+        }
+        Ok(true)
+    }
+
+    /// Inserts new value cell in the page cursor is currently in
+    fn insert_new(
+        &self,
+        ctx: &mut AccessContext,
+        cell: &ValueCell,
+    ) -> Result<()> {
+        self.tree
+            .mut_table_page(ctx, self.current_page, |mut page| {
+                let key_count = page.num_keys() as usize;
+                let keys = self.key_range(0, key_count, &page)?;
+                let new_count = key_count + 1;
+
+                let free_space = page.free_space() as usize;
+                let free_space_start = page.free_space_start() as usize;
+                let free_space_end = page.free_space_end() as usize;
+
+                if cell.len() > free_space {
+                    return Err(StorageError::WouldSplit);
+                }
+
+                let new_space_end = free_space_end - cell.len();
+                let new_space_start = HEADER_SIZE + (new_count * KEYCELL_SIZE);
+                let new_space = free_space - cell.len();
+
+                if new_space_end < free_space_start {
+                    return Err(StorageError::FragmentedPage);
+                }
+
+                let key = KeyCell {
+                    key: cell.key,
+                    offset: new_space_end as u32,
+                };
+
+                trace!(
+                    "cursor insert: page={} key={:?} new_space={} space=(start={}, end={})",
+                    self.current_page,
+                    key,
+                    new_space,
+                    new_space_start,
+                    new_space_end,
+                );
+
+                match keys.binary_search(&key) {
+                    Err(pos) => {
+                        let key_offset = HEADER_SIZE + (pos * KEYCELL_SIZE);
+                        let (_left, right) = keys.split_at(pos);
+                        let mut key_bytes =
+                            Into::<[u8; KEYCELL_SIZE]>::into(&key).to_vec();
+                        let after_insert = right
+                            .iter()
+                            .flat_map(Into::<[u8; KEYCELL_SIZE]>::into)
+                            .collect::<Vec<_>>();
+                        key_bytes.extend(after_insert);
+
+                        let value_bytes: Box<[u8]> = cell.into();
+
+                        page.mut_cell(new_space_end, free_space_end)
+                            .copy_from_slice(&value_bytes);
+                        page.mut_cell(key_offset, new_space_start)
+                            .copy_from_slice(&key_bytes);
+
+                        page.set_free_space_end(new_space_end as u16);
+                        page.set_free_space_start(new_space_start as u16);
+                        page.set_free_space(new_space as u16);
+                        page.set_num_keys(new_count as u16);
+
+                        Ok(())
+                    }
+                    Ok(_) => Err(StorageError::NotAllowed(
+                        "called insert new on existing key",
+                    )),
+                }
+            })?
+    }
+
+    /// Update `old` in the page [`Cursor`] is in with `updated`.
+    fn insert_existing(
+        &self,
+        ctx: &mut AccessContext,
+        old: &CursorValue,
+        updated: &ValueCell,
+    ) -> Result<()> {
+        let inserted = self.tree
+            .mut_table_page(ctx, self.current_page, |mut page| -> Result<bool> {
+                let key = self
+                    .key_range(old.idx, old.idx + 1, &page)?
+                    .pop()
+                    .expect("should have old key");
+
+                if old.val_cell.len() >= updated.len() {
+                    self.reclaim_existing(&mut page, &key, &old.val_cell, updated);
+                    Ok(true)
+                } else {
+                    warn!(
+                        "cursor insert existing: page={} unreclaimed={} allocated={}",
+                        self.current_page,
+                        old.val_cell.len(),
+                        updated.len(),
+                    );
+                    self.format_value(&mut page, &key)?;
+                    Ok(false)
+                }
+            })??;
+
+        if !inserted {
+            self.insert_new(ctx, updated)?;
+        }
+        Ok(())
+    }
+
+    /// Attempts to read [`CursorValue`] of associated `key` in page.
+    ///
+    /// ## Errors
+    ///
+    /// This funtion will error if a read attempt is made on an internal
+    /// [`Page`]. Utilize `Self::key_range` instead.
+    fn read_value(
+        &self,
+        ctx: &AccessContext,
+        key: &Key,
+    ) -> Result<Option<CursorValue>> {
+        self.tree
+            .table_page(ctx, self.current_page, |page| {
+                let flags = page.flags();
+                if !flags.contains(PageFlags::IsLeaf) {
+                    return Err(StorageError::NotAllowed(
+                        "attempt to read value from non-leaf page",
+                    ));
+                }
+
+                let count = page.num_keys() as usize;
+                let keys = self.key_range(0, count, &page)?;
+                trace!("cursor read: key={} page={}", key, self.current_page);
+
+                match keys.binary_search(&KeyCell::with_key(key)) {
+                    Ok(pos) => {
+                        let key = keys[pos].clone();
+                        let value = ValueCell::from_bytes(
+                            page.cell_from(key.offset as usize),
+                        )?;
+
+                        debug!(
+                            "cursor read success: key={:?} page={}",
+                            key, self.current_page
+                        );
+                        Ok(Some((pos, value).into()))
+                    }
+                    Err(_) => Ok(None),
+                }
+            })?
+    }
+
+    /// Retrieves list of [`KeyCell`] starting from logical `start_index` up till
+    /// `end_index`. This function returns [R_start..R_end).
+    ///
+    /// ## Panics
+    ///
+    /// This function will panic if the range(start_index..end_index) is not valid
+    /// for [`Page`] `num_keys`.
+    fn key_range(
+        &self,
+        start_index: usize,
+        end_index: usize,
+        page: &impl PageView,
+    ) -> Result<Vec<KeyCell>> {
+        let start_offset = HEADER_SIZE + (start_index * KEYCELL_SIZE);
+        let end_offset = HEADER_SIZE + (end_index * KEYCELL_SIZE);
+
+        let mut bytes = vec![0; end_offset - start_offset];
+        let mut out = Vec::new();
+        bytes.copy_from_slice(page.cell(start_offset, end_offset));
+
+        let mut keys = bytes
+            .chunks(KEYCELL_SIZE)
+            .map(KeyCell::from_bytes)
+            .collect::<Vec<std::io::Result<_>>>();
+
+        debug!(
+            "cursor key range: start={}:{} end={}:{}",
+            start_index, start_offset, end_index, end_offset
+        );
+
+        for r in keys.drain(..) {
+            out.push(r?);
+        }
+
+        Ok(out)
+    }
+
+    /// Wipes the [`ValueCell`] pointed to by `key`, removing `key` from page in
+    /// the process.
+    fn format_value(
+        &self,
+        page: &mut TablePage<&mut Page>,
+        key: &KeyCell,
+    ) -> Result<()> {
+        if !page
+            .flags()
+            .contains(PageFlags::IsLeaf)
+        {
+            panic!("attempt to format internal page key");
+        }
+
+        self.remove_key(page, key)?;
+
+        let start = key.offset as usize;
+        let value_len = ValueCell::value(page.cell_from(start))?.len();
+        let value_len =
+            VALUECELL_KEY_SIZE + VALUECELL_VALUE_LEN_SIZE + value_len;
+        let initial_free_space = page.free_space();
+
+        trace!(
+            "cursor format value: key={} offset={} initial_space={} value_len={}",
+            key.key, start, initial_free_space, value_len
+        );
+
+        page.mut_cell(start, start + value_len)
+            .copy_from_slice(vec![0; value_len].as_ref());
+        page.set_free_space(initial_free_space + value_len as u16);
+
+        if start == page.free_space_end() as usize {
+            page.set_free_space_end((start + value_len) as u16);
+        }
+        Ok(())
+    }
+
+    /// Removes `key` in the table, updating table information as necessary
+    fn remove_key(
+        &self,
+        page: &mut TablePage<&mut Page>,
+        key: &KeyCell,
+    ) -> Result<()> {
+        let mut keys = self.key_range(0, page.num_keys() as usize, page)?;
+
+        match keys.binary_search(key) {
+            Ok(pos) => {
+                keys.remove(pos);
+                let key_bytes = keys
+                    .iter()
+                    .flat_map(Into::<[u8; KEYCELL_SIZE]>::into)
+                    .collect::<Vec<_>>();
+                let end = HEADER_SIZE + (keys.len() * KEYCELL_SIZE);
+                let initial_space = page.free_space();
+                let new_space = initial_space - KEYCELL_SIZE as u16;
+
+                trace!(
+                    "cursor remove key: key={} count_after={} space_after={}",
+                    key.key,
+                    keys.len(),
+                    new_space
+                );
+
+                page.set_num_keys(keys.len() as u16);
+                page.mut_cell(HEADER_SIZE, end)
+                    .clone_from_slice(&key_bytes);
+                page.set_free_space_start(end as u16);
+                page.set_free_space(new_space);
+
+                Ok(())
+            }
+            Err(_) => Err(StorageError::NotAllowed(
+                "attempt to remove non-existent key",
+            )),
+        }
+    }
+
+    /// Reclaim the space previously held by `old` at `key`. This function will
+    /// overwrite the `old` bytes with `updated` bytes, updating free_space when
+    /// necessary.
+    ///
+    /// ## Panics
+    ///
+    /// This function requires that `old` is of greater len or equal to
+    /// `updated`. This check must be done by the caller.
+    fn reclaim_existing(
+        &self,
+        page: &mut TablePage<&mut Page>,
+        key: &KeyCell,
+        old: &ValueCell,
+        updated: &ValueCell,
+    ) {
+        let diff = old.len() - updated.len();
+        let new_space = page.free_space() as usize + diff;
+        let value_bytes: Box<[u8]> = updated.into();
+        let offset = key.offset as usize;
+        trace!(
+            "cursor reclaim: key={} initial_space={} new_space={} diff={}",
+            key.key,
+            page.free_space(),
+            new_space,
+            diff
+        );
+
+        page.mut_cell(offset, offset + value_bytes.len())
+            .clone_from_slice(&value_bytes);
+        page.set_free_space(new_space as u16);
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct DebugOpt {
+    /// Stop descent after `max_depth` level
+    pub max_depth: usize,
+    /// Maximum children to show per internal
+    pub max_children: usize,
+    /// Maximum keys to show per leaf
+    pub max_leaf_keys: usize,
+}
+
+impl Default for DebugOpt {
+    fn default() -> Self {
+        Self {
+            max_depth: 3,
+            max_children: 10,
+            max_leaf_keys: 10,
+        }
+    }
+}
+
+impl Cursor {
+    pub fn debug_print(&self, opt: DebugOpt) -> Result<()> {
+        // NOTE: Test with multi node tree
+        let mut queue = VecDeque::new();
+        queue.push_front((self.tree.root()?, 0, 0));
+
+        let depth_marker = |depth: usize, key: usize| -> String {
+            if depth >= 1 {
+                format!("┗{}(<={})", "━".repeat(depth), key)
+            } else {
+                String::default()
+            }
+        };
+
+        while !queue.is_empty() {
+            let (page, depth, key) = queue
+                .pop_front()
+                .expect("queue isn't empty");
+
+            if depth > opt.max_depth {
+                println!("      <...pruned depth...>        ");
+            }
+
+            self.tree.table_page(
+                &CURSOR_CONTEXT,
+                page,
+                |p| -> Result<()> {
+                    let root = if p
+                        .flags()
+                        .contains(PageFlags::IsRoot)
+                    {
+                        "root"
+                    } else {
+                        ""
+                    };
+
+                    print!("[{}{}#{page} ", depth_marker(depth, key), root);
+
+                    let key_count = p.num_keys() as usize;
+
+                    match p
+                        .flags()
+                        .contains(PageFlags::IsLeaf)
+                    {
+                        true => {
+                            let end_index = key_count.min(opt.max_leaf_keys);
+                            let keys = self
+                                .key_range(0, end_index, &p)?
+                                .iter()
+                                .map(|k| k.key)
+                                .collect::<Vec<_>>();
+                            let pruned = if end_index < key_count {
+                                format!(
+                                    " (+{} keys hidden)",
+                                    key_count - end_index
+                                )
+                            } else {
+                                String::default()
+                            };
+
+                            print!(
+                                "LEAF n={} lsn={} hi={}]    keys: {keys:?}{pruned}",
+                                p.num_keys(),
+                                p.latest_lsn(),
+                                p.high_key()
+                            );
+                        }
+                        _ => {
+                            let end_index = key_count.min(opt.max_children);
+                            self.key_range(0, end_index, &p)?.iter().for_each(|k| {
+                                queue.push_back((
+                                    k.offset as usize,
+                                    depth + 1,
+                                    k.key as usize,
+                                ))
+                            });
+
+                            let pruned = if end_index < key_count {
+                                format!(
+                                    " (+{} children pruned)",
+                                    key_count - end_index
+                                )
+                            } else {
+                                String::default()
+                            };
+
+                            print!(
+                                "INTERNAL n={} lsn={} hi={}] {pruned}",
+                                p.num_keys(),
+                                p.latest_lsn(),
+                                p.high_key()
+                            );
+                        }
+                    }
+                    if let Some(right) = p.right_pointer() {
+                        print!("  --right→ #{right}")
+                    }
+                    Ok(())
+                },
+            )??;
+        }
+
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use tempfile::TempDir;
+
+    use crate::{
+        AccessContext, KEYCELL_SIZE, KeyCell, ValueCell, storage::Tree,
+    };
+
+    fn temp_tree() -> (TempDir, Tree) {
+        let dir = TempDir::new().expect("can create tempdir");
+        let path = dir.path().join("store.db");
+        let tree = Tree::load(path, 8).expect("can load tree");
+
+        (dir, tree)
+    }
+
+    fn filled_leaf_root() -> (TempDir, Tree) {
+        let (dir, tree) = temp_tree();
+
+        let root = tree
+            .inner
+            .root()
+            .expect("can retrieve tree root");
+        let mut ctx = AccessContext::maintenance("test leaf split");
+        assert!(root != 0, "root should be a valid page ID");
+        tree.inner
+            .mut_table_page(&mut ctx, root, |mut p| {
+                let mut initial_start = p.free_space_start() as usize;
+                let mut initial_end = p.free_space_end() as usize;
+
+                p.set_free_space(0);
+                p.set_num_keys(4);
+
+                let sample =
+                    [(5, "asb"), (20, "230"), (50, "sdafjl"), (90, "assdfj")];
+                let sample = sample
+                    .iter()
+                    .map(|s| ValueCell {
+                        key: s.0,
+                        value: s.1.as_bytes().into(),
+                    })
+                    .map(|r| (r.key, Into::<Box<[u8]>>::into(&r)))
+                    .collect::<Vec<_>>();
+
+                for (key, v) in sample {
+                    p.mut_cell(initial_end - v.len(), initial_end)
+                        .copy_from_slice(&v);
+                    initial_end = initial_end - v.len();
+
+                    let key = KeyCell {
+                        key: key,
+                        offset: initial_end as u32,
+                    };
+                    p.mut_cell(initial_start, initial_start + KEYCELL_SIZE)
+                        .copy_from_slice(
+                            Into::<[u8; KEYCELL_SIZE]>::into(&key).as_ref(),
+                        );
+                    initial_start += KEYCELL_SIZE;
+                }
+
+                p.set_free_space_end(initial_start as u16);
+            })
+            .expect("can mutate page");
+
+        (dir, tree)
+    }
+
+    #[test]
+    fn cursor_search_success_on_not_found() {
+        let (_dir, tree) = temp_tree();
+        let mut cursor = tree
+            .cursor()
+            .expect("can initialize cursor");
+
+        let key: u32 = 99;
+        let result = cursor
+            .search(&key)
+            .expect("can search tree");
+        assert!(result.is_none())
+    }
+
+    #[test]
+    fn cursor_insert_can_insert_into_new() {
+        let (_dir, tree) = temp_tree();
+        let mut ctx = AccessContext::maintenance("cursor insert test");
+
+        let records: [(u32, &str); 3] = [(10, "abc"), (20, "nas"), (5, "mna")];
+        for r in records {
+            let mut cursor = tree
+                .cursor()
+                .expect("can initialize cursor");
+            cursor
+                .insert(&mut ctx, &r.0, r.1.as_bytes().to_vec())
+                .expect("can insert record");
+        }
+
+        records.iter().for_each(|r| {
+            let mut cursor = tree
+                .cursor()
+                .expect("can initialize cursor");
+
+            let found = cursor
+                .search(&r.0)
+                .expect("can search")
+                .expect("record is located");
+
+            assert_eq!(found.key, r.0);
+            assert_eq!(found.value.as_ref(), r.1.as_bytes());
+        });
+    }
+
+    #[test]
+    fn cursor_insert_overrides_on_existing() {
+        let (_dir, tree) = temp_tree();
+        let mut ctx = AccessContext::maintenance("cursor insert overwrite");
+
+        let record_1: (u32, &str) = (10, "abc");
+        let record_2: (u32, &str) = (10, "lorem ipsum");
+
+        let out = tree
+            .cursor()
+            .expect("can init cursor")
+            .insert(&mut ctx, &record_1.0, record_1.1.as_bytes().to_vec())
+            .expect("can insert");
+
+        assert!(out.is_none());
+
+        let replaced = tree
+            .cursor()
+            .expect("can init cursor")
+            .insert(&mut ctx, &record_2.0, record_2.1.as_bytes().to_vec())
+            .expect("can insert");
+
+        assert!(replaced.is_some());
+        let actual = replaced.unwrap();
+        assert_eq!(actual.key, record_1.0);
+        assert_eq!(actual.value.as_ref(), record_1.1.as_bytes());
+
+        let updated = tree
+            .cursor()
+            .expect("can init cursor")
+            .search(&record_2.0)
+            .expect("can search tree");
+        assert!(updated.is_some());
+
+        let actual = updated.unwrap();
+        assert_eq!(actual.key, record_2.0);
+        assert_eq!(actual.value.as_ref(), record_2.1.as_bytes());
+    }
+
+    #[test]
+    #[should_panic(expected = "WouldSplit")]
+    fn cursor_insert_on_split_errors() {
+        let (_dir, tree) = filled_leaf_root();
+        let mut ctx = AccessContext::maintenance("cursor insert test");
+        let record: (u32, &str) = (10, "abc");
+
+        tree.cursor()
+            .expect("can init cursor")
+            .insert(&mut ctx, &record.0, record.1.as_bytes().to_vec())
+            .unwrap();
+    }
+}

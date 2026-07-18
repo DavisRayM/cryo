@@ -1,4 +1,5 @@
 # Cryo **State: Not Runnable**
+[![CI](https://github.com/DavisRayM/cryo/actions/workflows/ci.yml/badge.svg)](https://github.com/DavisRayM/cryo/actions/workflows/ci.yml)
 
 Cryo is a **WIP** database system. It's composable, meaning components are built
 to be plug-and-play, so new pieces can be added later with minimal friction.

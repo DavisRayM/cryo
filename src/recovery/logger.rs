@@ -1,550 +1,86 @@
-use bitflags::bitflags;
-use serde::{Deserialize, Serialize};
 use std::{
     collections::VecDeque,
     fs::{File, OpenOptions},
-    io::{self, BufReader, Read, Seek, SeekFrom, Write},
+    io::{self, BufReader, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
-    sync::{self, Mutex},
+    sync::{Arc, Mutex},
 };
 
 use log::{info, trace, warn};
 
-use crate::pager::FlushGuard;
-use crate::read_be;
+use crate::{
+    AccessContext, FlushGuard,
+    storage::{self, pager::ChangeGuard},
+};
 
-const MAGIC: &str = "PD";
-const MAGIC_SIZE: usize = MAGIC.len();
-
-const RECORD_FORMAT_VERSION: u8 = 1;
-const RECORD_FORMAT_SIZE: usize = size_of::<u8>();
-
-const FLAGS_SIZE: usize = size_of::<u8>();
-const LSN_SIZE: usize = size_of::<u64>();
-const CHECKSUM_SIZE: usize = size_of::<u32>();
-const PAYLOAD_LEN_SIZE: usize = size_of::<u32>();
-
-const HEADER_SIZE: usize = MAGIC_SIZE
-    + RECORD_FORMAT_SIZE
-    + FLAGS_SIZE
-    + LSN_SIZE
-    + CHECKSUM_SIZE
-    + PAYLOAD_LEN_SIZE;
+use super::{Lsn, Record, RecordEntry};
 
 /// The file extension used for WAL generation segment files.
 const WAL_EXTENSION: &str = "wal";
 
-bitflags! {
-    #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-    pub struct RecordFlags: u8 {}
+/// A [`FlushGuard`] that enforces the write-ahead rule: a page may only be
+/// flushed once the WAL is durable through the page's `pageLSN`.
+pub struct WalFlushGuard {
+    wal: Arc<Logger>,
 }
 
-fn read_exact_or_eof(
-    reader: &mut impl Read,
-    buf: &mut [u8],
-) -> io::Result<bool> {
-    let mut read = 0;
-
-    while read < buf.len() {
-        match reader.read(&mut buf[read..])? {
-            0 if read == 0 => return Ok(false),
-            0 => {
-                return Err(io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    "partial WAL frame",
-                ));
-            }
-            n => read += n,
-        }
-    }
-
-    Ok(true)
-}
-
-/// Scans a single `generation`'s `reader` for all valid [`Record`] entries
-/// starting from byte `offset`.
-///
-/// Returns the entries found along with the next [`Lsn`] within this generation
-/// (i.e. the byte offset immediately past the last valid frame). A trailing
-/// partial/corrupt frame is treated as the end of the valid log and the reader
-/// is rewound to the last known-good position.
-fn scan_records_from(
-    reader: &mut (impl Read + Seek),
-    generation: u32,
-    offset: u32,
-) -> io::Result<(Lsn, Vec<RecordEntry>)> {
-    let mut offset = offset;
-    let mut records = Vec::new();
-    reader.seek(SeekFrom::Start(offset as u64))?;
-
-    loop {
-        match Record::read(reader) {
-            Ok(Some((stored_lsn, record))) => {
-                let lsn = Lsn::new(generation, offset);
-                if u64::from(lsn) != stored_lsn {
-                    warn!(
-                        "WAL LSN does not match offset!! expected={lsn} \
-                         stored={}",
-                        Lsn::from(stored_lsn)
-                    );
-                }
-                offset = reader.stream_position()? as u32;
-                records.push(RecordEntry { lsn, record });
-            }
-            Ok(None) => break,
-            Err(e)
-                if matches!(
-                    e.kind(),
-                    io::ErrorKind::UnexpectedEof | io::ErrorKind::InvalidData
-                ) =>
-            {
-                reader.seek(SeekFrom::Start(offset as u64))?;
-                break;
-            }
-            Err(e) => return Err(e),
-        }
-    }
-
-    Ok((Lsn::new(generation, offset), records))
-}
-
-/// Returns the path of the `<generation>.wal` segment inside `dir`.
-fn generation_path(dir: &Path, generation: u32) -> PathBuf {
-    dir.join(format!("{generation}.{WAL_EXTENSION}"))
-}
-
-/// Discovers all WAL generation numbers present in `dir`.
-///
-/// A generation file is any file named `<N>.wal` where `N` parses as a `u32`.
-/// The returned generations are sorted ascending.
-fn discover_generations(dir: &Path) -> io::Result<Vec<u32>> {
-    let mut generations = Vec::new();
-
-    for entry in std::fs::read_dir(dir)? {
-        let entry = entry?;
-        let path = entry.path();
-
-        if path
-            .extension()
-            .and_then(|ext| ext.to_str())
-            != Some(WAL_EXTENSION)
-        {
-            continue;
-        }
-
-        if let Some(generation) = path
-            .file_stem()
-            .and_then(|stem| stem.to_str())
-            .and_then(|stem| stem.parse::<u32>().ok())
-        {
-            generations.push(generation);
-        }
-    }
-
-    generations.sort_unstable();
-    Ok(generations)
-}
-
-/// [`Lsn`] is a physical log address.
-///
-/// It is encoded as a `u64` where the high 32 bits are the WAL `generation`
-/// and the low 32 bits are the byte `offset` within that generation's file.
-///
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct Lsn {
-    generation: u32,
-    offset: u32,
-}
-
-impl Lsn {
-    /// Construct an [`Lsn`] from its `generation` and byte `offset`.
-    pub const fn new(generation: u32, offset: u32) -> Self {
-        Self { generation, offset }
-    }
-
-    /// The WAL generation this address points into.
-    pub const fn generation(self) -> u32 {
-        self.generation
-    }
-
-    /// The byte offset within the generation file.
-    pub const fn offset(self) -> u32 {
-        self.offset
-    }
-
-    /// The [`Lsn`] of the record that would follow a record of `len` bytes
-    /// written at `self`, staying within the same generation.
-    ///
-    /// Returns `None` when the addition would overflow the 32-bit offset field,
-    /// i.e. the generation has grown beyond 4 GiB. The caller must rotate to a
-    /// new generation before appending further.
-    fn advanced_by(self, len: u32) -> Option<Lsn> {
-        let offset = self.offset.checked_add(len)?;
-        Some(Lsn {
-            generation: self.generation,
-            offset,
-        })
-    }
-
-    /// The first [`Lsn`] of the generation following `self`.
-    fn next_generation(self) -> Lsn {
-        Lsn {
-            generation: self.generation + 1,
-            offset: 0,
-        }
+impl WalFlushGuard {
+    /// Create a guard that flushes `wal` before dependent pages are written.
+    pub fn new(wal: Arc<Logger>) -> Self {
+        Self { wal }
     }
 }
 
-impl From<Lsn> for u64 {
-    fn from(value: Lsn) -> Self {
-        ((value.generation as u64) << 32) | (value.offset as u64)
-    }
-}
-
-impl From<u64> for Lsn {
-    fn from(value: u64) -> Lsn {
-        let generation = (value >> 32) as u32;
-        let offset = (value & 0xffff_ffff) as u32;
-        Lsn { generation, offset }
-    }
-}
-
-impl std::fmt::Display for Lsn {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}:{}", self.generation, self.offset)
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct RecordEntry {
-    lsn: Lsn,
-    record: Record,
-}
-
-impl PartialOrd for RecordEntry {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        self.lsn
-            .partial_cmp(&other.lsn)
-    }
-}
-
-impl PartialEq for RecordEntry {
-    fn eq(&self, other: &Self) -> bool {
-        self.lsn.eq(&other.lsn)
-    }
-}
-
-impl RecordEntry {
-    /// The physical [`Lsn`] at which this record is stored.
-    pub fn lsn(&self) -> Lsn {
-        self.lsn
-    }
-
-    /// The [`Record`] payload.
-    pub fn record(&self) -> &Record {
-        &self.record
-    }
-}
-
-impl From<(Lsn, Record)> for RecordEntry {
-    fn from((lsn, record): (Lsn, Record)) -> Self {
-        RecordEntry { lsn, record }
-    }
-}
-
-/// [`Record`] is an entry in the Write-Ahead Log.
-///
-/// The [`Record`] keeps track of actions taken against pages in memory so they
-/// can be redone during recovery or undone when a transaction aborts.
-///
-/// Record Layout:
-///
-/// [0..2]       bytes[2]     magic
-/// [2..3]       u8           format
-/// [3..4]       u8           flags
-/// [4..12]      u64          lsn
-/// [12..16]     u32          crc
-/// [16..20]     u32          payload_len
-/// [20..]       bytes        payload
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum Record {
-    /// Marks the beginning of a transaction.
-    Begin { txn_id: u64, prev_lsn: Option<u64> },
-
-    /// Describes a byte-range update made to a page.
-    ///
-    /// The `before` bytes are used to undo the update and the `after` bytes are
-    /// used to redo it.
-    Update {
-        txn_id: u64,
-        page_id: u64,
-        offset: u16,
-        before: Vec<u8>,
-        after: Vec<u8>,
-        prev_lsn: Option<u64>,
-    },
-
-    /// Marks a transaction as committed.
-    Commit { txn_id: u64, prev_lsn: Option<u64> },
-
-    /// Marks a transaction as aborted.
-    Abort { txn_id: u64, prev_lsn: Option<u64> },
-
-    /// Describes an undo action that has already been applied.
-    ///
-    /// Compensation records are redo-only and point at the next log record that
-    /// should be undone for the transaction.
-    Compensation {
-        txn_id: u64,
-        page_id: u64,
-        offset: u16,
-        after: Vec<u8>,
-        undo_next_lsn: Option<u64>,
-        prev_lsn: Option<u64>,
-    },
-
-    /// Marks the end of a transaction's log records.
-    End { txn_id: u64, prev_lsn: Option<u64> },
-
-    /// Marks the beginning of a checkpoint.
-    BeginCheckpoint,
-
-    /// Marks the end of a checkpoint.
-    EndCheckpoint,
-}
-
-impl Record {
-    /// Reads a single [`Record`] from `reader`. Returning the stored `lsn`
-    /// and [`Record`] payload.
-    ///
-    /// The record is read from the reader's current position and validated against
-    /// the expected on-disk record format.
-    ///
-    /// ## Errors
-    ///
-    /// This function returns an error when bytes cannot be read from `reader` or
-    /// when the bytes read do not describe a valid [`Record`].
-    pub fn read(reader: &mut impl Read) -> io::Result<Option<(u64, Record)>> {
-        let mut magic = [0; MAGIC_SIZE];
-        if !read_exact_or_eof(reader, &mut magic)? {
-            return Ok(None);
-        }
-        if magic != MAGIC.as_bytes() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "invalid WAL record magic",
-            ));
-        }
-
-        let version = read_be!(reader, u8);
-        if version != RECORD_FORMAT_VERSION {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "unsupported WAL record version",
-            ));
-        }
-
-        let flags = read_be!(reader, u8);
-        let _flags = RecordFlags::from_bits(flags).ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                "corrupted WAL record flags",
-            )
-        })?;
-
-        let lsn = read_be!(reader, u64);
-        let crc = read_be!(reader, u32);
-        let payload_len = read_be!(reader, u32);
-
-        if payload_len > u16::MAX as u32 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "WAL payload too large",
-            ));
-        }
-
-        let mut payload = vec![0; payload_len as usize];
-        reader.read_exact(&mut payload)?;
-
-        let actual_crc = crate::CRC32C.checksum(&payload);
-        if actual_crc != crc {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "WAL record checksum mismatch",
-            ));
-        }
-
-        let record: Record = postcard::from_bytes(&payload[..])
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-        record.validate(None)?;
-
-        Ok(Some((lsn, record)))
-    }
-
-    #[allow(clippy::len_without_is_empty)]
-    pub fn len(&self) -> usize {
-        HEADER_SIZE
-            + self
-                .as_bytes()
-                .expect("should be able to marshal record")
-                .len()
-    }
-
-    pub fn txn_id(&self) -> Option<u64> {
-        match self {
-            Self::Begin { txn_id, .. }
-            | Self::Update { txn_id, .. }
-            | Self::Commit { txn_id, .. }
-            | Self::Abort { txn_id, .. }
-            | Self::Compensation { txn_id, .. }
-            | Self::End { txn_id, .. } => Some(*txn_id),
-            Self::BeginCheckpoint | Self::EndCheckpoint => None,
-        }
-    }
-
-    pub fn page_id(&self) -> Option<u64> {
-        match self {
-            Self::Update { page_id, .. }
-            | Self::Compensation { page_id, .. } => Some(*page_id),
-            _ => None,
-        }
-    }
-
-    pub fn prev_lsn(&self) -> Option<u64> {
-        match self {
-            Self::Begin { prev_lsn, .. }
-            | Self::Update { prev_lsn, .. }
-            | Self::Commit { prev_lsn, .. }
-            | Self::Abort { prev_lsn, .. }
-            | Self::Compensation { prev_lsn, .. }
-            | Self::End { prev_lsn, .. } => *prev_lsn,
-            Self::BeginCheckpoint | Self::EndCheckpoint => None,
-        }
-    }
-
-    pub fn kind(&self) -> &'static str {
-        match self {
-            Self::Begin { .. } => "begin",
-            Self::Update { .. } => "update",
-            Self::Commit { .. } => "commit",
-            Self::Abort { .. } => "abort",
-            Self::Compensation { .. } => "clr",
-            Self::End { .. } => "end",
-            Self::BeginCheckpoint => "begin_checkpoint",
-            Self::EndCheckpoint => "end_checkpoint",
-        }
-    }
-
-    pub fn as_bytes(&self) -> io::Result<Box<[u8]>> {
-        let payload = postcard::to_allocvec(self)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-        if payload.len() > u16::MAX as usize {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "WAL record too large",
-            ));
-        }
-
-        Ok(payload.into())
-    }
-
-    /// Validate that this record is structurally sound before it is applied to
-    /// or read from the log.
-    ///
-    /// These checks reject records that recovery could never apply correctly:
-    ///
-    /// - `Update.before` and `Update.after` must have equal length so an undo
-    ///   can restore exactly the bytes a redo replaced.
-    /// - `Update`/`Compensation` payloads must be non-empty (a zero-length
-    ///   change carries no redo/undo information).
-    /// - `Compensation` records are redo-only and must carry an
-    ///   `undo_next_lsn` so undo can continue past the compensated action.
-    ///
-    /// A `page_size` hint, when provided, additionally requires the changed
-    /// byte range (`offset + len`) to fit within a single page.
-    pub fn validate(&self, page_size: Option<u16>) -> io::Result<()> {
-        let invalid = |msg: &str| {
-            io::Error::new(io::ErrorKind::InvalidData, msg.to_string())
-        };
-
-        match self {
-            Self::Update {
-                offset,
-                before,
-                after,
-                ..
-            } => {
-                if before.len() != after.len() {
-                    return Err(invalid(
-                        "WAL Update before/after length mismatch",
-                    ));
-                }
-                if after.is_empty() {
-                    return Err(invalid("WAL Update carries no bytes"));
-                }
-                Self::check_range(*offset, after.len(), page_size)?;
-            }
-            Self::Compensation {
-                offset,
-                after,
-                undo_next_lsn,
-                ..
-            } => {
-                if after.is_empty() {
-                    return Err(invalid("WAL Compensation carries no bytes"));
-                }
-                if undo_next_lsn.is_none() {
-                    return Err(invalid(
-                        "WAL Compensation missing undo_next_lsn",
-                    ));
-                }
-                Self::check_range(*offset, after.len(), page_size)?;
-            }
-            _ => {}
-        }
-
-        Ok(())
-    }
-
-    /// Ensure a changed byte range `[offset, offset + len)` fits within a page.
-    fn check_range(
-        offset: u16,
-        len: usize,
-        page_size: Option<u16>,
-    ) -> io::Result<()> {
-        let Some(page_size) = page_size else {
-            return Ok(());
-        };
-
-        let end = offset as usize + len;
-        if end > page_size as usize {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!(
-                    "WAL record byte range {offset}+{len} exceeds page size \
-                     {page_size}"
-                ),
-            ));
-        }
-
+impl FlushGuard for WalFlushGuard {
+    fn before_flush(
+        &self,
+        _page_id: u64,
+        page: &crate::Page,
+    ) -> storage::Result<()> {
+        let lsn = Lsn::from(page.latest_lsn());
+        self.wal.flush_through(lsn)?;
+        self.wal.sync_all()?;
         Ok(())
     }
 }
 
-/// Mutable state protected by the [`Logger`]'s lock.
-struct Inner {
-    /// Directory containing the `<N>.wal` generation files.
-    dir: PathBuf,
-    /// Append handle for the current (highest) generation.
-    writer: File,
-    /// The generation currently being appended to.
-    current_generation: u32,
-    /// Records appended but not yet flushed to disk.
-    buffer: VecDeque<RecordEntry>,
-    /// The [`Lsn`] the next appended record will occupy.
-    next_lsn: Lsn,
-    /// The [`Lsn`] of the last record durably written to disk, if any.
-    flushed_lsn: Option<Lsn>,
+/// A [`ChangeGuard`] that enforces the write-ahead rule: changes may only be
+/// applied to a page once they have been written to the WAL.
+pub struct WalChangeGuard {
+    wal: Arc<Logger>,
+}
+
+impl WalChangeGuard {
+    /// Create a guard that writes [`RecordEntry`] on page change.
+    pub fn new(wal: Arc<Logger>) -> Self {
+        Self { wal }
+    }
+}
+
+impl ChangeGuard for WalChangeGuard {
+    fn before_change(
+        &self,
+        ctx: &mut AccessContext,
+        page_id: u64,
+        mutations: Vec<storage::page::Mutation>,
+    ) -> storage::Result<Option<Lsn>> {
+        // TODO: Allow maintenance context
+        let Some(txn_id) = ctx.txn_id else {
+            return Err(storage::StorageError::NotAllowed(
+                "attempt to change page without transaction",
+            ));
+        };
+
+        let record = Record::Update {
+            txn_id: txn_id,
+            page_id,
+            mutations,
+            prev_lsn: ctx.lsn,
+        };
+        let lsn = self.wal.append(record)?;
+        ctx.lsn = Some(lsn.into());
+        Ok(Some(lsn))
+    }
 }
 
 /// A directory-backed Write-Ahead Log.
@@ -584,15 +120,28 @@ impl Logger {
             .truncate(false)
             .open(generation_path(&dir, current_generation))?;
 
-        let (next_lsn, records) =
+        let (mut next_lsn, records) =
             scan_records_from(&mut writer, current_generation, 0)?;
         let flushed_lsn = records
             .last()
             .map(|entry| entry.lsn);
+        let mut buffer = VecDeque::new();
+
+        let lsn: u64 = next_lsn.into();
+        if lsn == 0 {
+            let lsn = next_lsn;
+            next_lsn = lsn
+                .advanced_by(Record::StartSentinel.len() as u32)
+                .expect("can advance lsn");
+            buffer.push_back(RecordEntry {
+                lsn,
+                record: Record::StartSentinel,
+            });
+        }
 
         // Position the append handle at the end of the valid prefix so a
         // trailing partial frame is overwritten by the next append.
-        writer.seek(SeekFrom::Start(next_lsn.offset() as u64))?;
+        writer.seek(io::SeekFrom::Start(next_lsn.offset as u64))?;
 
         info!(
             "wal open: dir={} current_generation={current_generation} \
@@ -605,36 +154,112 @@ impl Logger {
                 dir,
                 writer,
                 current_generation,
-                buffer: VecDeque::new(),
+                buffer,
                 next_lsn,
                 flushed_lsn,
             }),
         })
     }
 
-    fn lock(&self) -> io::Result<sync::MutexGuard<'_, Inner>> {
+    fn lock(&self) -> io::Result<std::sync::MutexGuard<'_, Inner>> {
         self.inner
             .lock()
             .map_err(|_| io::Error::other("wal: lock poisoned"))
     }
+}
 
+/// Mutable state protected by the [`Logger`]'s lock.
+struct Inner {
     /// The generation currently being appended to.
-    pub fn current_generation(&self) -> io::Result<u32> {
-        Ok(self
-            .lock()?
-            .current_generation)
-    }
-
-    /// The [`Lsn`] of the last record durably written to disk, if any.
-    pub fn flushed_lsn(&self) -> io::Result<Option<Lsn>> {
-        Ok(self.lock()?.flushed_lsn)
-    }
-
+    pub current_generation: u32,
     /// The [`Lsn`] the next appended record will occupy.
-    pub fn next_lsn(&self) -> io::Result<Lsn> {
-        Ok(self.lock()?.next_lsn)
+    pub next_lsn: Lsn,
+    /// The [`Lsn`] of the last record durably written to disk, if any.
+    pub flushed_lsn: Option<Lsn>,
+
+    /// Directory containing the `<N>.wal` generation files.
+    dir: PathBuf,
+    /// Append handle for the current (highest) generation.
+    writer: File,
+    /// Records appended but not yet flushed to disk.
+    buffer: VecDeque<RecordEntry>,
+}
+
+impl Inner {
+    /// Open a fresh read handle for `generation`'s segment file.
+    fn open_generation_reader(
+        &self,
+        generation: u32,
+    ) -> io::Result<BufReader<File>> {
+        let file = OpenOptions::new()
+            .read(true)
+            .open(generation_path(&self.dir, generation))?;
+        Ok(BufReader::new(file))
     }
 
+    /// Flush buffered records up to and including `target_lsn`.
+    fn flush_through(&mut self, target_lsn: Lsn) -> io::Result<()> {
+        if let Some(flushed_lsn) = self.flushed_lsn
+            && target_lsn <= flushed_lsn
+        {
+            trace!(
+                "wal flush skipped: target_lsn={target_lsn} \
+                     flushed_lsn={flushed_lsn}"
+            );
+            return Ok(());
+        }
+
+        info!(
+            "wal flush start: target_lsn={target_lsn} \
+             current_flushed={:?}",
+            self.flushed_lsn
+        );
+
+        let mut flushed_until = self.flushed_lsn;
+
+        while let Some(entry) = self.buffer.pop_front() {
+            if entry.lsn > target_lsn {
+                self.buffer.push_front(entry);
+                break;
+            }
+
+            self.write(&entry)?;
+            flushed_until = Some(entry.lsn);
+        }
+
+        self.writer.flush()?;
+        self.writer.sync_all()?;
+        self.flushed_lsn = flushed_until;
+
+        info!("wal flush complete: flushed_lsn={:?}", self.flushed_lsn);
+        Ok(())
+    }
+
+    /// Writes a single [`RecordEntry`] to the underlying file.
+    ///
+    /// ## Errors
+    ///
+    /// If this is called with an `entry` with an `LSN` from a different
+    /// generation than the current.
+    fn write(&mut self, entry: &RecordEntry) -> io::Result<()> {
+        if entry.lsn.generation != self.current_generation {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "entry lsn is not for the current log generation",
+            ));
+        }
+
+        self.writer
+            .seek(SeekFrom::Start(entry.lsn.offset as u64))?;
+        let payload = entry.as_bytes()?;
+        self.writer
+            .write_all(&payload)?;
+
+        Ok(())
+    }
+}
+
+impl Logger {
     /// Retrieve the [`Record`] stored at `lsn`.
     ///
     /// The record is served from the in-memory buffer when it has not yet been
@@ -668,8 +293,8 @@ impl Logger {
             ));
         }
 
-        let mut reader = inner.open_generation_reader(lsn.generation())?;
-        reader.seek(SeekFrom::Start(lsn.offset() as u64))?;
+        let mut reader = inner.open_generation_reader(lsn.generation)?;
+        reader.seek(SeekFrom::Start(lsn.offset as u64))?;
 
         let Some((stored_lsn, record)) = Record::read(&mut reader)? else {
             return Ok(None);
@@ -698,8 +323,8 @@ impl Logger {
         let mut records = Vec::new();
 
         // Read flushed records across generations, starting from `lsn`.
-        let mut generation = lsn.generation();
-        let mut offset = lsn.offset();
+        let mut generation = lsn.generation;
+        let mut offset = lsn.offset;
         while generation <= inner.current_generation {
             let mut reader = inner.open_generation_reader(generation)?;
             let (_next, mut found) =
@@ -754,7 +379,7 @@ impl Logger {
     }
 
     /// Read every flushed [`Record`] in the current generation from its start.
-    pub fn read_all(&self) -> io::Result<Vec<RecordEntry>> {
+    pub fn read_all_current_gen(&self) -> io::Result<Vec<RecordEntry>> {
         let inner = self.lock()?;
         let (_next, records) = {
             let mut reader =
@@ -816,119 +441,97 @@ impl Logger {
     }
 }
 
-impl Inner {
-    /// Open a fresh read handle for `generation`'s segment file.
-    fn open_generation_reader(
-        &self,
-        generation: u32,
-    ) -> io::Result<BufReader<File>> {
-        let file = OpenOptions::new()
-            .read(true)
-            .open(generation_path(&self.dir, generation))?;
-        Ok(BufReader::new(file))
-    }
+/// Scans a single `generation`'s `reader` for all valid [`Record`] entries
+/// starting from byte `offset`.
+///
+/// Returns the entries found along with the next [`Lsn`] within this generation
+/// (i.e. the byte offset immediately past the last valid frame). A trailing
+/// partial/corrupt frame is treated as the end of the valid log and the reader
+/// is rewound to the last known-good position.
+fn scan_records_from(
+    reader: &mut (impl io::Read + io::Seek),
+    generation: u32,
+    offset: u32,
+) -> io::Result<(Lsn, Vec<RecordEntry>)> {
+    let mut offset = offset;
+    let mut records = Vec::new();
+    reader.seek(io::SeekFrom::Start(offset as u64))?;
 
-    /// Flush buffered records up to and including `target_lsn`.
-    fn flush_through(&mut self, target_lsn: Lsn) -> io::Result<()> {
-        if let Some(flushed_lsn) = self.flushed_lsn
-            && target_lsn <= flushed_lsn
-        {
-            trace!(
-                "wal flush skipped: target_lsn={target_lsn} \
-                     flushed_lsn={flushed_lsn}"
-            );
-            return Ok(());
-        }
-
-        info!(
-            "wal flush start: target_lsn={target_lsn} \
-             current_flushed={:?}",
-            self.flushed_lsn
-        );
-
-        let mut flushed_until = self.flushed_lsn;
-
-        while let Some(entry) = self.buffer.pop_front() {
-            if entry.lsn > target_lsn {
-                self.buffer.push_front(entry);
+    loop {
+        match Record::read(reader) {
+            Ok(Some((stored_lsn, record))) => {
+                let lsn = Lsn::new(generation, offset);
+                if u64::from(lsn) != stored_lsn {
+                    warn!(
+                        "WAL LSN does not match offset!! expected={lsn} \
+                         stored={}",
+                        Lsn::from(stored_lsn)
+                    );
+                }
+                offset = reader.stream_position()? as u32;
+                records.push(RecordEntry { lsn, record });
+            }
+            Ok(None) => break,
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    io::ErrorKind::UnexpectedEof | io::ErrorKind::InvalidData
+                ) =>
+            {
+                reader.seek(io::SeekFrom::Start(offset as u64))?;
                 break;
             }
+            Err(e) => return Err(e),
+        }
+    }
 
-            self.write(entry.lsn, &entry.record)?;
-            flushed_until = Some(entry.lsn);
+    Ok((Lsn::new(generation, offset), records))
+}
+/// Returns the path of the `<generation>.wal` segment inside `dir`.
+fn generation_path(dir: &Path, generation: u32) -> PathBuf {
+    dir.join(format!("{generation}.{WAL_EXTENSION}"))
+}
+
+/// Discovers all WAL generation numbers present in `dir`.
+///
+/// A generation file is any file named `<N>.wal` where `N` parses as a `u32`.
+/// The returned generations are sorted ascending.
+fn discover_generations(dir: &Path) -> io::Result<Vec<u32>> {
+    let mut generations = Vec::new();
+
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+
+        if path
+            .extension()
+            .and_then(|ext| ext.to_str())
+            != Some(WAL_EXTENSION)
+        {
+            continue;
         }
 
-        self.writer.flush()?;
-        self.flushed_lsn = flushed_until;
-
-        info!("wal flush complete: flushed_lsn={:?}", self.flushed_lsn);
-        Ok(())
+        if let Some(generation) = path
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .and_then(|stem| stem.parse::<u32>().ok())
+        {
+            generations.push(generation);
+        }
     }
 
-    /// Encode and write a single record frame at `lsn.offset()` in the current
-    /// generation file.
-    fn write(&mut self, lsn: Lsn, record: &Record) -> io::Result<()> {
-        debug_assert_eq!(lsn.generation(), self.current_generation);
-
-        let payload = record.as_bytes()?;
-        let crc = crate::CRC32C.checksum(&payload);
-
-        self.writer
-            .seek(SeekFrom::Start(lsn.offset() as u64))?;
-        self.writer
-            .write_all(MAGIC.as_bytes())?;
-        self.writer
-            .write_all(&[RECORD_FORMAT_VERSION])?;
-        self.writer
-            .write_all(&[RecordFlags::empty().bits()])?;
-        self.writer.write_all(
-            u64::from(lsn)
-                .to_be_bytes()
-                .as_ref(),
-        )?;
-        self.writer
-            .write_all(crc.to_be_bytes().as_ref())?;
-        self.writer.write_all(
-            (payload.len() as u32)
-                .to_be_bytes()
-                .as_ref(),
-        )?;
-        self.writer
-            .write_all(&payload)?;
-
-        Ok(())
-    }
-}
-
-/// A [`FlushGuard`] that enforces the write-ahead rule: a page may only be
-/// flushed once the WAL is durable through the page's `pageLSN`.
-pub struct WalFlushGuard {
-    wal: sync::Arc<Logger>,
-}
-
-impl WalFlushGuard {
-    /// Create a guard that flushes `wal` before dependent pages are written.
-    pub fn new(wal: sync::Arc<Logger>) -> Self {
-        Self { wal }
-    }
-}
-
-impl FlushGuard for WalFlushGuard {
-    fn before_flush(
-        &self,
-        _page_id: u64,
-        page: &crate::Page,
-    ) -> io::Result<()> {
-        let lsn = Lsn::from(page.latest_lsn());
-        self.wal.flush_through(lsn)?;
-        self.wal.sync_all()
-    }
+    generations.sort_unstable();
+    Ok(generations)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::Page;
+    use crate::{
+        Page,
+        recovery::record::{MAGIC, RECORD_FORMAT_VERSION},
+        storage::page::{Mutation, MutationOffset},
+    };
     use tempfile::TempDir;
 
     /// Open a [`Logger`] backed by a fresh temporary directory, returning the
@@ -943,55 +546,30 @@ mod tests {
         Record::Update {
             txn_id: 10,
             page_id: 7,
-            offset: 42,
-            before: vec![b'a', b'b', b'c'],
-            after: vec![b'x', b'y', b'z'],
+            mutations: vec![Mutation {
+                offset: MutationOffset { start: 42, end: 45 },
+                before: vec![0; 3].into_boxed_slice(),
+                after: vec![b'x', b'y', b'z'].into_boxed_slice(),
+            }],
             prev_lsn,
         }
-    }
-
-    #[test]
-    fn record_metadata_helpers_return_expected_values() {
-        let update = update_record(Some(3));
-        assert_eq!(update.txn_id(), Some(10));
-        assert_eq!(update.page_id(), Some(7));
-        assert_eq!(update.prev_lsn(), Some(3));
-        assert_eq!(update.kind(), "update");
-
-        let clr = Record::Compensation {
-            txn_id: 11,
-            page_id: 8,
-            offset: 9,
-            after: vec![1, 2, 3],
-            undo_next_lsn: Some(4),
-            prev_lsn: Some(5),
-        };
-        assert_eq!(clr.txn_id(), Some(11));
-        assert_eq!(clr.page_id(), Some(8));
-        assert_eq!(clr.prev_lsn(), Some(5));
-        assert_eq!(clr.kind(), "clr");
-
-        let checkpoint = Record::BeginCheckpoint;
-        assert_eq!(checkpoint.txn_id(), None);
-        assert_eq!(checkpoint.page_id(), None);
-        assert_eq!(checkpoint.prev_lsn(), None);
-        assert_eq!(checkpoint.kind(), "begin_checkpoint");
     }
 
     #[test]
     fn append_buffers_records_until_flush_through() {
         let (_dir, logger) = temp_logger();
 
-        let begin = Record::Begin {
+        let begin_transaction = Record::Begin {
             txn_id: 1,
             prev_lsn: None,
         };
-        let expected_begin_lsn = Lsn::new(0, 0);
+        let expected_begin_lsn =
+            Lsn::new(0, Record::StartSentinel.len() as u32);
         let expected_update_lsn = expected_begin_lsn
-            .advanced_by(begin.len() as u32)
+            .advanced_by(begin_transaction.len() as u32)
             .unwrap();
         let begin_lsn = logger
-            .append(begin)
+            .append(begin_transaction)
             .expect("begin can be appended");
         let update_lsn = logger
             .append(update_record(Some(begin_lsn.into())))
@@ -999,21 +577,34 @@ mod tests {
 
         assert_eq!(begin_lsn, expected_begin_lsn);
         assert_eq!(update_lsn, expected_update_lsn);
-        assert_eq!(logger.flushed_lsn().unwrap(), None);
+        assert_eq!(
+            logger
+                .lock()
+                .unwrap()
+                .flushed_lsn,
+            None
+        );
         assert_eq!(
             logger
                 .lock()
                 .unwrap()
                 .buffer
                 .len(),
-            2
+            // Logger also contains the Start sentinel
+            3
         );
 
         logger
             .flush_through(begin_lsn)
             .expect("flush through first record succeeds");
 
-        assert_eq!(logger.flushed_lsn().unwrap(), Some(begin_lsn));
+        assert_eq!(
+            logger
+                .lock()
+                .unwrap()
+                .flushed_lsn,
+            Some(begin_lsn)
+        );
         assert_eq!(
             logger
                 .lock()
@@ -1024,17 +615,23 @@ mod tests {
         );
 
         let records = logger
-            .read_all()
+            .read_all_current_gen()
             .expect("flushed WAL records can be read");
-        assert_eq!(records.len(), 1);
-        assert_eq!(records[0].lsn, begin_lsn);
-        assert_eq!(records[0].record.kind(), "begin");
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[1].lsn, begin_lsn);
+        assert_eq!(records[1].record.kind(), "begin");
 
         logger
             .flush_through(update_lsn)
             .expect("flush through second record succeeds");
 
-        assert_eq!(logger.flushed_lsn().unwrap(), Some(update_lsn));
+        assert_eq!(
+            logger
+                .lock()
+                .unwrap()
+                .flushed_lsn,
+            Some(update_lsn)
+        );
         assert!(
             logger
                 .lock()
@@ -1044,13 +641,13 @@ mod tests {
         );
 
         let records = logger
-            .read_all()
+            .read_all_current_gen()
             .expect("all flushed WAL records can be read");
-        assert_eq!(records.len(), 2);
-        assert_eq!(records[0].lsn, begin_lsn);
-        assert_eq!(records[1].lsn, update_lsn);
-        assert_eq!(records[1].record.kind(), "update");
-        assert_eq!(records[1].record.prev_lsn(), Some(begin_lsn.into()));
+        assert_eq!(records.len(), 3);
+        assert_eq!(records[1].lsn, begin_lsn);
+        assert_eq!(records[2].lsn, update_lsn);
+        assert_eq!(records[2].record.kind(), "update");
+        assert_eq!(records[2].record.prev_lsn(), Some(begin_lsn.into()));
     }
 
     #[test]
@@ -1090,12 +687,16 @@ mod tests {
 
         assert_eq!(
             reopened
-                .flushed_lsn()
-                .unwrap(),
+                .lock()
+                .unwrap()
+                .flushed_lsn,
             Some(commit_lsn)
         );
         assert_eq!(
-            reopened.next_lsn().unwrap(),
+            reopened
+                .lock()
+                .unwrap()
+                .next_lsn,
             commit_lsn
                 .advanced_by(commit_len)
                 .unwrap()
@@ -1156,7 +757,9 @@ mod tests {
                 .expect("record can be synced");
         }
 
-        let mut bytes = std::fs::read(&path).expect("wal file can be read");
+        let mut bytes = std::fs::read(&path).expect("wal file can be read")
+            [Record::StartSentinel.len()..]
+            .to_vec();
         let last = bytes.len() - 1;
         bytes[last] ^= 0xff;
 
@@ -1249,7 +852,10 @@ mod tests {
         assert_eq!(commit.record.kind(), "commit");
         assert_eq!(commit.record.prev_lsn(), Some(update_lsn.into()));
 
-        let eof = logger.next_lsn().unwrap();
+        let eof = logger
+            .lock()
+            .unwrap()
+            .next_lsn;
         assert!(
             logger
                 .get(eof)
@@ -1371,7 +977,7 @@ mod tests {
     #[test]
     fn wal_flush_guard_flushes_through_page_lsn() {
         let dir = TempDir::new().expect("temp dir can be created");
-        let wal = sync::Arc::new(
+        let wal = std::sync::Arc::new(
             Logger::open(dir.path()).expect("logger can be created"),
         );
 
@@ -1390,12 +996,63 @@ mod tests {
             .before_flush(1, &page)
             .expect("guard can flush WAL through page LSN");
 
-        assert_eq!(wal.flushed_lsn().unwrap(), Some(lsn));
+        assert_eq!(
+            wal.lock()
+                .unwrap()
+                .flushed_lsn,
+            Some(lsn)
+        );
         assert!(
             wal.lock()
                 .unwrap()
                 .buffer
                 .is_empty()
+        );
+    }
+
+    #[test]
+    fn wal_change_guard_tracks_changes() {
+        let (_dir, logger) = temp_logger();
+        let wal = Arc::new(logger);
+        assert_eq!(
+            wal.lock()
+                .unwrap()
+                .buffer
+                .len(),
+            1
+        );
+        let mut ctx = AccessContext::txn(10, None, "insert record");
+
+        let guard = WalChangeGuard::new(wal.clone());
+        let lsn = guard
+            .before_change(
+                &mut ctx,
+                0,
+                vec![
+                    Mutation {
+                        offset: MutationOffset { start: 80, end: 84 },
+                        before: vec![0; 4].into_boxed_slice(),
+                        after: vec![1, 2, 3, 4].into_boxed_slice(),
+                    },
+                    Mutation {
+                        offset: MutationOffset {
+                            start: 1094,
+                            end: 1098,
+                        },
+                        before: vec![0; 4].into_boxed_slice(),
+                        after: vec![1, 2, 3, 4].into_boxed_slice(),
+                    },
+                ],
+            )
+            .unwrap();
+
+        assert_eq!(ctx.lsn.unwrap(), lsn.unwrap().into());
+        assert_eq!(
+            wal.lock()
+                .unwrap()
+                .buffer
+                .len(),
+            2
         );
     }
 
@@ -1432,8 +1089,9 @@ mod tests {
 
             assert!(
                 logger
-                    .flushed_lsn()
+                    .lock()
                     .unwrap()
+                    .flushed_lsn
                     .unwrap()
                     >= commit_lsn,
                 "commit must be flushed before success is reported"
@@ -1457,9 +1115,11 @@ mod tests {
         let bad = Record::Update {
             txn_id: 1,
             page_id: 1,
-            offset: 0,
-            before: vec![1, 2, 3],
-            after: vec![9, 9],
+            mutations: vec![Mutation {
+                offset: MutationOffset { start: 42, end: 45 },
+                before: vec![0; 3].into_boxed_slice(),
+                after: vec![b'x', b'y'].into_boxed_slice(),
+            }],
             prev_lsn: None,
         };
 
@@ -1485,24 +1145,6 @@ mod tests {
         let err = logger
             .append(bad)
             .expect_err("redo-only CLR without undo_next must be rejected");
-        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
-    }
-
-    #[test]
-    fn validate_rejects_byte_range_beyond_page_size() {
-        let update = Record::Update {
-            txn_id: 1,
-            page_id: 1,
-            offset: 4094,
-            before: vec![0, 0, 0, 0],
-            after: vec![1, 1, 1, 1],
-            prev_lsn: None,
-        };
-
-        assert!(update.validate(None).is_ok());
-        let err = update
-            .validate(Some(4096))
-            .expect_err("range past page size must be rejected");
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
     }
 
@@ -1541,7 +1183,7 @@ mod tests {
             .get(clr)
             .expect("clr lookup succeeds")
             .expect("clr is found");
-        let Record::Compensation { undo_next_lsn, .. } = clr_entry.record()
+        let Record::Compensation { undo_next_lsn, .. } = clr_entry.record
         else {
             panic!("expected compensation record");
         };
@@ -1553,7 +1195,7 @@ mod tests {
             .get(resume)
             .expect("resume lookup succeeds")
             .expect("resume record is found");
-        assert_eq!(resumed.record().kind(), "begin");
+        assert_eq!(resumed.record.kind(), "begin");
     }
 
     #[test]
@@ -1580,7 +1222,13 @@ mod tests {
             .flush_through(update)
             .expect("flush through the update only");
 
-        assert_eq!(logger.flushed_lsn().unwrap(), Some(update));
+        assert_eq!(
+            logger
+                .lock()
+                .unwrap()
+                .flushed_lsn,
+            Some(update)
+        );
         // The commit remains buffered and is still retrievable by LSN.
         assert_eq!(
             logger
@@ -1594,18 +1242,18 @@ mod tests {
             .get(commit)
             .expect("buffered commit lookup succeeds")
             .expect("commit still buffered");
-        assert_eq!(buffered.record().kind(), "commit");
+        assert_eq!(buffered.record.kind(), "commit");
 
         // The on-disk prefix stops at the flushed target.
         let on_disk = logger
-            .read_all()
+            .read_all_current_gen()
             .expect("flushed prefix can be read");
         assert_eq!(
             on_disk
                 .iter()
-                .map(|e| e.lsn())
+                .map(|e| e.lsn)
                 .collect::<Vec<_>>(),
-            vec![begin, update]
+            vec![Lsn::new(0, 0), begin, update]
         );
     }
 }
