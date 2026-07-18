@@ -66,19 +66,10 @@ pub enum AccessMode {
 pub struct AccessContext {
     pub txn_id: Option<u64>,
     pub lsn: Option<u64>,
-    pub reason: Option<&'static str>,
+    pub reason: &'static str,
 }
 
 impl AccessContext {
-    /// No specific access context
-    pub const fn anonymous() -> Self {
-        Self {
-            txn_id: None,
-            lsn: None,
-            reason: None,
-        }
-    }
-
     /// Access [`Page`] as part of a user-initiated transaction.
     pub const fn txn(
         txn_id: u64,
@@ -88,7 +79,7 @@ impl AccessContext {
         Self {
             txn_id: Some(txn_id),
             lsn,
-            reason: Some(reason),
+            reason: reason,
         }
     }
 
@@ -97,7 +88,7 @@ impl AccessContext {
         Self {
             txn_id: None,
             lsn: None,
-            reason: Some(reason),
+            reason: reason,
         }
     }
 }
@@ -362,12 +353,6 @@ impl Pager {
         ctx: &mut AccessContext,
         f: impl FnOnce(AnyPageMut) -> R,
     ) -> Result<R> {
-        if ctx.txn_id.is_none() && ctx.reason.is_none() {
-            warn!(
-                "mutating page {page_id} without transaction or maintenance context."
-            );
-        }
-
         trace!(
             "page {page_id} access start: mode={:?} txn={:?} lsn={:?} reason={:?}",
             AccessMode::Write,
@@ -525,7 +510,7 @@ pub struct PageHandle {
     pub lsn: Option<u64>,
     pub mode: AccessMode,
     pub page_id: usize,
-    pub reason: Option<&'static str>,
+    pub reason: &'static str,
     pub thread_id: ThreadId,
     pub txn_id: Option<u64>,
 }
@@ -999,14 +984,14 @@ impl fmt::Display for PageHandle {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "{:?}(page={}, txn={:?}, lsn={:?}, thread={:?}",
-            self.mode, self.page_id, self.txn_id, self.lsn, self.thread_id
-        )?;
-
-        if let Some(reason) = self.reason {
-            write!(f, ", reason={reason}")?;
-        }
-        write!(f, ")")
+            "{:?}(page={}, txn={:?}, lsn={:?}, thread={:?}, reason={})",
+            self.mode,
+            self.page_id,
+            self.txn_id,
+            self.lsn,
+            self.thread_id,
+            self.reason
+        )
     }
 }
 

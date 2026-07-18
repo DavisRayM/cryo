@@ -64,6 +64,7 @@ impl ChangeGuard for WalChangeGuard {
         page_id: u64,
         mutations: Vec<storage::page::Mutation>,
     ) -> storage::Result<Option<Lsn>> {
+        // TODO: Allow maintenance context
         let Some(txn_id) = ctx.txn_id else {
             return Err(storage::StorageError::NotAllowed(
                 "attempt to change page without transaction",
